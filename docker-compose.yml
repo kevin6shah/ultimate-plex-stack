@@ -177,36 +177,36 @@ services:
       - 8191:8191
     restart: unless-stopped
     
-  #Gluetun - vpn container
-  gluetun: #Setup for this container will be different depending on your VPN of choice
-    image: qmcgaw/gluetun
-    container_name: gluetun
-    # line above must be uncommented to allow external containers to connect.
-    # See https://github.com/qdm12/gluetun-wiki/blob/main/setup/connect-a-container-to-gluetun.md#external-container-to-gluetun
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    ports:
-      - 8888:8888/tcp # HTTP proxy
-      - 8388:8388/tcp # Shadowsocks
-      - 8388:8388/udp # Shadowsocks
-      - 8080:8080 #Qbittorent Web UI
-      - 8081:8081 #Qbittorent Web UI
-      - 8694:8694
-      - 8694:8694/udp
-    volumes:
-      - ${BASE_PATH}/gluetun:/gluetun
-    environment:
-      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER} # Example airvpn
-      - VPN_TYPE=wireguard #Wireguard is generally faster than OpenVPN
-      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY} #Example IE4cdRxZzoy/HvlLXVLB.2Hy@d=
-      - WIREGUARD_PRESHARED_KEY=${WIREGUARD_PRESHARED_KEY} #Example IE4cdRxZzoy/HvlLXVLB.2Hy@d=
-      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES} #Example 101.14.14.28/32
-      - SERVER_HOSTNAMES=${SERVER_HOSTNAMES} #Example vpn.airdns.org
-      - SERVER_NAMES=${VPN_SERVER_NAMES} #Example Dallim
-      - SERVER_CITIES=${VPN_SERVER_CITIES} #Example Albasserdonia
-      - FIREWALL_VPN_INPUT_PORTS=${FIREWALL_VPN_INPUT_PORTS} #Example 8926 - Used for port forwarding
+  # #Gluetun - vpn container
+  # gluetun: #Setup for this container will be different depending on your VPN of choice
+  #   image: qmcgaw/gluetun
+  #   container_name: gluetun
+  #   # line above must be uncommented to allow external containers to connect.
+  #   # See https://github.com/qdm12/gluetun-wiki/blob/main/setup/connect-a-container-to-gluetun.md#external-container-to-gluetun
+  #   cap_add:
+  #     - NET_ADMIN
+  #   devices:
+  #     - /dev/net/tun:/dev/net/tun
+  #   ports:
+  #     - 8888:8888/tcp # HTTP proxy
+  #     - 8388:8388/tcp # Shadowsocks
+  #     - 8388:8388/udp # Shadowsocks
+  #     - 8080:8080 #Qbittorent Web UI
+  #     - 8081:8081 #Qbittorent Web UI
+  #     - 8694:8694
+  #     - 8694:8694/udp
+  #   volumes:
+  #     - ${BASE_PATH}/gluetun:/gluetun
+  #   environment:
+  #     - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER} # Example airvpn
+  #     - VPN_TYPE=wireguard #Wireguard is generally faster than OpenVPN
+  #     - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY} #Example IE4cdRxZzoy/HvlLXVLB.2Hy@d=
+  #     - WIREGUARD_PRESHARED_KEY=${WIREGUARD_PRESHARED_KEY} #Example IE4cdRxZzoy/HvlLXVLB.2Hy@d=
+  #     - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES} #Example 101.14.14.28/32
+  #     - SERVER_HOSTNAMES=${SERVER_HOSTNAMES} #Example vpn.airdns.org
+  #     - SERVER_NAMES=${VPN_SERVER_NAMES} #Example Dallim
+  #     - SERVER_CITIES=${VPN_SERVER_CITIES} #Example Albasserdonia
+  #     - FIREWALL_VPN_INPUT_PORTS=${FIREWALL_VPN_INPUT_PORTS} #Example 8926 - Used for port forwarding
       
   #Qbittorent - torrenting software
   #
