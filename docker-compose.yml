@@ -16,10 +16,10 @@
 ---
 version: "2.1"
 
-networks: #This is used if you have a reverse proxy. I use Nginx Proxy Manager but anything will do
-  proxy:
-    external:
-      name: proxy
+  #networks: #This is used if you have a reverse proxy. I use Nginx Proxy Manager but anything will do
+  #proxy:
+  # external:
+  #   name: proxy
       
 services:
   #Plex - used to display the media
