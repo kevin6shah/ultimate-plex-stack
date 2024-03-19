@@ -47,8 +47,7 @@ services:
      - /dev/dri:/dev/dri #Required for plex HW transcoding / QuickSync
     volumes:
       - ${BASE_PATH}/plex/config:/config
-      - ${UNRAID_SHARE}/media/tv:/tv
-      - ${UNRAID_SHARE}/media/movies:/movies
+      - ${UNRAID_SHARE}/media:/media
     restart: unless-stopped
     
   #Radarr - used to find movies automatically
