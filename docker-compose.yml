@@ -213,21 +213,25 @@ services:
   #You can also use RuTorrent, Transmisson or Deluge
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
-    network_mode: "service:gluetun"
+    # network_mode: "service:gluetun"
     container_name: qbittorrent
-    labels:
-      - deunhealth.restart.on.unhealthy=true
+    # labels:
+    #   - deunhealth.restart.on.unhealthy=true
     environment:
       - PUID=${USER_ID}
       - PGID=${USER_ID}
       - TZ=${TZ}
       - WEBUI_PORT=8080
       - TORRENTING_PORT=8694
-    healthcheck: # https://github.com/qdm12/gluetun/issues/641#issuecomment-933856220
-      test: "curl -sf https://1.1.1.1/  || exit 1"
-      interval: 1m
-      timeout: 10s
-      retries: 1
+    ports:
+      - 8080:8080
+      - 6881:6881
+      - 6881:6881/udp
+    # healthcheck: # https://github.com/qdm12/gluetun/issues/641#issuecomment-933856220
+    #   test: "curl -sf https://1.1.1.1/  || exit 1"
+    #   interval: 1m
+    #   timeout: 10s
+    #   retries: 1
     volumes:
       - ${BASE_PATH}/qbittorent/config:/config
       - ${UNRAID_SHARE}:/share
