@@ -13,18 +13,11 @@ This Plex Stack includes the following services:
 - **Overseerr:** Request management and monitoring for Plex.
 - **Gluetun:** VPN container with WireGuard support for secure browsing.
 - **Qbittorrent:** BitTorrent client with VPN support.
-- **Tdarr:** Pre-transcodes your media to decrease file sizes
 - **De-unhealth:** Monitors VPN health and restarts Qbittorrent if necessary.
-- **Membarr:** Invite users to your Plex via discord
-- **Tautulli:** Analytics and monitoring for Plex.
 - **Bazarr:** Subtitle management for movies and TV shows.
-- **Autobrr:** Used to grab torrents immediately as they are released.
-- **Readarr:** Used to grab books and audiobooks.
-- **Lidarr:** Used to grab music.
 - **Flaresolverr:** Used as a proxy server to bypass Cloudflare and DDoS-GUARD protection.
 - **Dozzle:** Used to view the logs of any container.
 - **Wizarr:** Used to create links that can be sent to users so they can be invited to your media server.
-- **Plex Meta Manager:** Used to create collections, overlays, playlists and much more!
 - **Plex Auto Lanaguages:** Used to auto update the language of your Plex Tv episodes
 
 <img width="353" alt="image" src="https://github.com/DonMcD/ultimate-plex-stack/assets/90471623/a9b8faf8-072e-4fb3-ac18-2ffd29d0f760">
