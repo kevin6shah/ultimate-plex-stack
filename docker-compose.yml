@@ -71,7 +71,9 @@ services:
     container_name: maintainerr
     user: ${USER_ID}:${USER_ID}
     volumes:
-      - ${BASE_PATH}/maintainerr/data:/opt/data
+      - type: bind
+        source: ./maintainerr/data
+        target: /opt/data
     environment:
       - TZ=${TZ}
     ports:
