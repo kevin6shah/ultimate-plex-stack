@@ -69,7 +69,7 @@ services:
   maintainerr:
     image: ghcr.io/jorenn92/maintainerr:latest
     container_name: maintainerr
-    user: 1000:1000
+    user: ${USER_ID}:${USER_ID}
     volumes:
       - ${BASE_PATH}/maintainerr/data:/opt/data
     environment:
