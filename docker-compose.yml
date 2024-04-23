@@ -65,6 +65,7 @@ services:
       - 7359:7359/udp #optional
     restart: unless-stopped
 
+  #Maintainerr - Used to maintain/delete movies and stuff
   maintainerr:
     image: ghcr.io/jorenn92/maintainerr:latest
     container_name: maintainerr
@@ -143,51 +144,6 @@ services:
     ports:
       - 5055:5055
     restart: unless-stopped
-    
-  #Flaresolerr - Used as a proxy server to bypass Cloudflare and DDoS-GUARD protection.
-  flaresolverr:
-    # DockerHub mirror flaresolverr/flaresolverr:latest
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
-    environment:
-      - LOG_LEVEL=info
-      - LOG_HTML=false
-      - CAPTCHA_SOLVER=none
-      - TZ=${TZ}
-    ports:
-      - 8191:8191
-    restart: unless-stopped
-    
-  # #Gluetun - vpn container
-  # gluetun: #Setup for this container will be different depending on your VPN of choice
-  #   image: qmcgaw/gluetun
-  #   container_name: gluetun
-  #   # line above must be uncommented to allow external containers to connect.
-  #   # See https://github.com/qdm12/gluetun-wiki/blob/main/setup/connect-a-container-to-gluetun.md#external-container-to-gluetun
-  #   cap_add:
-  #     - NET_ADMIN
-  #   devices:
-  #     - /dev/net/tun:/dev/net/tun
-  #   ports:
-  #     - 8888:8888/tcp # HTTP proxy
-  #     - 8388:8388/tcp # Shadowsocks
-  #     - 8388:8388/udp # Shadowsocks
-  #     - 8080:8080 #Qbittorent Web UI
-  #     - 8081:8081 #Qbittorent Web UI
-  #     - 8694:8694
-  #     - 8694:8694/udp
-  #   volumes:
-  #     - ${BASE_PATH}/gluetun:/gluetun
-  #   environment:
-  #     - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER} # Example airvpn
-  #     - VPN_TYPE=wireguard #Wireguard is generally faster than OpenVPN
-  #     - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY} #Example IE4cdRxZzoy/HvlLXVLB.2Hy@d=
-  #     - WIREGUARD_PRESHARED_KEY=${WIREGUARD_PRESHARED_KEY} #Example IE4cdRxZzoy/HvlLXVLB.2Hy@d=
-  #     - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES} #Example 101.14.14.28/32
-  #     - SERVER_HOSTNAMES=${SERVER_HOSTNAMES} #Example vpn.airdns.org
-  #     - SERVER_NAMES=${VPN_SERVER_NAMES} #Example Dallim
-  #     - SERVER_CITIES=${VPN_SERVER_CITIES} #Example Albasserdonia
-  #     - FIREWALL_VPN_INPUT_PORTS=${FIREWALL_VPN_INPUT_PORTS} #Example 8926 - Used for port forwarding
       
   #Qbittorent - torrenting software
   #
@@ -217,20 +173,6 @@ services:
       - ${BASE_PATH}/qbittorent/config:/config
       - ${UNRAID_SHARE}:/share
     restart: unless-stopped
-    
-  #De-unhealth - used to restart qbitorrent if gluetun VPN tunnel ever drops
-  deunhealth:
-    build: .
-    image: qmcgaw/deunhealth
-    container_name: deunhealth
-
-    environment:
-      - LOG_LEVEL=info
-      - HEALTH_SERVER_ADDRESS=127.0.0.1:9999
-      - TZ=${TZ}
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       
   #Bazarr - for subtitles. Try to use SRT format if you can rather than PGS due to performance issues
   bazarr:
@@ -246,19 +188,6 @@ services:
       - ${UNRAID_SHARE}:/share
     ports:
       - 6767:6767
-      
-  #Plex Auto Languages - This switchs languages automatically example: watching english show and non english speaks you get subtitle lol
-  plexautolanguages:
-    image: remirigal/plex-auto-languages:latest
-    container_name: plex-auto-languages
-    environment:
-      - PLEX_URL=${PLEX_URL} #This is your local URl example: http://192.168.1.10:32400
-      #To find your plex token go to https://app.plex.tv/, go to your library, click on the 3 dots on the bottom right of one of your tv/movie posters
-      #Then click "View XML" in the bottom right of that popup, look at the URL of the XML window and find your X-Plex-Token= in the URL (at the very end)
-      - PLEX_TOKEN=${PLEX_TOKEN}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/pal/config:/config
     
   #Wizarr - Allows you to create a share link that you can send to users to invite them to your media server
   wizarr:
@@ -268,15 +197,6 @@ services:
       - 5690:5690
     volumes:
       - ${BASE_PATH}/wizarr/data/database:/data/database
-      
-  #Dozzle - Used to easily view logs of any container in real time!    
-  dozzle:
-    container_name: dozzle
-    image: amir20/dozzle:latest
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    ports:
-      - 9999:8080
     
   #Unpacker - Used to unzip zipped files
   unpackerr:
