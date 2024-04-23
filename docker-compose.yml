@@ -65,28 +65,17 @@ services:
       - 7359:7359/udp #optional
     restart: unless-stopped
 
-  deleterr:
-    image: ghcr.io/rfsbraz/deleterr:latest
-    container_name: deleterr
+  maintainerr:
+    image: ghcr.io/jorenn92/maintainerr:latest
+    container_name: maintainerr
+    user: 1000:1000
+    volumes:
+      - ${BASE_PATH}/maintainerr/data:/opt/data
     environment:
-        LOG_LEVEL: INFO
-    volumes:
-        - ${BASE_PATH}/deleterr/config:/config
-        - ${BASE_PATH}/deleterr/config/logs:/config/logs
+      - TZ=${TZ}
+    ports:
+      - 6246:6246
     restart: unless-stopped
-  
-  scheduler:
-    image: mcuadros/ofelia:latest
-    container_name: scheduler
-    depends_on:
-        - deleterr
-    command: daemon --docker
-    volumes:
-        - /var/run/docker.sock:/var/run/docker.sock:ro
-    restart: unless-stopped
-    labels:
-        ofelia.job-run.deleterr.schedule: "@weekly"
-        ofelia.job-run.deleterr.container: "deleterr"
     
   #Radarr - used to find movies automatically
   radarr:
