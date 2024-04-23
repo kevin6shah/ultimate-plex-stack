@@ -72,7 +72,7 @@ services:
     user: ${USER_ID}:${USER_ID}
     volumes:
       - type: bind
-        source: ./maintainerr/data
+        source: ${BASE_PATH}/maintainerr/data
         target: /opt/data
     environment:
       - TZ=${TZ}
