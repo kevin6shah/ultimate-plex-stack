@@ -1,35 +1,58 @@
 services:
-  # WireGuard VPN Container
   wireguard:
-    image: lscr.io/linuxserver/wireguard:latest
+    image: linuxserver/wireguard
     container_name: wireguard
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/New_York
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
+      - PUID=501
+      - PGID=20
+      - TZ=Etc/UTC
+      - SERVERURL=wireguard.example.com
+      - SERVERPORT=51820
+      - PEERS=1
+      - PEERDNS=auto
+      - INTERNAL_SUBNET=10.13.13.0
     volumes:
       - ./config/wireguard:/config
       - /lib/modules:/lib/modules
     ports:
-      - 9091:9091  # Transmission WebUI
-      - 51413:51413  # Transmission torrenting
-      - 51413:51413/udp
+      - 51820:51820/udp
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+
+  transmission:
+    image: linuxserver/transmission
+    container_name: transmission
+    network_mode: "service:wireguard"
+    environment:
+      - PUID=501
+      - PGID=20
+      - TZ=Etc/UTC
+      - UMASK=002
+    volumes:
+      - ./config/transmission:/config
+      - ./share:/share
+    restart: unless-stopped
+
+  transmission-proxy:
+    image: alpine/socat
+    container_name: transmission-proxy
+    command: tcp-listen:9091,fork,reuseaddr tcp-connect:wireguard:9091
+    ports:
+      - "9091:9091"
+    depends_on:
+      - wireguard
     restart: unless-stopped
 
   plex:
     image: lscr.io/linuxserver/plex:latest
     container_name: plex
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
       - VERSION=docker
       - PLEX_CLAIM=claim-nMSFhYzSR1BxDBzKtBkf
@@ -49,8 +72,8 @@ services:
     image: lscr.io/linuxserver/jellyfin:latest
     container_name: jellyfin
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
     ports:
       - 8096:8096
@@ -65,8 +88,8 @@ services:
     image: lscr.io/linuxserver/radarr:latest
     container_name: radarr
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
     ports:
       - 7878:7878
@@ -79,8 +102,8 @@ services:
     image: lscr.io/linuxserver/sonarr:latest
     container_name: sonarr
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
     ports:
       - 8989:8989
@@ -93,8 +116,8 @@ services:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
     ports:
       - 9696:9696
@@ -102,31 +125,12 @@ services:
       - ./config/prowlarr:/config
     restart: unless-stopped
 
-  # Transmission now routes through WireGuard
-  transmission:
-    image: lscr.io/linuxserver/transmission:latest
-    container_name: transmission
-    network_mode: "service:wireguard"  # Route through VPN
-    depends_on:
-      - wireguard
-    environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/New_York
-      - USER=admin
-      - PASS=adminadmin
-    volumes:
-      - ./config/transmission:/config
-      - ./share/downloads:/downloads
-      - ./share/downloads/watch:/watch
-    restart: unless-stopped
-
   overseerr:
     image: lscr.io/linuxserver/overseerr:latest
     container_name: overseerr
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
     ports:
       - 5055:5055
@@ -139,8 +143,8 @@ services:
     image: lscr.io/linuxserver/bazarr:latest
     container_name: bazarr
     environment:
-      - PUID=1000
-      - PGID=1000
+      - PUID=501
+      - PGID=20
       - TZ=America/New_York
     ports:
       - 6767:6767
