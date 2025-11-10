@@ -1,235 +1,184 @@
-# Welcome to my Ultimate Plex Stack!
-
-# I was hoping this could maybe help some people out when setting up their stack
-#
-# Environment Variable Examples:
-# USER_ID = 1000
-# TZ = America/Edmonton
-# BASE_PATH = /home/username/docker
-#
-# https://trash-guides.info/Hardlinks/Hardlinks-and-Instant-Moves/ # This can be useful for establishing how the media will be presented below
-# UNRAID_SHARE = /mnt/media   # This can also be renamed to "SHARE" or "MEDIA" this is where you will present your media
-#
-# NOTE: This is not a plug and play solution, some research / customization will be required to make this work as intented
-# Feel free to customize ie: remove/change/add containers as needed - one size does not fit all
-
----
-version: "2.1"
-
-  #networks: #This is used if you have a reverse proxy. I use Nginx Proxy Manager but anything will do
-  #proxy:
-  # external:
-  #   name: proxy
-      
 services:
-  #Plex - used to display the media
-  #
-  #This can also be replaced by Emby/Jellyfin
+  # WireGuard VPN Container
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - ./config/wireguard:/config
+      - /lib/modules:/lib/modules
+    ports:
+      - 9091:9091  # Transmission WebUI
+      - 51413:51413  # Transmission torrenting
+      - 51413:51413/udp
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+
   plex:
     image: lscr.io/linuxserver/plex:latest
     container_name: plex
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
       - VERSION=docker
-      - PLEX_CLAIM=${PLEX_CLAIM}
+      - PLEX_CLAIM=claim-nMSFhYzSR1BxDBzKtBkf
     ports:
-      - 32400:32400/tcp
-      - 8324:8324/tcp
-      - 32469:32469/tcp
+      - 32400:32400
+      - 8324:8324
+      - 32469:32469
       - 1900:1900/udp
-      - 32410:32410/udp
-      - 32412:32412/udp
-      - 32413:32413/udp
-      - 32414:32414/udp
-    devices:
-     - /dev/dri:/dev/dri #Required for plex HW transcoding / QuickSync
+      - 32410-32414:32410-32414/udp
     volumes:
-      - ${BASE_PATH}/plex/config:/config
-      - ${UNRAID_SHARE}/media:/media
+      - ./share/media:/media
+      - ./share/downloads:/downloads
+      - ./config/plex:/config
     restart: unless-stopped
 
   jellyfin:
     image: lscr.io/linuxserver/jellyfin:latest
     container_name: jellyfin
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/jellyfin/config:/config
-      - ${UNRAID_SHARE}/media:/media
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     ports:
       - 8096:8096
-      - 7359:7359/udp #optional
+      - 7359:7359/udp
+    volumes:
+      - ./config/jellyfin:/config
+      - ./share/media:/media
+      - ./share/downloads:/downloads
     restart: unless-stopped
 
-  #Maintainerr - Used to maintain/delete movies and stuff
-  maintainerr:
-    image: ghcr.io/jorenn92/maintainerr:latest
-    container_name: maintainerr
-    user: ${USER_ID}:${USER_ID}
-    volumes:
-      - type: bind
-        source: ${BASE_PATH}/maintainerr/data
-        target: /opt/data
-    environment:
-      - TZ=${TZ}
-    ports:
-      - 6246:6246
-    restart: unless-stopped
-    
-  #Radarr - used to find movies automatically
   radarr:
     image: lscr.io/linuxserver/radarr:latest
     container_name: radarr
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/radarr/config:/config
-      - ${UNRAID_SHARE}:/share #Access to the entire share
-    #networks: #Does not connect to overseer if you use NPM
-    #  - proxy
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     ports:
       - 7878:7878
+    volumes:
+      - ./config/radarr:/config
+      - ./share:/share
     restart: unless-stopped
-    
-  #Sonarr - used to find tv shows automatically
+
   sonarr:
     image: lscr.io/linuxserver/sonarr:latest
     container_name: sonarr
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/sonarr/config:/config
-      - ${UNRAID_SHARE}:/share #Access to the entire share
-    #networks: #Does not connect to overseer if you use NPM
-    #  - proxy
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     ports:
       - 8989:8989
+    volumes:
+      - ./config/sonarr:/config
+      - ./share:/share
     restart: unless-stopped
-    
-  #Prowlarr - manages your Sonarr, Radarr and download client
+
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/prowlarr/config:/config
-    #networks:
-    #  - proxy
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     ports:
       - 9696:9696
+    volumes:
+      - ./config/prowlarr:/config
     restart: unless-stopped
 
-  #Overseer - allows users to request media on their own
+  # Transmission now routes through WireGuard
+  transmission:
+    image: lscr.io/linuxserver/transmission:latest
+    container_name: transmission
+    network_mode: "service:wireguard"  # Route through VPN
+    depends_on:
+      - wireguard
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+      - USER=admin
+      - PASS=adminadmin
+    volumes:
+      - ./config/transmission:/config
+      - ./share/downloads:/downloads
+      - ./share/downloads/watch:/watch
+    restart: unless-stopped
+
   overseerr:
     image: lscr.io/linuxserver/overseerr:latest
     container_name: overseerr
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/overseer/config:/config
-      - ${UNRAID_SHARE}:/share #Access to the entire share
-    #networks:
-    #  - proxy
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     ports:
       - 5055:5055
-    restart: unless-stopped
-      
-  #Qbittorent - torrenting software
-  #
-  #You can also use RuTorrent, Transmisson or Deluge
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    # network_mode: "service:gluetun"
-    container_name: qbittorrent
-    # labels:
-    #   - deunhealth.restart.on.unhealthy=true
-    environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-      - WEBUI_PORT=8080
-      - TORRENTING_PORT=8694
-    ports:
-      - 8080:8080
-      - 6881:6881
-      - 6881:6881/udp
-    # healthcheck: # https://github.com/qdm12/gluetun/issues/641#issuecomment-933856220
-    #   test: "curl -sf https://1.1.1.1/  || exit 1"
-    #   interval: 1m
-    #   timeout: 10s
-    #   retries: 1
     volumes:
-      - ${BASE_PATH}/qbittorent/config:/config
-      - ${UNRAID_SHARE}:/share
+      - ./config/overseerr:/config
+      - ./share:/share
     restart: unless-stopped
-      
-  #Bazarr - for subtitles. Try to use SRT format if you can rather than PGS due to performance issues
+
   bazarr:
-    container_name: bazarr
     image: lscr.io/linuxserver/bazarr:latest
-    restart: unless-stopped
+    container_name: bazarr
     environment:
-      - PUID=${USER_ID}
-      - PGID=${USER_ID}
-      - TZ=${TZ}
-    volumes:
-      - ${BASE_PATH}/bazarr/config:/config
-      - ${UNRAID_SHARE}:/share
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
     ports:
       - 6767:6767
-    
-  #Wizarr - Allows you to create a share link that you can send to users to invite them to your media server
-  wizarr:
-    container_name: wizarr
-    image: ghcr.io/wizarrrr/wizarr:latest
-    ports:
-      - 5690:5690
     volumes:
-      - ${BASE_PATH}/wizarr/data/database:/data/database
-    
-  #Unpacker - Used to unzip zipped files
+      - ./config/bazarr:/config
+      - ./share:/share
+    restart: unless-stopped
+
+  maintainerr:
+    image: ghcr.io/jorenn92/maintainerr:latest
+    container_name: maintainerr
+    user: "1000:1000"
+    environment:
+      - TZ=America/New_York
+    ports:
+      - 6246:6246
+    volumes:
+      - ./config/maintainerr/data:/opt/data
+    restart: unless-stopped
+
   unpackerr:
     image: golift/unpackerr
     container_name: unpackerr
-
-    volumes:
-      # You need at least this one volume mapped so Unpackerr can find your files to extract.
-      # Make sure this matches your Starr apps; the folder mount (/downloads or /data) should be identical.
-      - ${UNRAID_SHARE}:/share
-      #- ${BASE_PATH}/unpackerr/config:/config
-    restart: always
-    user: ${USER_ID}:${USER_ID} #Needs to run as 1000
-    # What you see below are defaults for this compose. You only need to modify things specific to your environment.
-    # Remove apps and feature configs you do not use or need. 
-    # ie. Remove all lines that begin with UN_CMDHOOK, UN_WEBHOOK, UN_FOLDER, UN_WEBSERVER, and other apps you do not use.
+    user: "1000:1000"
     environment:
+      - TZ=America/New_York
       - UN_START_DELAY=1m
-      #- UMASK=002
-      - TZ=${TZ}
-      #- UN_DEBUG=true
-      # Sonarr Config
-      - UN_SONARR_0_URL=http://${SERVER_IP}:7878
-      - UN_SONARR_0_API_KEY=${SONARR_KEY}
-      #- UN_SONARR_0_PATHS_0=/share/downloads/tv
-      - UN_SONARR_0_TIMEOUT=10s
-      #- UN_SONARR_0_PATHS_0=/share/downloads/tv
-      # Radarr Config
-      - UN_RADARR_0_URL=http://${SERVER_IP}:8989
-      - UN_RADARR_0_API_KEY=${RADARR_KEY}
-      #- UN_RADARR_0_PATHS_0=/share/downloads/movies
-      - UN_RADARR_0_TIMEOUT=10s
-      #- UN_RADARR_0_PATHS_0=/share/downloads/movies
- 
+    volumes:
+      - ./share:/share
+    restart: unless-stopped
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    ports:
+      - 9000:9000
+      - 9443:9443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config/portainer:/data
+    restart: unless-stopped
