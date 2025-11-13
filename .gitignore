@@ -1,4 +1,23 @@
+# Config directories (contain sensitive data)
 config/
-Friday-key-pair-*.pem
-.DS_Store
 share/
+
+# Environment files
+.env
+
+# Key files
+*.pem
+*.key
+
+# Mac files
+.DS_Store
+
+# Logs
+*.log
+
+# Backups
+*.backup
+backup/
+
+# Docker
+.docker/

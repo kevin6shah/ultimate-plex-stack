@@ -1,0 +1,25 @@
+# Environment Variables for Plex Stack
+# Copy this file to .env and update with your values
+
+# User IDs (run 'id' in terminal to find yours)
+PUID=501
+PGID=20
+
+# Timezone
+TZ=America/New_York
+
+# Plex Claim Token (get from https://www.plex.tv/claim)
+PLEX_CLAIM=claim-XXXXXXXXXXXXXXXXXX
+
+# VPN Information (for documentation)
+EC2_PUBLIC_IP=
+AWS_ACCOUNT_EMAIL=
+EC2_KEY_NAME=
+
+# Transmission Credentials
+TRANSMISSION_USER=admin
+TRANSMISSION_PASS=adminadmin
+
+# Renewal Tracking
+LAST_RENEWAL_DATE=
+NEXT_RENEWAL_DATE=
