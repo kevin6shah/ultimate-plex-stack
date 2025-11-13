@@ -15,7 +15,7 @@ if ! docker info > /dev/null 2>&1; then
 fi
 
 # Create config directory if it doesn't exist
-CONFIG_DIR="./config/wireguard"
+CONFIG_DIR="./config/wireguard/wg_confs"
 mkdir -p "$CONFIG_DIR"
 
 echo "📋 Paste your WireGuard client configuration below."

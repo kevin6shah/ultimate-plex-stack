@@ -1,6 +1,7 @@
 services:
+  # WireGuard VPN Container - REQUIRED for secure torrenting
   wireguard:
-    image: linuxserver/wireguard
+    image: lscr.io/linuxserver/wireguard:latest
     container_name: wireguard
     cap_add:
       - NET_ADMIN
@@ -8,43 +9,40 @@ services:
     environment:
       - PUID=501
       - PGID=20
-      - TZ=Etc/UTC
-      - SERVERURL=wireguard.example.com
-      - SERVERPORT=51820
-      - PEERS=1
-      - PEERDNS=auto
-      - INTERNAL_SUBNET=10.13.13.0
+      - TZ=America/New_York
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     volumes:
       - ./config/wireguard:/config
       - /lib/modules:/lib/modules
     ports:
-      - 51820:51820/udp
+      - 9091:9091  # Transmission WebUI
+      - 51413:51413  # Transmission torrenting TCP
+      - 51413:51413/udp  # Transmission torrenting UDP
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=1  # Disable IPv6 to prevent leaks
+      - net.ipv6.conf.default.disable_ipv6=1
     restart: unless-stopped
 
+  # Transmission - Routes ALL traffic through WireGuard
   transmission:
-    image: linuxserver/transmission
+    image: lscr.io/linuxserver/transmission:latest
     container_name: transmission
-    network_mode: "service:wireguard"
+    network_mode: "service:wireguard"  # THIS IS CRITICAL - shares WireGuard's network
+    depends_on:
+      - wireguard
     environment:
       - PUID=501
       - PGID=20
-      - TZ=Etc/UTC
+      - TZ=America/New_York
       - UMASK=002
+      - USER=admin
+      - PASS=adminadmin
     volumes:
       - ./config/transmission:/config
-      - ./share:/share
-    restart: unless-stopped
-
-  transmission-proxy:
-    image: alpine/socat
-    container_name: transmission-proxy
-    command: tcp-listen:9091,fork,reuseaddr tcp-connect:wireguard:9091
-    ports:
-      - "9091:9091"
-    depends_on:
-      - wireguard
+      - ./share:/share  # Unified volume for hardlinking
     restart: unless-stopped
 
   plex:
@@ -156,7 +154,7 @@ services:
   maintainerr:
     image: ghcr.io/jorenn92/maintainerr:latest
     container_name: maintainerr
-    user: "1000:1000"
+    user: "501:20"
     environment:
       - TZ=America/New_York
     ports:
@@ -168,7 +166,7 @@ services:
   unpackerr:
     image: golift/unpackerr
     container_name: unpackerr
-    user: "1000:1000"
+    user: "501:20"
     environment:
       - TZ=America/New_York
       - UN_START_DELAY=1m
