@@ -1,3 +1,5 @@
+version: '3.9'
+
 services:
   # WireGuard VPN Container - REQUIRED for secure torrenting
   wireguard:
@@ -54,6 +56,11 @@ services:
       - TZ=America/New_York
       - VERSION=docker
       - PLEX_CLAIM=claim-nMSFhYzSR1BxDBzKtBkf
+      # Advertise the host IP to ensure clients see the correct LAN address. Replace 192.168.1.42
+      # with the IP address of the Mac or host running Docker. Without this, Plex may
+      # broadcast the container's bridge IP, causing indirect connections and forcing
+      # low-quality transcodes on remote clients like Apple TV.
+      - ADVERTISE_IP=http://192.168.1.237:32400/
     ports:
       - 32400:32400
       - 8324:8324
