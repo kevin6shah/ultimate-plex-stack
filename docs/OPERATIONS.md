@@ -100,7 +100,7 @@ To reapply the stable Transmission host in Radarr and Sonarr:
 Transmission is reachable from other Tailscale devices through the Mac's Tailnet identity:
 
 ```text
-http://kevins-macbook-pro.tail87437e.ts.net:9091/transmission/web/
+http://friday-media.tail87437e.ts.net:9091/transmission/web/
 ```
 
 Alternate direct Tailscale IP:
@@ -166,6 +166,8 @@ VPN_EXPECTED_PUBLIC_IP=203.0.113.10
 TELEGRAM_BOT_TOKEN=123456:example
 TELEGRAM_CHAT_ID=123456789
 ```
+
+Transmission credentials are local runtime secrets now. Keep the active values in `.friday-ops.env` and in the Arr download-client configs; do not reintroduce them as tracked literals in `docker-compose.yml`.
 
 ## Autonomous Cleanup Workflow
 

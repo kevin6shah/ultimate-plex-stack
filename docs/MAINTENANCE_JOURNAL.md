@@ -210,3 +210,35 @@
 - Result:
   - Bazarr still relies on SignalR for truly immediate subtitle searches, but missed-event recovery is now much faster on the sync side.
   - Transmission can now be tracked from the user's phone over Tailscale with a stable MagicDNS hostname.
+
+### Change: Tailscale machine hostname renamed to `friday-media`
+
+- Evidence:
+  - `tailscale status --json` now reports:
+    - `Self.DNSName = friday-media.tail87437e.ts.net.`
+    - `Self.HostName = friday-media`
+  - Verified live service responses over the new MagicDNS name:
+    - Radarr `http://friday-media.tail87437e.ts.net:7878` -> `200`
+    - Overseerr `http://friday-media.tail87437e.ts.net:5055` -> `307`
+    - Sonarr `http://friday-media.tail87437e.ts.net:8989` -> `302`
+    - Transmission `http://friday-media.tail87437e.ts.net:9091/transmission/web/` -> `401`
+- Change:
+  - Ran `tailscale set --hostname=friday-media`.
+  - Updated repo docs to use the new preferred MagicDNS hostname instead of the prior Mac-derived name.
+- Result:
+  - The stack now has a stable, human-chosen Tailscale hostname for phone and laptop access.
+
+### Change: Sonarr-to-Prowlarr torrent handoff repaired and Transmission auth rotated
+
+- Evidence:
+  - `config/sonarr/logs/sonarr.txt` showed repeated `Connection refused (vpn-web-proxy:80)` errors while Sonarr tried to add Daredevil releases to the download queue.
+  - Live Sonarr download-client tests later succeeded against `vpn-web-proxy:9091`.
+  - A fresh manual `EpisodeSearch` for `Daredevil: Born Again` grabbed `Daredevil.Born.Again.S02E01.1080p.WEB.h264-ETHEL` from `EZTV (Prowlarr)` and queued it in Transmission.
+- Change:
+  - Added an internal port `80` listener to tracked `ops/vpn-web-proxy/default.conf` that proxies to `wireguard:9696` so Sonarr's default Prowlarr download URLs resolve correctly.
+  - Rotated the Transmission Web UI credentials away from the default account.
+  - Updated Sonarr and Radarr to use the new Transmission credentials.
+  - Moved the Transmission container credentials out of tracked `docker-compose.yml` literals and into the local `.friday-ops.env` runtime file.
+- Result:
+  - The broken triangle state on the live Daredevil request was caused by the missing internal Prowlarr proxy listener, and that path is now fixed.
+  - Transmission is reachable at the existing Tailscale URL with the new credentials, and Sonarr can queue downloads end-to-end again while the VPN guard remains in force.

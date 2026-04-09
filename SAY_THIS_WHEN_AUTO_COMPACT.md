@@ -36,5 +36,8 @@ Current live baseline:
 - `The Pirate Bay` is intentionally disabled
 - `TorrentGalaxyClone` and `The Pirate Bay` still fail local helper-backed tests
 - Radarr and Sonarr should use Transmission at `vpn-web-proxy:9091`
+- `vpn-web-proxy` must also listen on internal port `80` and proxy that to Prowlarr on `wireguard:9696`, otherwise Sonarr release grabs can fail with `Connection refused (vpn-web-proxy:80)`
 - Bazarr should have `radarr.movies_sync: 15`, `sonarr.series_sync: 15`, and `defer_search_signalr: false` for both
 - Bazarr wanted-search intervals cannot go below 6 hours in version `1.5.3`
+- preferred Tailscale hostname: `friday-media.tail87437e.ts.net`
+- Transmission credentials should live in the local `.friday-ops.env`, not as tracked `docker-compose.yml` literals
