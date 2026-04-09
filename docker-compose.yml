@@ -19,7 +19,6 @@ services:
       - ./config/wireguard:/config
       - /lib/modules:/lib/modules
     ports:
-      - 9091:9091  # Transmission WebUI
       - 51413:51413  # Transmission torrenting TCP
       - 51413:51413/udp  # Transmission torrenting UDP
     sysctls:
@@ -120,14 +119,54 @@ services:
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
+    network_mode: "service:wireguard"  # Shares WireGuard's egress for indexer traffic
+    depends_on:
+      - wireguard
     environment:
       - PUID=501
       - PGID=20
       - TZ=America/New_York
-    ports:
-      - 9696:9696
     volumes:
       - ./config/prowlarr:/config
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: "service:wireguard"
+    depends_on:
+      - wireguard
+    environment:
+      - LOG_LEVEL=info
+      - TZ=America/New_York
+      - HOST=0.0.0.0
+      - PORT=8191
+    restart: unless-stopped
+
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    network_mode: "service:wireguard"
+    depends_on:
+      - wireguard
+    init: true
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8192
+    restart: unless-stopped
+
+  vpn-web-proxy:
+    image: nginx:alpine
+    container_name: vpn-web-proxy
+    depends_on:
+      - wireguard
+      - transmission
+      - prowlarr
+    ports:
+      - 9091:9091  # Transmission WebUI via stable bridge proxy
+      - 9696:9696  # Prowlarr WebUI via stable bridge proxy
+    volumes:
+      - ./config/vpn-web-proxy/default.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
 
   overseerr:

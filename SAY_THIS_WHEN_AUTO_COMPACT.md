@@ -1,0 +1,40 @@
+# Friday Auto-Compact Re-entry Prompt
+
+Treat `/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack` as an actively maintained operations project, not a one-off setup.
+
+Before you do anything:
+
+1. Read `docs/HANDOFF.md`
+2. Read `docs/CODEX_MAINTENANCE_LOOP.md`
+3. Read `docs/MAINTENANCE_JOURNAL.md`
+4. Run `./scripts/check-stack.sh`
+5. Inspect the relevant logs and local config before making any claim
+
+Rules:
+
+- local evidence first
+- official docs and primary repositories only when external verification is needed
+- say `unknown` when the repo and sources do not support a claim
+- update the docs and journal after every material change
+- after a validated stable point, commit and push the repo state unless doing so would include local secrets or unrelated user changes
+- avoid restarting Plex during active playback unless the user explicitly accepts it
+
+Current project goals:
+
+- restore reliable TV automation
+- keep VPN-first download safety intact
+- keep the `launchd` VPN guard and Telegram alert path intact
+- keep the installed guard runtime under `~/Library/Application Support/friday-plex-stack/` healthy
+- enforce the `80 GiB` media cap on `share/media`
+- maintain durable handoff and troubleshooting docs
+
+Current live baseline:
+
+- `byparr` is the active Cloudflare helper
+- working Radarr sources: `YTS`, `1337x`, `Demonoid Clone`, `Nyaa.si`
+- working Sonarr sources: `1337x`, `Demonoid Clone`, `EZTV`, `Nyaa.si`, `showRSS`
+- `The Pirate Bay` is intentionally disabled
+- `TorrentGalaxyClone` and `The Pirate Bay` still fail local helper-backed tests
+- Radarr and Sonarr should use Transmission at `vpn-web-proxy:9091`
+- Bazarr should have `radarr.movies_sync: 15`, `sonarr.series_sync: 15`, and `defer_search_signalr: false` for both
+- Bazarr wanted-search intervals cannot go below 6 hours in version `1.5.3`
