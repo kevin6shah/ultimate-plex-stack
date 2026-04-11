@@ -242,3 +242,35 @@
 - Result:
   - The broken triangle state on the live Daredevil request was caused by the missing internal Prowlarr proxy listener, and that path is now fixed.
   - Transmission is reachable at the existing Tailscale URL with the new credentials, and Sonarr can queue downloads end-to-end again while the VPN guard remains in force.
+
+## 2026-04-10
+
+### Change: Maintainerr scheduled runs validated after the Plex token refresh
+
+- Evidence:
+  - `docker logs --tail 200 maintainerr` now shows clean scheduled executions on `2026-04-09` and `2026-04-10`.
+  - Recent log lines include:
+    - `Starting execution of all active rules`
+    - `Execution of rules for 'Radarr' done.`
+    - `Execution of rules for 'sonarr' done.`
+    - `All collections handled. No data was altered`
+  - The prior `Plex api communication failure` is absent from the latest scheduled runs.
+- Change:
+  - No config change was required in this step; this was a validation pass on the already-refreshed Maintainerr configuration.
+- Result:
+  - Maintainerr is no longer blocked on Plex communication during its scheduled rule and collection handlers.
+  - Current rules are evaluating successfully, but they are not deleting or altering any media in the present configuration/run window.
+
+### Change: remote Tailscale access paths documented and scripted
+
+- Evidence:
+  - `tailscale status --json` reports:
+    - `Self.DNSName = friday-media.tail87437e.ts.net.`
+    - `Self.TailscaleIPs[0] = 100.77.97.13`
+  - Local HTTP checks confirm the key service paths respond on the Tailscale hostname.
+- Change:
+  - Added `docs/REMOTE_ACCESS.md` with the durable Tailscale URLs, auth expectations, VPN-guard behavior, and Amphetamine lid-closed assumptions.
+  - Added `scripts/print-remote-access.sh` to print the current live Tailscale endpoints and operating assumptions from the host.
+  - Updated operations, troubleshooting, and handoff docs to point to the new remote-access reference.
+- Result:
+  - The stack now has a tracked, repo-local source of truth for phone/laptop access paths instead of relying on ephemeral chat history.

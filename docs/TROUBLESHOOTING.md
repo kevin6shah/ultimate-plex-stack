@@ -120,6 +120,36 @@ Interpretation:
 - In the current live config, `defer_search_signalr` is disabled for both Arr apps, so Bazarr should react immediately when the SignalR feed is healthy.
 - Bazarr 1.5.3 will not accept wanted-search intervals below 6 hours, so the practical fallback is the tightened 15-minute Arr sync cadence plus the 6-hour wanted scan.
 
+### Tailscale remote access fails after closing the lid
+
+Symptom:
+
+- Tailscale URLs worked while the MacBook lid was open, then stopped responding after the lid was closed.
+
+Local evidence:
+
+- `pmset -g assertions` can confirm whether Amphetamine is currently preventing idle sleep.
+- Closed-lid operation still depends on the active Amphetamine session settings, not just the general presence of the app.
+
+Interpretation:
+
+- Preventing idle sleep while the lid is open is not the same as preventing system sleep when the display is closed.
+- For lid-closed server use, the active Amphetamine session must explicitly disable `Allow system sleep when display is closed`.
+- Amphetamine Enhancer should be installed, and the MacBook should stay on AC power during the test.
+
+Quick check:
+
+```bash
+pmset -g assertions
+./scripts/print-remote-access.sh
+```
+
+If lid-closed mode is still unreliable:
+
+- restart the current Amphetamine session after changing the closed-display option
+- test one of the Tailscale URLs from your phone with the lid closed
+- if reliability still matters more than silence/portability, keep the lid open and let only the display sleep
+
 ### Maintainerr skipped cleanup
 
 Symptom:

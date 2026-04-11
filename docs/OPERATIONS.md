@@ -169,6 +169,16 @@ TELEGRAM_CHAT_ID=123456789
 
 Transmission credentials are local runtime secrets now. Keep the active values in `.friday-ops.env` and in the Arr download-client configs; do not reintroduce them as tracked literals in `docker-compose.yml`.
 
+## Remote Access
+
+Use Tailscale for phone and laptop access. The durable URL and sleep notes are documented in `docs/REMOTE_ACCESS.md`.
+
+To print the current live endpoints from the host:
+
+```bash
+./scripts/print-remote-access.sh
+```
+
 ## Autonomous Cleanup Workflow
 
 1. Review current usage:

@@ -12,10 +12,9 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 ## Current Priorities
 
 1. Keep the rebuilt TV automation path healthy with the current working source set.
-2. Validate the next scheduled Maintainerr rule run with the refreshed Plex token before forcing any cleanup.
-3. Keep the media library inside the `80 GiB` cap.
-4. Maintain repo-local operations docs after every change.
-5. Expand movie backup coverage beyond the currently working public sources if needed.
+2. Keep the media library inside the `80 GiB` cap.
+3. Maintain repo-local operations docs after every change.
+4. Expand movie backup coverage beyond the currently working public sources if needed.
 
 ## Current Defaults
 
@@ -35,7 +34,7 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 - Radarr and Sonarr now reach Transmission through `vpn-web-proxy:9091`; if download handoff breaks again, check that hostname before debugging Transmission itself.
 - Bazarr still depends on SignalR for truly immediate subtitle searches after import. The sync fallback is now 15 minutes, but Bazarr's built-in wanted-search scheduler cannot be set below 6 hours in this version.
 - `prowlarr` now shares the `wireguard` network namespace for egress, uses `http://vpn-web-proxy:9696` as the stable bridge-network access point, and reaches `radarr`/`sonarr` through the Docker bridge gateway at `172.18.0.1`.
-- Maintainerr no longer uses the brittle `*.plex.direct` hostname, but its cleanup path still needs validation on the next scheduled run after the Plex token refresh.
+- Maintainerr no longer uses the brittle `*.plex.direct` hostname, and scheduled rule runs now complete without app reachability errors, but the current runs have not altered any data yet.
 - The installed VPN guard now runs from `~/Library/Application Support/friday-plex-stack/` because macOS background jobs could not reliably execute the repo copy from `Documents`.
 - Docker Desktop storage and macOS storage views are larger than `share/media`; that overhead must be tracked separately from the media cap.
 
@@ -48,18 +47,15 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 
 ## Immediate Next Steps
 
-1. Observe the next scheduled Maintainerr rule execution before manually running cleanup actions.
-2. Decide how the media-cap script should be scheduled on macOS after validation.
-3. Add alternative movie backups for the still-failing `TorrentGalaxyClone` and `The Pirate Bay` slots if you want more redundancy.
-4. Add Tailscale access paths for Overseerr and Transmission from phone/laptop to the durable docs, not just the current live hostname.
+1. Decide how the media-cap script should be scheduled on macOS after validation.
+2. Add alternative movie backups for the still-failing `TorrentGalaxyClone` and `The Pirate Bay` slots if you want more redundancy.
+3. Confirm Bazarr subtitle pickup on a completed import after the recent sync tightening.
+4. If Maintainerr should actively delete media instead of only evaluating rules, review the current rule set before forcing a manual execution.
 
 ## Backlog
 
-1. Add Tailscale-based remote access for request apps so Overseerr can be used off-LAN from phone and laptop.
-2. Add Tailscale-based remote access for Transmission Web UI from phone, with VPN guard behavior documented so downloads still fail closed if WireGuard is unhealthy.
-3. Evaluate the best remote playback path over Tailscale for Plex and Jellyfin when the laptop stays awake under Amphetamine.
-4. Document the exact remote URLs, auth expectations, and battery/sleep assumptions for the MacBook-hosted stack.
-5. Add a durable AWS/WireGuard rotation workflow so yearly account replacement is a scripted config swap instead of a manual rebuild.
+1. Evaluate the best remote playback path over Tailscale for Plex and Jellyfin when the laptop stays awake under Amphetamine.
+2. Add a durable AWS/WireGuard rotation workflow so yearly account replacement is a scripted config swap instead of a manual rebuild.
 
 ## Resume Checklist
 

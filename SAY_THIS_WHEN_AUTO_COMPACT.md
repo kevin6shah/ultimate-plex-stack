@@ -41,3 +41,5 @@ Current live baseline:
 - Bazarr wanted-search intervals cannot go below 6 hours in version `1.5.3`
 - preferred Tailscale hostname: `friday-media.tail87437e.ts.net`
 - Transmission credentials should live in the local `.friday-ops.env`, not as tracked `docker-compose.yml` literals
+- `docs/REMOTE_ACCESS.md` and `./scripts/print-remote-access.sh` are the durable sources of truth for current Tailscale URLs and lid-closed assumptions
+- Maintainerr scheduled runs are now passing without Plex reachability errors, but current runs have not altered media yet
