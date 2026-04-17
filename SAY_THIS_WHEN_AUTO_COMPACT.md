@@ -39,7 +39,12 @@ Current live baseline:
 - `vpn-web-proxy` must also listen on internal port `80` and proxy that to Prowlarr on `wireguard:9696`, otherwise Sonarr release grabs can fail with `Connection refused (vpn-web-proxy:80)`
 - Bazarr should have `radarr.movies_sync: 15`, `sonarr.series_sync: 15`, and `defer_search_signalr: false` for both
 - Bazarr wanted-search intervals cannot go below 6 hours in version `1.5.3`
+- Bazarr should not count embedded subtitles as satisfying the desired language, but external subtitle success is still limited by provider coverage; on this host `tvsubtitles` is currently the only clean provider path
 - preferred Tailscale hostname: `friday-media.tail87437e.ts.net`
 - Transmission credentials should live in the local `.friday-ops.env`, not as tracked `docker-compose.yml` literals
 - `docs/REMOTE_ACCESS.md` and `./scripts/print-remote-access.sh` are the durable sources of truth for current Tailscale URLs and lid-closed assumptions
 - Maintainerr scheduled runs are now passing without Plex reachability errors, but current runs have not altered media yet
+- `./scripts/install-media-cap-launchd.sh` exists now, and the installed runtime must force `MEDIA_CAP_IO_MODE=docker` so scheduled cleanup does not depend on background access to the repo under `Documents`
+- The AWS EC2 host is shared with the production Iris backend in `/Users/kevinshah/Documents/mta-led-sign`; `docs/AWS_MIGRATION.md` is now the primary account-rotation doc, not `QUICK-RENEWAL-GUIDE.md`
+- The current AWS migration model is no-domain by design; use `docs/AWS_BLUE_GREEN_RUNBOOK.md`, `./scripts/check-aws-migration-readiness.sh`, and `ops/aws/iam/codex-migration-policy.json` when preparing a new free AWS account
+- `./scripts/prepare-migration-day.sh` is the final green-light gate before the user says `migrate`

@@ -274,3 +274,102 @@
   - Updated operations, troubleshooting, and handoff docs to point to the new remote-access reference.
 - Result:
   - The stack now has a tracked, repo-local source of truth for phone/laptop access paths instead of relying on ephemeral chat history.
+
+### Change: Bazarr subtitle trigger path tightened, but provider coverage is still incomplete
+
+- Evidence:
+  - Imported `Daredevil: Born Again` episodes exist under `share/media/tv/...` without external subtitle sidecars.
+  - `config/bazarr/db/bazarr.db` showed those episodes with `missing_subtitles = []` while their stored subtitle rows only referenced embedded tracks.
+  - `ffprobe` inside the `bazarr` container confirmed the files include internal English subtitle tracks.
+  - `docker logs bazarr --tail 200` showed:
+    - `opensubtitlescom` throttled after provider errors and a `403/426` challenge path
+    - `podnapisi` throttled after IPv6 `Network unreachable`
+  - `curl -sS -H "X-Api-Key: ..."` against Bazarr's live API showed only `tvsubtitles` remaining healthy after provider cleanup.
+  - Bazarr provider lookups for tested `Daredevil` episodes returned `[]`, so no external subtitle candidate was available from the reachable provider.
+- Change:
+  - Updated the live Bazarr config so embedded subtitles no longer satisfy the desired language.
+  - Reduced the enabled providers to the locally reachable set instead of leaving clearly broken providers active.
+- Result:
+  - Future imports should no longer be treated as subtitle-complete just because they contain internal subtitle tracks.
+  - The remaining limitation is now explicit: external subtitle downloads still depend on provider coverage, and the current reachable provider set is too weak to guarantee them.
+
+### Change: media-cap LaunchAgent installer now uses Docker-safe runtime mode
+
+- Evidence:
+  - The first draft of `scripts/install-media-cap-launchd.sh` copied `enforce-media-cap.sh` into `~/Library/Application Support/friday-plex-stack/`, but the script still expected the live media tree and Plex DB under the repo root.
+  - `docker cp "plex:/config/.../com.plexapp.plugins.library.db"` succeeds locally.
+  - `docker exec plex sh -lc 'du -sk /media'` succeeds locally.
+- Change:
+  - Extended `scripts/enforce-media-cap.sh` with `MEDIA_CAP_IO_MODE=host|docker`.
+  - Added container-aware Plex DB access and media deletion logic so scheduled runs can operate through the `plex` container instead of relying on background access to the repo under `Documents`.
+  - Updated `scripts/install-media-cap-launchd.sh` to force the installed support env to `MEDIA_CAP_IO_MODE=docker` and explicitly target the `plex` container.
+  - Added the related launchd env knobs to `.friday-ops.env.example`.
+- Verification:
+  - `./scripts/enforce-media-cap.sh --dry-run` exits `0`.
+  - `MEDIA_CAP_IO_MODE=docker ./scripts/enforce-media-cap.sh --dry-run` exits `0`.
+  - Installed `~/Library/LaunchAgents/com.friday.media-cap.plist`.
+  - `launchctl kickstart -k gui/$(id -u)/com.friday.media-cap` produced a clean dry-run entry in `~/Library/Logs/friday-plex-stack/media-cap.log`.
+- Result:
+  - Interactive local runs can stay on the simpler host path.
+  - The installed LaunchAgent path now has a defensible execution model for scheduled dry runs and later active enforcement.
+
+### Change: shared AWS host backup and migration toolkit added
+
+- Evidence:
+  - `AWS_PROFILE=friday-ec2 aws sts get-caller-identity` resolved account `767582655895` and IAM user `codex-ec2-deploy`.
+  - `aws ec2 describe-instances --instance-ids i-0c824a5a2b18d31d5` confirmed the live shared host at `54.90.132.5`, launched `2025-11-10T07:04:42Z`, instance type `t3.micro`, key pair `Friday-key-pair-11102025`, VPC `vpc-08b8e549449b2d539`, subnet `subnet-0ebe079417aec95cb`.
+  - `aws ec2 describe-security-groups --group-ids sg-09479da35bed15790` confirmed current ingress includes `80/tcp`, `22/tcp`, `51820/udp`, and an unnecessary `51413/udp`.
+  - SSH inspection of `54.90.132.5` confirmed the host runs:
+    - `wg-quick@wg0`
+    - `iris-backend`
+    - `nginx`
+  - SSH inspection also confirmed the critical live state lives in:
+    - `/etc/wireguard/wg0.conf`
+    - `/etc/nginx/sites-available/iris-backend`
+    - `/etc/systemd/system/iris-backend.service`
+    - `/opt/iris-backend/`
+- Change:
+  - Added `scripts/backup-aws-host.sh` to take a read-only local backup of the shared AWS host.
+  - Added `ops/aws/friday-shared-host.yaml` as the CloudFormation baseline for recreating the shared EC2 host in a new AWS account.
+  - Added `ops/aws/bootstrap-host.sh` and `ops/aws/restore-host-from-backup.sh` for package install and state restore on the new host.
+  - Added `scripts/migrate-aws-account.sh` as the future one-command migration entrypoint.
+  - Added `scripts/update-vpn-endpoint.sh` so Friday can keep the same WireGuard keys and only rotate the endpoint IP after host restore.
+  - Added `scripts/update-mta-led-sign-backend-url.sh` so local Iris source references can be rewritten to the new backend URL during migration.
+  - Added `docs/AWS_MIGRATION.md` and marked `QUICK-RENEWAL-GUIDE.md` as a legacy VPN-only quick reference instead of the primary rotation workflow.
+- Result:
+  - The repo now has a documented and scriptable shared-host backup/migration path that accounts for both Friday and Iris.
+  - The old renewal process is now explicitly documented as incomplete for the current production topology.
+
+### Change: no-domain free-account operating model hardened
+
+- Evidence:
+  - The user explicitly chose to keep rotating free AWS accounts and explicitly rejected paid domains for now.
+  - The current `friday-ec2` IAM user still lacks several actions needed for full green-host automation, including `cloudformation:ValidateTemplate`.
+- Change:
+  - Added `ops/aws/iam/codex-migration-policy.json` as the intended least-privilege-ish policy baseline for future AWS accounts.
+  - Added `ops/aws/iam/README.md` documenting how to create a dedicated `codex-migration` IAM user and local AWS CLI profile in each new account.
+  - Added `scripts/check-aws-migration-readiness.sh` so a new account can be validated before migration day.
+  - Added `docs/AWS_BLUE_GREEN_RUNBOOK.md` as the no-domain, raw-IP blue/green cutover procedure.
+  - Updated the AWS migration docs to reflect the newer AWS free-plan risk model and to treat raw IP cutover as the primary operational path for now.
+- Result:
+  - The repo now documents a coherent free-account operating model:
+    - fresh backup
+    - readiness check
+    - green-host creation
+    - raw-IP validation
+    - delayed blue teardown
+  - Future AWS accounts now have an explicit IAM bootstrap target instead of ad hoc permissions.
+
+### Change: migration-day green-light wrapper added
+
+- Change:
+  - Added `scripts/prepare-migration-day.sh` as the final migration-day preflight wrapper.
+  - Updated AWS migration docs and runbooks to treat that script as the explicit go/no-go gate before the user says `migrate`.
+- Result:
+  - The repo now has one concrete readiness command that checks:
+    - local tool availability
+    - current blue Friday health
+    - current Iris backend reachability
+    - required new-account inputs
+    - latest shared-host backup presence
+    - target AWS account readiness

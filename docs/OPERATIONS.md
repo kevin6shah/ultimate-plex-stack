@@ -32,6 +32,7 @@ du -sh share/media share/media/movies share/media/tv share/downloads
 
 ```bash
 ./scripts/backup-services.sh
+./scripts/backup-aws-host.sh
 ```
 
 ## Safe Restart Order
@@ -162,6 +163,10 @@ Example overrides:
 ```bash
 MEDIA_CAP_GB=80
 MEDIA_NEVER_DELETE_PATTERNS=The Godfather,Friday Favorites
+MEDIA_CAP_IO_MODE=host
+MEDIA_CAP_LAUNCHD_MODE=dry-run
+MEDIA_CAP_LAUNCHD_HOUR=3
+MEDIA_CAP_LAUNCHD_MINUTE=30
 VPN_EXPECTED_PUBLIC_IP=203.0.113.10
 TELEGRAM_BOT_TOKEN=123456:example
 TELEGRAM_CHAT_ID=123456789
@@ -178,6 +183,42 @@ To print the current live endpoints from the host:
 ```bash
 ./scripts/print-remote-access.sh
 ```
+
+## AWS Shared Host
+
+The AWS EC2 host is shared infrastructure:
+
+- Friday WireGuard VPN
+- Iris backend from `/Users/kevinshah/Documents/mta-led-sign`
+
+Do not treat AWS rotation as a Friday-only VPN task.
+
+Primary doc:
+
+- `docs/AWS_MIGRATION.md`
+- `docs/AWS_BLUE_GREEN_RUNBOOK.md`
+
+Safe backup command:
+
+```bash
+./scripts/backup-aws-host.sh
+./scripts/check-aws-migration-readiness.sh
+./scripts/prepare-migration-day.sh
+```
+
+Future migration entrypoint:
+
+```bash
+AWS_PROFILE=<new-account-profile> \
+KEY_NAME=<new-keypair-name> \
+EC2_SSH_KEY=/path/to/new-key.pem \
+./scripts/migrate-aws-account.sh --yes
+```
+
+IAM bootstrap for future accounts:
+
+- `ops/aws/iam/README.md`
+- `ops/aws/iam/codex-migration-policy.json`
 
 ## Autonomous Cleanup Workflow
 
@@ -198,6 +239,33 @@ Behavior:
 - watched media is selected from the Plex database
 - deletion candidates are ordered oldest watched first
 - if the cap is still exceeded after eligible cleanup, Transmission is paused
+
+`MEDIA_CAP_IO_MODE=host` is appropriate for direct interactive runs from the repo. The macOS LaunchAgent installer overrides the installed runtime to `MEDIA_CAP_IO_MODE=docker` so scheduled runs can operate through the `plex` container without depending on background access to the repo under `Documents`.
+
+To install the scheduled macOS dry run:
+
+```bash
+./scripts/install-media-cap-launchd.sh
+launchctl print gui/$(id -u)/com.friday.media-cap | sed -n '1,80p'
+tail -n 50 "$HOME/Library/Logs/friday-plex-stack/media-cap.log"
+```
+
+This installs:
+
+- `~/Library/LaunchAgents/com.friday.media-cap.plist`
+- runtime copy: `~/Library/Application Support/friday-plex-stack/`
+- log file: `~/Library/Logs/friday-plex-stack/media-cap.log`
+
+Default schedule:
+
+- daily at `03:30`
+- mode `dry-run`
+
+To switch the scheduled job to active deletion, update local `.friday-ops.env` and reinstall:
+
+```bash
+MEDIA_CAP_LAUNCHD_MODE=apply ./scripts/install-media-cap-launchd.sh
+```
 
 ## Internal Plex Addressing Fix
 

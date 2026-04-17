@@ -55,6 +55,16 @@ docker logs byparr --tail 100
 docker logs maintainerr --tail 100
 ```
 
+### AWS shared host path
+
+```bash
+./scripts/backup-aws-host.sh
+AWS_PROFILE=<new-profile> ./scripts/check-aws-migration-readiness.sh
+AWS_PROFILE=<new-profile> KEY_NAME=<new-keypair-name> EC2_SSH_KEY=/path/to/new-key.pem ./scripts/prepare-migration-day.sh
+ssh -i Friday-key-pair-11102025.pem ubuntu@54.90.132.5 'systemctl is-active wg-quick@wg0 iris-backend nginx'
+curl http://54.90.132.5/api/iris/preferences
+```
+
 ## Incident Notes
 
 ### Sonarr could not search TV
@@ -112,6 +122,7 @@ If Bazarr does not grab subtitles soon after import:
 docker logs bazarr --tail 120
 BAZARR_KEY=$(awk '/apikey:/ {print $2; exit}' config/bazarr/config/config.yaml)
 curl -sS -H "X-Api-Key: $BAZARR_KEY" http://localhost:6767/api/system/tasks | jq '.data[] | select(.name|test("Sync with|Search for Missing"))'
+curl -sS -H "X-Api-Key: $BAZARR_KEY" http://localhost:6767/api/providers
 ```
 
 Interpretation:
@@ -119,6 +130,32 @@ Interpretation:
 - Immediate subtitle search depends on Bazarr's SignalR connection to Radarr and Sonarr.
 - In the current live config, `defer_search_signalr` is disabled for both Arr apps, so Bazarr should react immediately when the SignalR feed is healthy.
 - Bazarr 1.5.3 will not accept wanted-search intervals below 6 hours, so the practical fallback is the tightened 15-minute Arr sync cadence plus the 6-hour wanted scan.
+- The local config now treats embedded subtitles as insufficient for the desired language, so Bazarr should mark future imports as missing when only internal tracks exist.
+- Current provider reality on this host:
+  - `tvsubtitles` is reachable
+  - `opensubtitlescom` is returning provider failures after a `403/426` challenge flow
+  - `podnapisi` resolves to IPv6 only from the Bazarr container and fails with `Network unreachable`
+- If `GET /api/providers/episodes?episodeid=...` still returns `[]`, the problem is provider coverage, not the Bazarr trigger path.
+
+### Media-cap LaunchAgent does not run
+
+Symptom:
+
+- `com.friday.media-cap` is loaded, but the scheduled run never logs useful work or exits early.
+
+Local evidence:
+
+```bash
+launchctl print gui/$(id -u)/com.friday.media-cap | sed -n '1,80p'
+tail -n 100 "$HOME/Library/Logs/friday-plex-stack/media-cap.log"
+cat "$HOME/Library/Application Support/friday-plex-stack/.friday-ops.env"
+```
+
+Interpretation:
+
+- The installed LaunchAgent should force `MEDIA_CAP_IO_MODE=docker` in its support env.
+- If that override is missing, the copied runtime will fall back to `host` mode and background access to the repo under `Documents` can fail.
+- If Docker itself is unavailable to the LaunchAgent session, the support log will show container inspection or `docker cp` failures before any cleanup logic runs.
 
 ### Tailscale remote access fails after closing the lid
 
@@ -179,6 +216,25 @@ docker exec maintainerr sh -lc 'wget -qO- http://plex:32400/identity'
   - `config/plex/Library/Application Support/Plex Media Server/Preferences.xml` attribute: `PlexOnlineToken`
 - A stale Maintainerr token returns `401 Unauthorized` against `http://plex:32400/library/sections`.
 - `./scripts/fix-internal-addresses.sh` now refreshes both the internal hostname and the Plex token from local Plex preferences.
+
+### AWS account rotation risks
+
+Symptom:
+
+- The old VPN renewal steps seem fine, but they would leave Iris broken after the EC2 cutover.
+
+Local evidence:
+
+- `docs/AWS_MIGRATION.md`
+- `/Users/kevinshah/Documents/mta-led-sign/docs/BACKEND.md`
+- `/Users/kevinshah/Documents/mta-led-sign/scripts/prepare_gift_board.py`
+
+Interpretation:
+
+- The AWS host is shared infrastructure.
+- Friday only needs the WireGuard endpoint updated after host restore.
+- Iris still has direct backend URL references that must be updated too.
+- Do not use the old gist-driven VPN rebuild path as the only renewal procedure anymore.
 
 ## Allowed External Sources
 

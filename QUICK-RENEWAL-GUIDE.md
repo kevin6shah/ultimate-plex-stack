@@ -1,5 +1,13 @@
 # 🔄 6-Month VPN Renewal Guide
 
+## Important
+
+This file is the old VPN-only flow.
+
+The current EC2 host also runs the production Iris backend from `/Users/kevinshah/Documents/mta-led-sign`, so this guide is no longer sufficient by itself for account rotation.
+
+Use [AWS_MIGRATION.md](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/docs/AWS_MIGRATION.md) as the primary migration document. Keep this file only as a quick reference for the historical manual WireGuard path.
+
 **⏱️ Time Required:** 10 minutes  
 **📅 Do this:** Every 5.5 months (set calendar reminder!)
 

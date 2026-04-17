@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Friday shared EC2 host for WireGuard VPN and Iris backend.
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: Friday
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  ImageId:
+    Type: AWS::EC2::Image::Id
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+  SshCidr:
+    Type: String
+    Description: CIDR allowed to SSH to the shared host.
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 8
+
+Resources:
+  FridaySharedHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Friday shared host security group
+      GroupName: !Sub '${AWS::StackName}-shared-host'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshCidr
+        - Description: Iris backend HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: WireGuard UDP
+          IpProtocol: udp
+          FromPort: 51820
+          ToPort: 51820
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-sg'
+        - Key: FridayRole
+          Value: shared-host
+
+  FridaySharedHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref FridaySharedHostSecurityGroup
+          SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: FridayRole
+          Value: shared-host
+
+Outputs:
+  InstanceId:
+    Value: !Ref FridaySharedHost
+  PublicIp:
+    Value: !GetAtt FridaySharedHost.PublicIp
+  PublicDnsName:
+    Value: !GetAtt FridaySharedHost.PublicDnsName
+  SecurityGroupId:
+    Value: !Ref FridaySharedHostSecurityGroup
