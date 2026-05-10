@@ -2,15 +2,46 @@
 
 set -euo pipefail
 
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+WG_FILE="${ROOT_DIR}/config/wireguard/wg_confs/wg0.conf"
 AWS_PROFILE_NAME="${AWS_PROFILE:-}"
 AWS_REGION_NAME="${AWS_REGION:-us-east-1}"
 KEY_NAME_VALUE="${KEY_NAME:-}"
 EC2_SSH_KEY_VALUE="${EC2_SSH_KEY:-}"
-CURRENT_IRIS_URL="${CURRENT_IRIS_URL:-http://54.90.132.5/api/iris/preferences}"
+CURRENT_IRIS_URL="${CURRENT_IRIS_URL:-}"
 LATEST_BACKUP_DIR="${LATEST_BACKUP_DIR:-$ROOT_DIR/backup/aws/latest}"
+ALLOW_BLUE_DOWN=0
+AUTO_BLUE_MODE=1
+
+if [[ -z "$CURRENT_IRIS_URL" && -f "$WG_FILE" ]]; then
+  current_host_from_wg="$(sed -n 's/^Endpoint = \([^:]*\):51820$/\1/p' "$WG_FILE" | head -n 1)"
+  if [[ -n "$current_host_from_wg" ]]; then
+    CURRENT_IRIS_URL="http://${current_host_from_wg}/api/iris/preferences"
+  fi
+fi
+
+CURRENT_IRIS_URL="${CURRENT_IRIS_URL:-http://54.90.132.5/api/iris/preferences}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --offline-restore|--allow-blue-down)
+      ALLOW_BLUE_DOWN=1
+      AUTO_BLUE_MODE=0
+      ;;
+    --strict-blue)
+      AUTO_BLUE_MODE=0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 failures=0
 
@@ -44,22 +75,35 @@ for cmd in docker aws ssh scp curl bash; do
 done
 
 section "Blue Health"
-if ./scripts/check-vpn.sh >/dev/null 2>&1; then
-  pass "Friday VPN health"
-else
-  fail "Friday VPN health"
+if (( ALLOW_BLUE_DOWN == 0 && AUTO_BLUE_MODE == 1 )); then
+  if ! curl -fsS "$CURRENT_IRIS_URL" >/dev/null 2>&1; then
+    if [[ -f "$LATEST_BACKUP_DIR/remote/aws-host-state.tgz" ]]; then
+      echo "INFO: current Iris host is unreachable; switching to offline restore mode with the latest saved backup."
+      ALLOW_BLUE_DOWN=1
+    fi
+  fi
 fi
 
-if ./scripts/check-stack.sh >/dev/null 2>&1; then
-  pass "Friday stack health"
+if (( ALLOW_BLUE_DOWN == 1 )); then
+  echo "INFO: offline restore mode enabled; blue-host health checks are skipped."
 else
-  fail "Friday stack health"
-fi
+  if ./scripts/check-vpn.sh >/dev/null 2>&1; then
+    pass "Friday VPN health"
+  else
+    fail "Friday VPN health"
+  fi
 
-if curl -fsS "$CURRENT_IRIS_URL" >/dev/null 2>&1; then
-  pass "Iris backend reachable at current host"
-else
-  fail "Iris backend reachable at current host"
+  if ./scripts/check-stack.sh >/dev/null 2>&1; then
+    pass "Friday stack health"
+  else
+    fail "Friday stack health"
+  fi
+
+  if curl -fsS "$CURRENT_IRIS_URL" >/dev/null 2>&1; then
+    pass "Iris backend reachable at current host"
+  else
+    fail "Iris backend reachable at current host"
+  fi
 fi
 
 section "Local Migration Inputs"
@@ -110,4 +154,9 @@ if (( failures > 0 )); then
 fi
 
 echo "READY: migration day preflight passed."
+if (( ALLOW_BLUE_DOWN == 1 )); then
+  echo "Mode: offline restore from latest AWS backup."
+else
+  echo "Mode: live blue/green."
+fi
 echo "If you say 'migrate' with these inputs still valid, the scripted blue/green flow is ready to run."

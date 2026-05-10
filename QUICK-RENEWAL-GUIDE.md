@@ -8,6 +8,15 @@ The current EC2 host also runs the production Iris backend from `/Users/kevinsha
 
 Use [AWS_MIGRATION.md](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/docs/AWS_MIGRATION.md) as the primary migration document. Keep this file only as a quick reference for the historical manual WireGuard path.
 
+As of the May 10, 2026 migration, the maintained path is:
+
+```bash
+AWS_PROFILE=<new-profile> KEY_NAME=<new-keypair-name> EC2_SSH_KEY=/path/to/new-key.pem ./scripts/prepare-migration-day.sh
+AWS_PROFILE=<new-profile> AWS_REGION=us-east-1 KEY_NAME=<new-keypair-name> EC2_SSH_KEY=/path/to/new-key.pem ./scripts/migrate-aws-account.sh --yes
+```
+
+That path now auto-detects offline-restore mode when the old host is already dead and runs a combined post-cutover smoke test automatically.
+
 **⏱️ Time Required:** 10 minutes  
 **📅 Do this:** Every 5.5 months (set calendar reminder!)
 

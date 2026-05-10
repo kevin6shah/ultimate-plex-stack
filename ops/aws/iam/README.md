@@ -52,6 +52,8 @@ You also need:
 - a key pair created in the new account
 - the matching local `.pem` file
 
+The policy now also includes `ec2:CreateKeyPair` and `ec2:DeleteKeyPair`, so Codex can create the migration key pair directly if you prefer not to do it manually in the console.
+
 Typical migration inputs:
 
 ```bash

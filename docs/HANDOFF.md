@@ -41,6 +41,8 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 - The media-cap script now supports `MEDIA_CAP_IO_MODE=docker`, which is the only safe way for a LaunchAgent to enforce the cap without depending on background access to the repo under `Documents`.
 - The AWS EC2 host is shared with the Iris production backend in `/Users/kevinshah/Documents/mta-led-sign`; any account rotation must preserve both systems, not just WireGuard.
 - The current AWS migration model is intentionally no-domain and raw-IP based; the durable references are `docs/AWS_MIGRATION.md`, `docs/AWS_BLUE_GREEN_RUNBOOK.md`, and `ops/aws/iam/README.md`.
+- The AWS migration path now auto-detects offline-restore mode when the old host is dead, auto-runs `scripts/post-migration-smoke.sh`, and no longer depends on stale hardcoded EC2 instance/security-group IDs in `scripts/backup-aws-host.sh`.
+- AWS shared-host backup is now a hard rule for Codex-managed infra changes: use `scripts/aws-infra-change.sh` for ad hoc AWS changes so pre/post backups happen automatically.
 - Docker Desktop storage and macOS storage views are larger than `share/media`; that overhead must be tracked separately from the media cap.
 
 ## Current Working Sources
@@ -60,8 +62,8 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 ## Backlog
 
 1. Evaluate the best remote playback path over Tailscale for Plex and Jellyfin when the laptop stays awake under Amphetamine.
-2. Add a durable AWS/WireGuard rotation workflow so yearly account replacement is a scripted config swap instead of a manual rebuild.
-3. Turn the shared AWS migration into a true single-command cutover that also updates the live Iris board/backend URL, not just the Friday repo and local mta-led-sign sources.
+2. Turn the shared AWS migration into a true single-command cutover that also updates the live Iris board/backend URL, not just the Friday repo and local mta-led-sign sources.
+3. Add a redacted shared-host inventory export so fresh agents can inspect the topology without touching secrets.
 4. Turn the Friday local stack into a preflighted, mostly one-command bootstrap with env-driven settings instead of hardcoded host-specific values in tracked files.
 
 ## Resume Checklist

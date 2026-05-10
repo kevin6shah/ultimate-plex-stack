@@ -7,6 +7,7 @@
 3. If local evidence and primary sources do not support a claim, say `unknown`.
 4. Do not guess at runtime behavior that can be verified locally.
 5. Update the docs and journal after every material change.
+6. Any Codex-managed AWS infrastructure change must take both a pre-change and post-change backup of the shared host.
 
 ## Anti-Hallucination SOP
 
@@ -35,6 +36,12 @@ Before implementation work:
 4. Re-test
 5. Document
 6. Commit and push when the repo is at a validated stable point and no local secrets are included
+
+For AWS infrastructure work:
+
+1. Run `./scripts/backup-aws-host.sh` before the change.
+2. Prefer `./scripts/aws-infra-change.sh --reason "..." -- <command ...>` so pre/post backups happen automatically.
+3. If a script already performs the backups internally, note that explicitly in the journal.
 
 No step may be skipped without an explicit note in the journal.
 

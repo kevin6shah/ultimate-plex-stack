@@ -68,6 +68,14 @@ Use this before any AWS work:
 ./scripts/backup-aws-host.sh
 ```
 
+For ad hoc AWS CLI changes, use:
+
+```bash
+AWS_PROFILE=<profile> ./scripts/aws-infra-change.sh --reason "short reason" -- <aws command ...>
+```
+
+That is now the hard rule for Codex-managed AWS infrastructure changes in this repo.
+
 What it captures:
 
 - local AWS identity and EC2 metadata
@@ -94,9 +102,11 @@ Tracked artifacts:
 - [ops/aws/iam/README.md](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/iam/README.md)
 - [codex-migration-policy.json](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/iam/codex-migration-policy.json)
 - [backup-aws-host.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/backup-aws-host.sh)
+- [aws-infra-change.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/aws-infra-change.sh)
 - [check-aws-migration-readiness.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/check-aws-migration-readiness.sh)
 - [prepare-migration-day.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/prepare-migration-day.sh)
 - [migrate-aws-account.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/migrate-aws-account.sh)
+- [post-migration-smoke.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/post-migration-smoke.sh)
 - [update-vpn-endpoint.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/update-vpn-endpoint.sh)
 - [update-mta-led-sign-backend-url.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/update-mta-led-sign-backend-url.sh)
 - [AWS_BLUE_GREEN_RUNBOOK.md](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/docs/AWS_BLUE_GREEN_RUNBOOK.md)
@@ -147,6 +157,15 @@ What that command is designed to do:
 7. restore the saved shared-host state onto the new instance
 8. update the local Friday WireGuard endpoint and VPN expected IP
 9. update local `mta-led-sign` source references from the old backend URL to the new one
+10. run the combined Friday + Iris smoke checks before returning success
+
+Current resilience improvements from the May 10, 2026 migration:
+
+- `backup-aws-host.sh` now derives the active EC2 host from the local WireGuard endpoint, then discovers the matching instance ID and security group through AWS instead of relying on stale hardcoded values.
+- `prepare-migration-day.sh` now auto-switches to offline-restore mode when the current Iris host is already dead but a valid saved backup exists.
+- `migrate-aws-account.sh` now re-runs preflight internally, can continue from the latest saved backup if the old host dies before a fresh backup completes, and runs a combined post-cutover smoke test automatically.
+- `restore-host-from-backup.sh` now explicitly enables the `iris-backend` nginx site and removes the default site, which was the real restore gap found during the May 10 cutover.
+- `aws-infra-change.sh` now exists as the default wrapper for ad hoc AWS CLI changes so Codex-managed infra changes automatically capture pre-change and post-change shared-host backups.
 
 What it does not do yet:
 
@@ -169,19 +188,26 @@ EC2_SSH_KEY=/path/to/new-key.pem \
 
 If that script returns `READY`, then saying `migrate` should be enough context for Codex to execute the blue/green cutover workflow.
 
+If the old host is already gone and only the saved backup remains, use:
+
+```bash
+AWS_PROFILE=<new-profile> \
+KEY_NAME=<new-keypair-name> \
+EC2_SSH_KEY=/path/to/new-key.pem \
+./scripts/prepare-migration-day.sh --offline-restore
+```
+
+That treats the migration as a restore from `backup/aws/latest` instead of a live blue/green cutover.
+
+If you omit `--offline-restore`, the preflight now tries to detect that state automatically and falls back to the saved backup when possible.
+
 ## Validation After Migration
 
 Before terminating the old EC2 instance:
 
-1. Friday:
-   - `./scripts/check-vpn.sh`
-   - `docker exec transmission curl -fsS https://checkip.amazonaws.com`
-   - `./scripts/check-stack.sh`
-2. Iris backend:
-   - `curl http://NEW_IP/api/iris/preferences`
-   - `curl http://NEW_IP/api/iris/state`
-   - if needed: redeploy backend with `/Users/kevinshah/Documents/mta-led-sign/scripts/deploy_backend_ec2.sh`
-3. Iris board:
+1. Combined smoke:
+   - `EC2_SSH_KEY=/path/to/new-key.pem ./scripts/post-migration-smoke.sh NEW_IP`
+2. Iris board:
    - confirm the board is pointing at the new backend URL
    - run the relevant backend/board smoke flow from the `mta-led-sign` repo
 
@@ -201,9 +227,8 @@ Highest value:
 
 Secondary:
 
-1. Add a post-migration smoke script that validates Friday and Iris together.
-2. Add a redacted inventory export for the shared host so fresh agents can inspect the topology without touching secrets.
-3. If you later accept free dynamic DNS, replace raw-IP rewrites with stable hostnames. That is optional, not required for the current model.
+1. Add a redacted inventory export for the shared host so fresh agents can inspect the topology without touching secrets.
+2. If you later accept free dynamic DNS, replace raw-IP rewrites with stable hostnames. That is optional, not required for the current model.
 
 ## Free-Tier Expiration
 

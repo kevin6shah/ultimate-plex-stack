@@ -35,6 +35,24 @@
 - Added repo-local scripts for VPN verification, stack health checks, media-cap enforcement, config backup, and the internal Plex addressing fix.
 - Added `.friday-ops.env.example` to centralize local policy overrides.
 
+### Change: proxy and byparr health plumbing repaired
+
+- Symptom:
+  - `byparr` showed as `unhealthy` in Docker even though the service process was running.
+  - `vpn-web-proxy` returned local `504` responses when slow upstream Prowlarr requests exceeded the default proxy timeout.
+- Evidence:
+  - `docker inspect byparr` showed the image healthcheck was probing `http://localhost:8191/health` while this stack moved `byparr` to port `8192`.
+  - `docker logs vpn-web-proxy` showed `upstream timed out` on proxied Prowlarr requests.
+- Fix:
+  - Added an explicit `byparr` healthcheck on `127.0.0.1:8192`.
+  - Added an explicit `vpn-web-proxy` healthcheck on `127.0.0.1:9696`.
+  - Raised `proxy_connect_timeout`, `proxy_send_timeout`, and `proxy_read_timeout` in `ops/vpn-web-proxy/default.conf`.
+  - Recreated only `byparr` and `vpn-web-proxy`.
+- Result:
+  - `byparr` is now healthy.
+  - `vpn-web-proxy` is now healthy.
+  - This fixes generic container health and proxy tolerance, but it does not guarantee any specific upstream source is available.
+
 ### Change: internal Plex consumers moved to Docker service addressing
 
 - Evidence:
@@ -373,3 +391,43 @@
     - required new-account inputs
     - latest shared-host backup presence
     - target AWS account readiness
+
+### Change: May 10 migration hardening pass
+
+- Change:
+  - Patched `ops/aws/restore-host-from-backup.sh` so restore now enables the `iris-backend` nginx site and removes the default nginx site.
+  - Added `scripts/post-migration-smoke.sh` to validate remote Iris, remote shared-host services, local Friday VPN health, and local stack health in one command.
+  - Updated `scripts/migrate-aws-account.sh` to rerun `prepare-migration-day.sh` internally, support explicit `--offline-restore`, fall back to the latest saved backup if a fresh backup fails because the old host is already gone, and run the new post-migration smoke checks automatically.
+  - Updated `scripts/prepare-migration-day.sh` so it can auto-switch to offline-restore mode when the current Iris host is unreachable but `backup/aws/latest` is still valid.
+  - Updated `scripts/backup-aws-host.sh` so it discovers the current AWS host from the tracked WireGuard endpoint and then derives the instance ID and security group from AWS, instead of relying on stale old-account defaults.
+  - Updated `scripts/update-mta-led-sign-backend-url.sh` so it also rewrites bare host references like the ones in `scripts/deploy_backend_ec2.sh`, not just full `http://...` URLs.
+- Validation:
+  - `./scripts/post-migration-smoke.sh 13.216.214.108` passed.
+  - `./scripts/check-vpn.sh` passed with Transmission egress `13.216.214.108`.
+  - `./scripts/check-stack.sh` passed.
+  - Public `http://13.216.214.108/api/iris/preferences` and `/api/iris/state` both returned live data after the nginx site fix.
+- Result:
+  - The next AWS cutover should require fewer manual decisions:
+    - no manual offline/online mode choice in the common failure case,
+    - no stale EC2 metadata defaults in the backup path,
+    - and one built-in smoke verdict after restore instead of multiple ad hoc manual checks.
+
+### Change: AWS backup rule hardened after the `iris` cutover
+
+- Evidence:
+  - `AWS_PROFILE=iris EC2_SSH_KEY=/Users/kevinshah/.aws/keys/iris-migration-20260510.pem ./scripts/backup-aws-host.sh` succeeded against the new host and wrote `backup/aws/20260510-192341/`.
+  - `backup/aws/latest/metadata/discovered.env` now records:
+    - `EC2_HOST=13.216.214.108`
+    - `EC2_INSTANCE_ID=i-0263b221709dce545`
+    - `EC2_SECURITY_GROUP_ID=sg-0541241698170a453`
+- Change:
+  - Added `scripts/aws-infra-change.sh` as the default wrapper for Codex-managed AWS CLI changes.
+  - The wrapper now forces:
+    - one pre-change shared-host backup
+    - execution of the requested AWS change command
+    - one post-change shared-host backup
+    - a timestamped change log under `backup/aws/change-log/`
+  - Updated the maintenance loop, auto-compact prompt, AWS migration docs, and handoff to make this a hard rule for future Codex sessions.
+- Result:
+  - The new `iris` account already has a recoverable shared-host backup.
+  - Future Codex-managed AWS infrastructure changes now have an explicit automation path that captures before/after restore points instead of relying on memory or manual discipline.

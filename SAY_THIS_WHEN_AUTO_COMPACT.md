@@ -18,6 +18,7 @@ Rules:
 - update the docs and journal after every material change
 - after a validated stable point, commit and push the repo state unless doing so would include local secrets or unrelated user changes
 - avoid restarting Plex during active playback unless the user explicitly accepts it
+- any Codex-managed AWS infrastructure change must include a pre-change and post-change shared-host backup; prefer `./scripts/aws-infra-change.sh --reason "..." -- <command ...>`
 
 Current project goals:
 
@@ -48,3 +49,4 @@ Current live baseline:
 - The AWS EC2 host is shared with the production Iris backend in `/Users/kevinshah/Documents/mta-led-sign`; `docs/AWS_MIGRATION.md` is now the primary account-rotation doc, not `QUICK-RENEWAL-GUIDE.md`
 - The current AWS migration model is no-domain by design; use `docs/AWS_BLUE_GREEN_RUNBOOK.md`, `./scripts/check-aws-migration-readiness.sh`, and `ops/aws/iam/codex-migration-policy.json` when preparing a new free AWS account
 - `./scripts/prepare-migration-day.sh` is the final green-light gate before the user says `migrate`
+- `./scripts/aws-infra-change.sh` is the default wrapper for ad hoc AWS infra changes because it forces pre/post backups automatically

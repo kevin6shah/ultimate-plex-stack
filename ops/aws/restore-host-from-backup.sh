@@ -19,6 +19,9 @@ tar -xzf "$BACKUP_TGZ" -C /
 
 install -d -m 700 /etc/wireguard
 chmod 600 /etc/wireguard/wg0.conf
+install -d -m 755 /etc/nginx/sites-enabled
+ln -sfn /etc/nginx/sites-available/iris-backend /etc/nginx/sites-enabled/iris-backend
+rm -f /etc/nginx/sites-enabled/default
 
 chown -R "${REMOTE_USER}:${REMOTE_USER}" /opt/iris-backend
 

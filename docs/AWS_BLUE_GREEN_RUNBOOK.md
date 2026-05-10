@@ -49,6 +49,14 @@ AWS_PROFILE=<new-profile> KEY_NAME=<new-keypair-name> EC2_SSH_KEY=/path/to/new-k
 
 4. Record the blue host values from `backup/aws/latest/metadata/instance.json`.
 
+If blue is already dead, replace the second command with:
+
+```bash
+AWS_PROFILE=<new-profile> KEY_NAME=<new-keypair-name> EC2_SSH_KEY=/path/to/new-key.pem ./scripts/prepare-migration-day.sh --offline-restore
+```
+
+In normal use, `prepare-migration-day.sh` now auto-detects that failure mode and switches to offline restore if `backup/aws/latest` is still valid.
+
 ## Green Build
 
 Run:
@@ -68,6 +76,7 @@ What this should do:
 3. restore shared-host state
 4. rewrite local Friday VPN endpoint
 5. rewrite local `mta-led-sign` source references from old IP to new IP
+6. run the combined post-migration smoke checks before returning success
 
 ## Green Validation
 
@@ -76,9 +85,7 @@ Validate by the new public IP before touching blue.
 ### Friday
 
 ```bash
-./scripts/check-vpn.sh
-docker exec transmission curl -fsS https://checkip.amazonaws.com
-./scripts/check-stack.sh
+EC2_SSH_KEY=/path/to/new-key.pem ./scripts/post-migration-smoke.sh NEW_IP
 ```
 
 ### Iris backend
@@ -88,6 +95,8 @@ curl http://NEW_IP/api/iris/preferences
 curl http://NEW_IP/api/iris/state
 ssh -i /path/to/new-key.pem ubuntu@NEW_IP 'systemctl is-active wg-quick@wg0 iris-backend nginx'
 ```
+
+The standalone commands above are still useful if you need to debug the smoke script instead of just trusting its pass/fail result.
 
 ### Iris board
 

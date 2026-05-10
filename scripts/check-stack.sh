@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
