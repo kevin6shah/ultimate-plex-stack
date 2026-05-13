@@ -47,11 +47,26 @@ For reliable lid-closed operation:
 - Amphetamine Enhancer must be installed
 - the active Amphetamine session must have `Allow system sleep when display is closed` unchecked
 - the MacBook should stay on AC power
+- the session must actually be active before you close the lid; saved preferences alone are not enough
 
 Practical guidance:
 
 - safest: keep the lid open and let only the display sleep
-- if you want lid-closed use, restart the Amphetamine session after changing the closed-display setting, then test reachability from another Tailscale device
+- if you want lid-closed use, start a timed Amphetamine session first, then test reachability from another Tailscale device
+- verify the current state locally with:
+
+```bash
+./scripts/check-amphetamine.sh
+```
+
+Interpretation:
+
+- `FAIL: No active Amphetamine session`
+  Your Mac may sleep when the lid closes. Start a timed Amphetamine session first.
+- `FAIL: Active session allows display sleep`
+  Fix the current session’s Quick Settings before closing the lid.
+- `FAIL: Closed-display mode is not enabled for the active session`
+  The current session is not safe for lid-closed operation.
 
 ## Transmission and VPN Behavior
 

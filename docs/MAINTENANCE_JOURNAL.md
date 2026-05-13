@@ -454,3 +454,21 @@
 - Result:
   - The guard still fail-closes downloads when the VPN path is genuinely unsafe.
   - Idle tunnel flaps while `transmission` is already stopped should no longer spam Telegram by default.
+
+### Change: Amphetamine lid-closed readiness check added
+
+- Evidence:
+  - Amphetamine was installed and running, but there was no active Amphetamine session.
+  - Amphetamine preferences already showed:
+    - `Allow Closed-Display Sleep = 0`
+    - `Allow Display Sleep = 0`
+  - AppleScript checks still returned:
+    - `session is active = false`
+    - `display sleep allowed = false`
+    - `closed display mode enabled = true`
+  - `pmset -g assertions` showed no Amphetamine-owned sleep-prevention assertion, which means saved preferences alone were not enough to keep the Mac awake with the lid closed.
+- Change:
+  - Added `scripts/check-amphetamine.sh` to report whether Amphetamine is running, whether a session is active, and whether the current session is suitable for lid-closed server use.
+  - Updated `docs/REMOTE_ACCESS.md` so the remote-access checklist explicitly says a timed Amphetamine session must actually be active before the lid is closed.
+- Result:
+  - There is now a concrete local command to answer “is this Mac safe to close right now?” instead of relying on menu-bar guesswork.
