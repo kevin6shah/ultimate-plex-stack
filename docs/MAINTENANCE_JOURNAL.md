@@ -431,3 +431,26 @@
 - Result:
   - The new `iris` account already has a recoverable shared-host backup.
   - Future Codex-managed AWS infrastructure changes now have an explicit automation path that captures before/after restore points instead of relying on memory or manual discipline.
+
+### Change: VPN guard false-positive spam reduced
+
+- Evidence:
+  - Telegram alerts were flapping between unhealthy and healthy even when downloads were not active.
+  - Current unhealthy messages showed `Transmission action: already-stopped`.
+  - `./scripts/check-vpn.sh` had been validating public egress from the `transmission` container namespace, which fails trivially when `transmission` is stopped even if the WireGuard tunnel itself is healthy.
+  - Live validation showed the `wireguard` namespace could still reach `https://checkip.amazonaws.com` and reported the correct egress IP `13.216.214.108`.
+- Change:
+  - Updated `scripts/check-vpn.sh` so egress validation uses the `wireguard` namespace directly.
+  - Updated `scripts/vpn-guard.sh` to:
+    - add `VPN_GUARD_NOTIFY_ALREADY_STOPPED` with default `0`
+    - add `VPN_GUARD_FAILURE_STREAK_THRESHOLD` with default `3`
+    - persist `NOTIFIED` and `FAILURE_STREAK` in guard state
+    - send recovery notifications only when an unhealthy notification was actually sent
+  - Updated `scripts/install-vpn-guard-launchd.sh` and reinstalled the support runtime so the installed LaunchAgent uses the new logic and the cleaned state path.
+- Validation:
+  - `./scripts/check-vpn.sh` passed with a fresh handshake and egress IP `13.216.214.108`.
+  - The installed guard runtime reported `STATUS=healthy`, `NOTIFIED=0`, `FAILURE_STREAK=0`.
+  - `launchctl print gui/$(id -u)/com.friday.vpn-guard` showed the agent loaded with `last exit code = 0`.
+- Result:
+  - The guard still fail-closes downloads when the VPN path is genuinely unsafe.
+  - Idle tunnel flaps while `transmission` is already stopped should no longer spam Telegram by default.

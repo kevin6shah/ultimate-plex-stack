@@ -38,6 +38,8 @@ cat "$HOME/Library/Application Support/friday-plex-stack/vpn-guard.state"
 cat "$HOME/Library/Logs/friday-plex-stack/vpn-guard.log"
 ```
 
+If the state shows `ACTION=already-stopped`, the default current policy is not to send unhealthy Telegram alerts for that condition unless `VPN_GUARD_NOTIFY_ALREADY_STOPPED=1` is set.
+
 ### Request path
 
 ```bash

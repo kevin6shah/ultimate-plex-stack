@@ -10,6 +10,8 @@ ENV_PATH="${SUPPORT_DIR}/.friday-ops.env"
 LOG_DIR="${HOME}/Library/Logs/friday-plex-stack"
 LOG_PATH="${LOG_DIR}/vpn-guard.log"
 INTERVAL_SECONDS="${VPN_GUARD_LAUNCHD_INTERVAL_SECONDS:-60}"
+LEGACY_STATE_PATH="${SUPPORT_DIR}/config/ops/vpn-guard.state"
+STATE_PATH="${SUPPORT_DIR}/vpn-guard.state"
 
 mkdir -p "$(dirname "$PLIST_PATH")" "$LOG_DIR" "$SCRIPT_DIR"
 
@@ -25,8 +27,13 @@ fi
 cp "$SOURCE_ENV" "$ENV_PATH"
 tmp_env="$(mktemp)"
 grep -v '^VPN_GUARD_STATE_FILE=' "$ENV_PATH" >"$tmp_env" || true
-printf 'VPN_GUARD_STATE_FILE=%q\n' "${SUPPORT_DIR}/vpn-guard.state" >>"$tmp_env"
+printf 'VPN_GUARD_STATE_FILE=%q\n' "${STATE_PATH}" >>"$tmp_env"
 mv "$tmp_env" "$ENV_PATH"
+
+if [[ -f "$LEGACY_STATE_PATH" && ! -f "$STATE_PATH" ]]; then
+  mv "$LEGACY_STATE_PATH" "$STATE_PATH"
+fi
+rm -rf "${SUPPORT_DIR}/config"
 
 cat >"$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

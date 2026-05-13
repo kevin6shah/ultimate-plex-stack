@@ -122,6 +122,9 @@ Verification on this host returned HTTP `401`, which is the expected unauthentic
   - it runs `./scripts/check-vpn.sh`
   - it stops `transmission` if the VPN check fails
   - it sends a Telegram alert when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are configured
+  - it now checks egress through the `wireguard` namespace directly, so a stopped `transmission` container does not create a false VPN failure by itself
+  - by default it suppresses unhealthy Telegram alerts when `transmission` is already stopped
+  - by default it requires `3` consecutive failed checks before sending an unhealthy alert
   - it writes state to `config/ops/vpn-guard.state`
 
 To install the watchdog on macOS:

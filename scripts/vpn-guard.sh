@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -17,6 +19,8 @@ TRANSMISSION_CONTAINER="${TRANSMISSION_CONTAINER:-transmission}"
 VPN_GUARD_NOTIFY_RECOVERY="${VPN_GUARD_NOTIFY_RECOVERY:-1}"
 VPN_GUARD_STOP_TRANSMISSION="${VPN_GUARD_STOP_TRANSMISSION:-1}"
 VPN_GUARD_DRY_RUN="${VPN_GUARD_DRY_RUN:-0}"
+VPN_GUARD_NOTIFY_ALREADY_STOPPED="${VPN_GUARD_NOTIFY_ALREADY_STOPPED:-0}"
+VPN_GUARD_FAILURE_STREAK_THRESHOLD="${VPN_GUARD_FAILURE_STREAK_THRESHOLD:-3}"
 HOST_LABEL="${VPN_GUARD_HOST_LABEL:-$(hostname -s 2>/dev/null || hostname)}"
 
 mkdir -p "$(dirname "$STATE_FILE")"
@@ -24,6 +28,8 @@ mkdir -p "$(dirname "$STATE_FILE")"
 PREVIOUS_STATUS="unknown"
 PREVIOUS_MESSAGE=""
 PREVIOUS_ACTION=""
+PREVIOUS_NOTIFIED="0"
+PREVIOUS_FAILURE_STREAK="0"
 
 if [[ -f "$STATE_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -31,12 +37,16 @@ if [[ -f "$STATE_FILE" ]]; then
   PREVIOUS_STATUS="${STATUS:-unknown}"
   PREVIOUS_MESSAGE="${MESSAGE:-}"
   PREVIOUS_ACTION="${ACTION:-}"
+  PREVIOUS_NOTIFIED="${NOTIFIED:-0}"
+  PREVIOUS_FAILURE_STREAK="${FAILURE_STREAK:-0}"
 fi
 
 write_state() {
   local status="$1"
   local action="$2"
   local message="$3"
+  local notified="${4:-0}"
+  local failure_streak="${5:-0}"
   local timestamp
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -44,6 +54,8 @@ write_state() {
 STATUS=$(printf '%q' "$status")
 ACTION=$(printf '%q' "$action")
 MESSAGE=$(printf '%q' "$message")
+NOTIFIED=$(printf '%q' "$notified")
+FAILURE_STREAK=$(printf '%q' "$failure_streak")
 UPDATED_AT=$(printf '%q' "$timestamp")
 EOF
 }
@@ -92,6 +104,8 @@ stop_transmission() {
 failure_output=""
 if ! failure_output="$(./scripts/check-vpn.sh 2>&1)"; then
   action_taken="$(stop_transmission)"
+  notified="0"
+  failure_streak="$((PREVIOUS_FAILURE_STREAK + 1))"
   alert_message=$(
     cat <<EOF
 Friday Plex VPN guard on ${HOST_LABEL} detected an unsafe VPN state.
@@ -104,17 +118,22 @@ Inspect the VPN before restarting Transmission.
 EOF
   )
 
-  if [[ "$PREVIOUS_STATUS" != "unhealthy" ]]; then
-    send_telegram "$alert_message"
+  if [[ "$PREVIOUS_NOTIFIED" == "1" ]]; then
+    notified="1"
+  elif [[ "$failure_streak" -ge "$VPN_GUARD_FAILURE_STREAK_THRESHOLD" ]]; then
+    if [[ "$action_taken" != "already-stopped" || "$VPN_GUARD_NOTIFY_ALREADY_STOPPED" == "1" ]]; then
+      send_telegram "$alert_message"
+      notified="1"
+    fi
   fi
 
-  write_state "unhealthy" "$action_taken" "$failure_output"
+  write_state "unhealthy" "$action_taken" "$failure_output" "$notified" "$failure_streak"
   echo "$alert_message" >&2
   exit 1
 fi
 
 recovery_message=""
-if [[ "$PREVIOUS_STATUS" == "unhealthy" && "$VPN_GUARD_NOTIFY_RECOVERY" == "1" ]]; then
+if [[ "$PREVIOUS_STATUS" == "unhealthy" && "$PREVIOUS_NOTIFIED" == "1" && "$VPN_GUARD_NOTIFY_RECOVERY" == "1" ]]; then
   recovery_message=$(
     cat <<EOF
 Friday Plex VPN guard on ${HOST_LABEL} reports the VPN is healthy again.
@@ -125,5 +144,5 @@ EOF
   send_telegram "$recovery_message"
 fi
 
-write_state "healthy" "none" "$failure_output"
+write_state "healthy" "none" "$failure_output" "0" "0"
 echo "OK: VPN healthy on ${HOST_LABEL}"

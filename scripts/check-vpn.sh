@@ -17,6 +17,7 @@ TRANSMISSION_CONTAINER="${TRANSMISSION_CONTAINER:-transmission}"
 VPN_MAX_HANDSHAKE_AGE_SECONDS="${VPN_MAX_HANDSHAKE_AGE_SECONDS:-300}"
 VPN_PUBLIC_IP_URL="${VPN_PUBLIC_IP_URL:-https://checkip.amazonaws.com}"
 VPN_EXPECTED_PUBLIC_IP="${VPN_EXPECTED_PUBLIC_IP:-}"
+VPN_EGRESS_CONTAINER="${VPN_EGRESS_CONTAINER:-$WIREGUARD_CONTAINER}"
 
 CHECK_EGRESS=1
 if [[ "${1:-}" == "--no-egress" ]]; then
@@ -38,6 +39,7 @@ require_command date
 
 docker inspect "$WIREGUARD_CONTAINER" >/dev/null 2>&1 || fail "Container '$WIREGUARD_CONTAINER' not found"
 docker inspect "$TRANSMISSION_CONTAINER" >/dev/null 2>&1 || fail "Container '$TRANSMISSION_CONTAINER' not found"
+docker inspect "$VPN_EGRESS_CONTAINER" >/dev/null 2>&1 || fail "Container '$VPN_EGRESS_CONTAINER' not found"
 
 handshakes="$(docker exec "$WIREGUARD_CONTAINER" wg show all latest-handshakes 2>/dev/null || true)"
 [[ -n "$handshakes" ]] || fail "WireGuard handshake data is unavailable"
@@ -69,7 +71,7 @@ if [[ "$CHECK_EGRESS" -eq 0 ]]; then
   exit 0
 fi
 
-public_ip="$(docker exec "$TRANSMISSION_CONTAINER" curl -fsSL --max-time 10 "$VPN_PUBLIC_IP_URL" 2>/dev/null | tr -d '\r\n' || true)"
+public_ip="$(docker exec "$VPN_EGRESS_CONTAINER" sh -lc "curl -fsSL --max-time 10 '$VPN_PUBLIC_IP_URL' 2>/dev/null || wget -qO- '$VPN_PUBLIC_IP_URL' 2>/dev/null" | tr -d '\r\n' || true)"
 [[ -n "$public_ip" ]] || fail "Unable to determine public egress IP from the Transmission network namespace"
 
 if [[ -n "$VPN_EXPECTED_PUBLIC_IP" && "$public_ip" != "$VPN_EXPECTED_PUBLIC_IP" ]]; then
