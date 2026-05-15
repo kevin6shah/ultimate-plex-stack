@@ -8,12 +8,14 @@ from .jobs import TaskClass
 LONG_TASK_PATTERNS = (
     r"\b(browser|browse|research|compare|book|buy|order|reserve|apply|fill out)\b",
     r"\b(login|account|website|web site|form|checkout|cart)\b",
+    r"\b(reservation|reservations|availability|available|booking|bookings|restaurant)\b",
     r"\b(deep dive|investigate|audit|debug|deploy|migrate|scrape)\b",
     r"\b(monitor|track|watch for|keep checking)\b",
 )
 HEAVY_TASK_PATTERNS = (
     r"\b(browser|browse|website|web site|login|account|form|checkout|click|upload|download)\b",
     r"\b(compare|research|deep dive|investigate|audit|scrape|debug|deploy|migrate)\b",
+    r"\b(reservation|reservations|availability|available|booking|bookings|restaurant)\b",
     r"\b(csv|xlsx|spreadsheet|excel|pdf|document|attachment|file|image)\b",
     r"\b(run python|run shell|script|workspace|artifact)\b",
     r"\b(continue that task|resume that task|resume the task|continue the task)\b",
@@ -24,6 +26,7 @@ LIVE_WEB_PATTERNS = (
     r"\b(weather|forecast|headline|news|price|stock|score|status)\b",
     r"\b(browser|browse|website|web site|login|account|form|checkout)\b",
     r"\b(research|compare|search the web|search online|look on the web)\b",
+    r"\b(reservation|reservations|availability|available|booking|bookings|restaurant)\b",
 )
 
 

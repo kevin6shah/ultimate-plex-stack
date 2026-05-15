@@ -20,6 +20,11 @@ REMOTE_USER="${EC2_USER:-ubuntu}"
 AGENT_STACK_NAME_VALUE="${AGENT_STACK_NAME:-friday-agent}"
 WORKER_API_KEY_PARAM_VALUE="${WORKER_API_KEY_PARAM:-/friday/agent/worker-api-key}"
 DEEPSEEK_API_KEY_PARAM_VALUE="${DEEPSEEK_API_KEY_PARAM:-/friday/agent/deepseek-api-key}"
+BROWSER_USE_API_KEY_PARAM_VALUE="${BROWSER_USE_API_KEY_PARAM:-/friday/agent/browser-use-api-key}"
+BROWSER_USE_CLOUD_ENABLED_VALUE="${BROWSER_USE_CLOUD_ENABLED:-false}"
+BROWSER_USE_MODEL_VALUE="${BROWSER_USE_MODEL:-deepseek-chat}"
+BROWSER_USE_CLOUD_MODEL_VALUE="${BROWSER_USE_CLOUD_MODEL:-bu-latest}"
+BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE_VALUE="${BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE:-us}"
 
 [[ -n "$AWS_PROFILE_NAME" ]] || { echo "AWS_PROFILE is required" >&2; exit 1; }
 [[ -n "$KEY_NAME_VALUE" ]] || { echo "KEY_NAME is required" >&2; exit 1; }
@@ -72,6 +77,10 @@ deepseek_key="$(
   AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
     aws ssm get-parameter --name "$DEEPSEEK_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text
 )"
+browser_use_key="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$BROWSER_USE_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
 
 AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
   aws ec2 wait instance-running --instance-ids "$instance_id"
@@ -93,7 +102,7 @@ scp "${ssh_opts[@]}" "$ROOT_DIR/ops/aws/install-hands-worker-runtime.sh" "$tmp_d
   "${REMOTE_USER}@${public_ip}:/tmp/"
 
 ssh "${ssh_opts[@]}" "${REMOTE_USER}@${public_ip}" \
-  "sudo bash /tmp/install-hands-worker-runtime.sh /tmp/friday-hands-runtime.tgz '${function_url%/}' '$worker_key' '$deepseek_key' /tmp/friday-hands-worker.tar.gz"
+  "sudo bash /tmp/install-hands-worker-runtime.sh /tmp/friday-hands-runtime.tgz '${function_url%/}' '$worker_key' '$deepseek_key' /tmp/friday-hands-worker.tar.gz '$browser_use_key' '$BROWSER_USE_CLOUD_ENABLED_VALUE' '$BROWSER_USE_MODEL_VALUE' '$BROWSER_USE_CLOUD_MODEL_VALUE' '$BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE_VALUE'"
 
 echo "Dedicated hands worker deployed."
 echo "Instance ID: ${instance_id}"

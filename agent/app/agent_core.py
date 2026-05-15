@@ -8,7 +8,8 @@ from typing import Optional
 
 from pydantic_ai import Agent, RunContext
 
-from .browser import BrowserSession, run_browser_task
+from .browser import BrowserSession
+from .browser_use_runner import run_browser_use_task
 from .budget import estimate_deepseek_cost, usage_from_pydantic_ai
 from .jobs import AgentConfig, AgentResult, ThreadTurn, ThreadTurnRole
 from .jobs import CheckpointPayload
@@ -188,7 +189,13 @@ async def run_agent(
             bounded_pages = min(max(max_pages, 1), ctx.deps.settings.max_browser_pages)
             bounded_steps = min(max(max_steps, 1), ctx.deps.settings.max_browser_steps)
             try:
-                return await run_browser_task(task, max_pages=bounded_pages, max_steps=bounded_steps)
+                return await run_browser_use_task(
+                    task,
+                    max_pages=bounded_pages,
+                    max_steps=bounded_steps,
+                    settings=ctx.deps.settings,
+                    workspace=ctx.deps.workspace,
+                )
             except Exception as exc:
                 logger.warning("web_browser_task degraded task=%s error=%s", task, exc)
                 return sanitize_tool_output(
@@ -316,6 +323,17 @@ async def run_agent(
                 """Preview CSV, XLSX, PDF, JSON, or text content from the workspace."""
                 assert ctx.deps.workspace is not None
                 return ctx.deps.workspace.preview_table(relative_path, rows=rows)
+
+            @agent.tool
+            async def workspace_convert_to_markdown(
+                ctx: RunContext[AgentDependencies],
+                relative_path: str,
+                output_relative_path: str = "",
+            ) -> str:
+                """Convert a workspace document or image into markdown using the wrapped MarkItDown file tool."""
+                assert ctx.deps.workspace is not None
+                normalized_output = output_relative_path.strip() or None
+                return ctx.deps.workspace.convert_to_markdown(relative_path, normalized_output)
 
             @agent.tool
             async def workspace_write_text_file(ctx: RunContext[AgentDependencies], relative_path: str, content: str) -> str:

@@ -24,11 +24,29 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 
 This is the current highest-priority work and should stay the focus until validated live:
 
-1. Finish the dedicated on-demand hands worker path.
-2. Make browser/file execution reliable and fast enough for real use.
-3. Direct interruption/resume is now proven on the dedicated worker path. An operator-stopped worker container transitions the job to `interrupted`, and `resume that task` now preserves the original heavy-task query and completes with carried-forward workspace state. The remaining observability gap is that Telegram interruption delivery was not independently inspectable from current CloudWatch logging, even though the control-plane/job-state path is behaving correctly.
-4. Run Codex-driven E2E tests before the user’s first real heavy-task test.
-5. Continue runtime optimizations as real limitations are discovered.
+1. Keep the dedicated on-demand hands worker path as the production heavy-task path.
+2. Keep the new Browser-use + deterministic-first + Friday-owned workspace MCP stack as the primary hands substrate.
+3. Direct interruption/resume is now proven on the dedicated worker path. Text-driven task listing, status lookup, and stop commands are also live:
+   - `show my tasks`
+   - `what's the status?`
+   - `stop 1`
+   - `stop <job id>`
+4. The next substantive P1 upgrade is durable pause-for-input, not more light-path prompt tricks.
+5. Continue runtime optimizations as real limitations are discovered, with special focus on browser anti-bot and challenge-heavy sites.
+
+### P1 Remaining Work
+
+1. Add `paused_for_input` / human-in-the-loop resume instead of treating missing user input as terminal failure.
+2. Review and selectively add real MCP/app connectors for common use cases where they materially outperform browser automation:
+   - restaurant reservations / booking if a vetted connector is found
+   - any future commerce/travel/common-use connector only after security review
+3. Improve browser reliability on hostile domains:
+   - Cloudflare / challenge pages
+   - heavy retail SPAs
+   - blank result bodies after JS load
+   - screenshot quality / step artifact selection
+4. Decide whether to enable Browser Use Cloud, CAPTCHA support, or both for difficult sites.
+5. Move higher-risk MCP/tool classes toward per-tool container isolation instead of only the shared worker container boundary.
 
 ### P2: Dashboard
 
@@ -89,6 +107,12 @@ This is intentionally deferred until the agent is working well and the dashboard
 - The Friday personal agent now lives under `agent/` and is deployed by `scripts/deploy-agent.sh`; account migration includes it by default after the shared host is restored, with `--skip-agent` available for emergency host-only rotations.
 - The medium-term direction is now dedicated on-demand hands infrastructure for heavy tasks, with the shared host retained for VPN + Iris and as the current bridge state during the transition.
 - Docker Desktop storage and macOS storage views are larger than `share/media`; that overhead must be tracked separately from the media cap.
+- Browser-use is now the primary browser/computer-use loop, but it is still not enough by itself for some challenge-heavy sites. Current observed failure classes:
+  - Cloudflare verification / anti-bot pages
+  - retail site “page crashed” or blank result regions
+  - successful final reports paired with ugly intermediate screenshots from blocked pages
+- The current restaurant-reservation path does not yet have a vetted installed connector. Friday must use deterministic search/fetch first and browser fallback only when necessary.
+- Local Docker is not reliably available on this Mac session, so remote Docker builds on the dedicated worker have been used as the practical deployment path for recent Lambda image pushes.
 
 ## Current Working Sources
 
@@ -99,10 +123,11 @@ This is intentionally deferred until the agent is working well and the dashboard
 
 ## Immediate Next Steps
 
-1. Keep the installed `com.friday.media-cap` LaunchAgent in its default `dry-run` mode until you explicitly want scheduled deletions, then switch it to `apply` and reinstall it.
-2. Add alternative movie backups for the still-failing `TorrentGalaxyClone` and `The Pirate Bay` slots if you want more redundancy.
-3. Improve Bazarr provider coverage if external sidecar subtitles should be guaranteed instead of opportunistic.
-4. If Maintainerr should actively delete media instead of only evaluating rules, review the current rule set before forcing a manual execution.
+1. Keep the Friday control-plane + dedicated-worker deployment path healthy.
+2. Prioritize pause-for-input / HITL resume for long-running tasks.
+3. Evaluate and review real reservation connectors before adding them.
+4. Improve hostile-site browser behavior instead of assuming Browser-use solved anti-bot completely.
+5. Only after the agent is stable enough, move to dashboard/P2 work.
 
 ## Backlog
 
@@ -119,5 +144,8 @@ When returning to this repo in a future session:
 1. Read `SAY_THIS_WHEN_AUTO_COMPACT.md`
 2. Read `docs/CODEX_MAINTENANCE_LOOP.md`
 3. Read `docs/MAINTENANCE_JOURNAL.md`
-4. Run `./scripts/check-stack.sh`
-5. Read the logs before making claims
+4. Read `docs/FRIDAY_AGENT.md`
+5. Read `docs/FRIDAY_TOOL_SECURITY.md`
+6. Read `docs/NEXT_CODEX_PROMPT.md`
+7. Run `./scripts/check-stack.sh`
+8. Read the logs before making claims

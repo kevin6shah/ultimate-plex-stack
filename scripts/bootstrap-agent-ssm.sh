@@ -10,6 +10,7 @@ LOGFIRE_ENABLED_VALUE="${LOGFIRE_ENABLED:-false}"
 
 DEEPSEEK_API_KEY_PARAM_VALUE="${DEEPSEEK_API_KEY_PARAM:-/friday/agent/deepseek-api-key}"
 BRAVE_SEARCH_API_KEY_PARAM_VALUE="${BRAVE_SEARCH_API_KEY_PARAM:-/friday/agent/brave-search-api-key}"
+BROWSER_USE_API_KEY_PARAM_VALUE="${BROWSER_USE_API_KEY_PARAM:-/friday/agent/browser-use-api-key}"
 TELEGRAM_BOT_TOKEN_PARAM_VALUE="${TELEGRAM_BOT_TOKEN_PARAM:-/friday/agent/telegram-bot-token}"
 TELEGRAM_ALLOWED_CHAT_ID_PARAM_VALUE="${TELEGRAM_ALLOWED_CHAT_ID_PARAM:-/friday/agent/telegram-chat-id}"
 TELEGRAM_WEBHOOK_SECRET_PARAM_VALUE="${TELEGRAM_WEBHOOK_SECRET_PARAM:-/friday/agent/telegram-webhook-secret}"
@@ -78,6 +79,7 @@ put_plaintext() {
 
 put_secret "$DEEPSEEK_API_KEY_PARAM_VALUE" "DeepSeek API key"
 put_optional_secret "$BRAVE_SEARCH_API_KEY_PARAM_VALUE" "Brave Search API key"
+put_optional_secret "$BROWSER_USE_API_KEY_PARAM_VALUE" "Browser Use Cloud API key"
 put_secret "$TELEGRAM_BOT_TOKEN_PARAM_VALUE" "Telegram bot token"
 put_plaintext "$TELEGRAM_ALLOWED_CHAT_ID_PARAM_VALUE" "Telegram allowed chat id"
 put_secret "$TELEGRAM_WEBHOOK_SECRET_PARAM_VALUE" "Telegram webhook secret"

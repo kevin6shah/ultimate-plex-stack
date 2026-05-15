@@ -12,7 +12,7 @@ from botocore.exceptions import ClientError
 
 from .budget import month_key, today_key, ttl_epoch
 from .context_memory import build_thread_summary
-from .jobs import AgentConfig, AgentJob, CheckpointPayload, JobStatus, TaskClass, ThreadTurn, ThreadTurnRole
+from .jobs import AgentConfig, AgentJob, CheckpointPayload, ControlCommand, ControlSignal, JobStatus, TaskClass, ThreadTurn, ThreadTurnRole
 from .settings import Settings
 
 
@@ -419,6 +419,32 @@ class StateStore:
             }
         )
 
+    def record_control_signal(self, job_id: str, *, command: ControlCommand, note: str = "") -> ControlSignal:
+        signal = ControlSignal(command=command, note=note[:1000])
+        self.table.put_item(
+            Item={
+                "PK": f"JOB#{job_id}",
+                "SK": "CONTROL#LATEST",
+                "command": signal.command.value,
+                "note": signal.note,
+                "created_at": signal.created_at,
+                "ttl": ttl_epoch(self.settings.interrupted_job_ttl_days),
+            }
+        )
+        return signal
+
+    def get_latest_control_signal(self, job_id: str) -> Optional[ControlSignal]:
+        item = self.table.get_item(Key={"PK": f"JOB#{job_id}", "SK": "CONTROL#LATEST"}).get("Item")
+        if not item:
+            return None
+        return ControlSignal.model_validate(
+            {
+                "command": item.get("command"),
+                "note": item.get("note", ""),
+                "created_at": item.get("created_at"),
+            }
+        )
+
     def get_latest_job_for_user(self, *, source: str, user_id: str, statuses: tuple[JobStatus, ...]) -> Optional[AgentJob]:
         response = self.table.scan(
             FilterExpression=Attr("user_id").eq(user_id)
@@ -456,6 +482,16 @@ class StateStore:
     def list_jobs(self, *, statuses: tuple[JobStatus, ...], limit: int = 20) -> list[AgentJob]:
         response = self.table.scan(
             FilterExpression=Attr("SK").eq("META") & Attr("status").is_in([status.value for status in statuses]),
+        )
+        items = sorted(response.get("Items", []), key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        return [self._job_from_item(item) for item in items[:limit]]
+
+    def list_jobs_for_user(self, *, source: str, user_id: str, statuses: tuple[JobStatus, ...], limit: int = 20) -> list[AgentJob]:
+        response = self.table.scan(
+            FilterExpression=Attr("SK").eq("META")
+            & Attr("source").eq(source)
+            & Attr("user_id").eq(user_id)
+            & Attr("status").is_in([status.value for status in statuses]),
         )
         items = sorted(response.get("Items", []), key=lambda item: str(item.get("updated_at", "")), reverse=True)
         return [self._job_from_item(item) for item in items[:limit]]

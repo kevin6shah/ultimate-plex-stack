@@ -55,6 +55,9 @@ Parameters:
   BraveSearchApiKeyParam:
     Type: String
     Default: /friday/agent/brave-search-api-key
+  BrowserUseApiKeyParam:
+    Type: String
+    Default: /friday/agent/browser-use-api-key
   TelegramBotTokenParam:
     Type: String
     Default: /friday/agent/telegram-bot-token
@@ -81,6 +84,23 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
+  BrowserUseEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  BrowserUseCloudEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  BrowserUseModel:
+    Type: String
+    Default: deepseek-chat
+  BrowserUseCloudModel:
+    Type: String
+    Default: bu-latest
+  BrowserUseCloudProxyCountryCode:
+    Type: String
+    Default: us
 
 Conditions:
   CreateRuntime: !Equals [!Ref BootstrapOnly, 'false']
@@ -255,6 +275,7 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeepSeekApiKeyParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BraveSearchApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BrowserUseApiKeyParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramAllowedChatIdParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramWebhookSecretParam}'
@@ -319,6 +340,12 @@ Resources:
           WORKER_API_KEY_PARAM: !Ref WorkerApiKeyParam
           DEEPSEEK_API_KEY_PARAM: !Ref DeepSeekApiKeyParam
           BRAVE_SEARCH_API_KEY_PARAM: !Ref BraveSearchApiKeyParam
+          BROWSER_USE_API_KEY_PARAM: !Ref BrowserUseApiKeyParam
+          BROWSER_USE_ENABLED: !Ref BrowserUseEnabled
+          BROWSER_USE_CLOUD_ENABLED: !Ref BrowserUseCloudEnabled
+          BROWSER_USE_MODEL: !Ref BrowserUseModel
+          BROWSER_USE_CLOUD_MODEL: !Ref BrowserUseCloudModel
+          BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE: !Ref BrowserUseCloudProxyCountryCode
           LOGFIRE_TOKEN_PARAM: !Ref LogfireTokenParam
           LOGFIRE_ENABLED: !Ref LogfireEnabled
           LOGFIRE_FULL_CONTENT: !Ref LogfireFullContent

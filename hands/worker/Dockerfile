@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
+FROM mcr.microsoft.com/playwright/python:v1.49.1-noble
 
 WORKDIR /opt/friday
 

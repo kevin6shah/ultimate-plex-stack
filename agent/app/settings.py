@@ -38,10 +38,18 @@ class Settings:
     siri_api_key_param: str = os.environ.get("SIRI_API_KEY_PARAM", "")
     deepseek_api_key_param: str = os.environ.get("DEEPSEEK_API_KEY_PARAM", "")
     brave_search_api_key_param: str = os.environ.get("BRAVE_SEARCH_API_KEY_PARAM", "")
+    browser_use_api_key_param: str = os.environ.get("BROWSER_USE_API_KEY_PARAM", "")
     logfire_token_param: str = os.environ.get("LOGFIRE_TOKEN_PARAM", "")
     worker_api_key_param: str = os.environ.get("WORKER_API_KEY_PARAM", "")
     browser_stealth_enabled: bool = os.environ.get("BROWSER_STEALTH_ENABLED", "true").lower() == "true"
     browser_user_agent_rotation: bool = os.environ.get("BROWSER_USER_AGENT_ROTATION", "true").lower() == "true"
+    browser_use_enabled: bool = os.environ.get("BROWSER_USE_ENABLED", "true").lower() == "true"
+    browser_use_cloud_enabled: bool = os.environ.get("BROWSER_USE_CLOUD_ENABLED", "false").lower() == "true"
+    browser_use_model: str = os.environ.get("BROWSER_USE_MODEL", "deepseek-chat")
+    browser_use_cloud_model: str = os.environ.get("BROWSER_USE_CLOUD_MODEL", "bu-latest")
+    browser_use_cloud_proxy_country_code: str = os.environ.get("BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE", "us")
+    browser_use_step_timeout_seconds: int = int(os.environ.get("BROWSER_USE_STEP_TIMEOUT_SECONDS", "120"))
+    browser_use_max_failures: int = int(os.environ.get("BROWSER_USE_MAX_FAILURES", "3"))
     logfire_enabled: bool = os.environ.get("LOGFIRE_ENABLED", "false").lower() == "true"
     full_logfire_logging: bool = os.environ.get("LOGFIRE_FULL_CONTENT", "false").lower() == "true"
     hands_worker_mode: str = os.environ.get("HANDS_WORKER_MODE", "shared_host")

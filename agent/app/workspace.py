@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 
 def _pdf_escape(text: str) -> str:
@@ -165,7 +166,25 @@ class Workspace:
             for page in reader.pages[:rows]:
                 output.append((page.extract_text() or "").strip())
             return "\n\n".join(output)[:6000]
+        if suffix in {".docx", ".pptx", ".xlsx", ".xls", ".html", ".htm", ".xml", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}:
+            markdown = self.convert_to_markdown(relative_path)
+            return self.read_text(markdown, limit=6000)
         return self.read_text(relative_path)
+
+    def convert_to_markdown(self, relative_path: str, output_relative_path: Optional[str] = None) -> str:
+        path = self.resolve(relative_path)
+        suffix = path.suffix.lower().lstrip(".") or "txt"
+        target_relative = output_relative_path or f"converted/{path.stem}.{suffix}.md"
+        target = self.resolve(target_relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            from markitdown import MarkItDown
+        except Exception as exc:
+            raise RuntimeError(f"MarkItDown is unavailable: {exc}") from exc
+        converter = MarkItDown(enable_plugins=False)
+        result = converter.convert_local(path)
+        target.write_text(result.text_content or "", encoding="utf-8")
+        return str(target.relative_to(self.root))
 
     def run_shell(self, command: str, timeout_seconds: int = 60) -> str:
         blocked_patterns = (

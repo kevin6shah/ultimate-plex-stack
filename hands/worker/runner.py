@@ -6,11 +6,12 @@ import json
 import os
 import signal
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 from app.agent_core import run_agent
-from app.jobs import ArtifactUploadRequest, WorkerCheckpointRequest, WorkerClaimResponse, WorkerCompleteRequest, WorkerFailureRequest, WorkerHeartbeat
+from app.jobs import ArtifactUploadRequest, ControlCommand, WorkerCheckpointRequest, WorkerClaimResponse, WorkerCompleteRequest, WorkerFailureRequest, WorkerHeartbeat
 from app.settings import Settings
 from app.workspace import Workspace
 
@@ -36,6 +37,17 @@ class WorkerApiClient:
             response = await client.post(
                 f"{self.base_url}{path}",
                 json=payload,
+                headers={"x-friday-worker-key": self.worker_key},
+            )
+            response.raise_for_status()
+            if response.content:
+                return response.json()
+            return {}
+
+    async def get_control(self, job_id: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}/internal/worker/control/{job_id}",
                 headers={"x-friday-worker-key": self.worker_key},
             )
             response.raise_for_status()
@@ -149,6 +161,21 @@ async def main() -> None:
 
     status_task = asyncio.create_task(periodic_status())
 
+    async def poll_control() -> None:
+        while True:
+            await asyncio.sleep(10)
+            payload = await api.get_control(claim.job.job_id)
+            control = payload.get("control")
+            if not control:
+                continue
+            if control.get("command") == ControlCommand.STOP.value:
+                interrupted.set()
+                if main_task is not None:
+                    main_task.cancel()
+                return
+
+    control_task = asyncio.create_task(poll_control())
+
     try:
         await api.heartbeat(claim.job.job_id, current_step, current_summary)
         await download_attachments(claim, workspace)
@@ -192,8 +219,11 @@ async def main() -> None:
         raise
     finally:
         status_task.cancel()
+        control_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await status_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await control_task
 
 
 if __name__ == "__main__":

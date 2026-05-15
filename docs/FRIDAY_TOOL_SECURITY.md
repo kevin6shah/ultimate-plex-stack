@@ -61,6 +61,32 @@ The dedicated hands worker currently enforces:
 
 This is the baseline security posture for all future MCP-style tool servers too.
 
+## Current MCP Usage
+
+Friday now uses a Friday-owned local workspace MCP server for browser/file handoff instead of exposing broad file-writing directly to the model.
+
+Current pattern:
+- Browser-use remains the primary browser/computer-use loop
+- Browser-use built-in file actions are excluded where Friday has safer equivalents
+- a Friday-owned stdio MCP server exposes only:
+  - list workspace files
+  - read workspace file
+  - preview workspace file
+  - write workspace text file
+  - convert workspace file to markdown
+  - write workspace PDF report
+
+This keeps file operations inside a narrower, auditable surface while still letting Browser-use finish multi-step workflows.
+
+Common-use MCP/app policy:
+- prefer real connectors for categories that have first-class tool support, such as flights and hotels
+- do not treat generic browser automation as equivalent to a reservation/booking connector when none is installed
+- if no production-worthy connector exists for a common use case, Friday should use deterministic search/fetch first and only escalate to browser interaction when needed
+
+Current limitation:
+- these MCP tools currently run inside the already-isolated worker container, not yet in separate per-tool containers
+- per-tool container isolation remains the next hardening step for higher-risk tool classes
+
 ## Deterministic-First Rule
 
 For research tasks:

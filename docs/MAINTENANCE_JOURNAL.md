@@ -2,6 +2,27 @@
 
 ## 2026-05-15
 
+- Shifted the primary heavy-task browser substrate toward Browser-use instead of continuing to deepen the custom selector-driven Playwright layer.
+- Added a Friday-owned local workspace MCP server and registered it into Browser-use so file operations can go through a narrower tool surface than Browser-use's default file actions.
+- Added MarkItDown-backed workspace document conversion and wired it into the new workspace MCP/file flow.
+- Kept the dedicated worker orchestration, checkpoints, Telegram/Siri routing, and auto-start/auto-stop lifecycle unchanged while replacing the primary browser/file execution path underneath.
+- Added direct control-plane commands for long-running work:
+  - `show my tasks`
+  - `what's the status?`
+  - `stop 1`
+  - `stop <job id>`
+- Fixed the bad light-path DSML/tool-call leak by:
+  - classifying reservation/availability/restaurant queries as heavy
+  - auto-upgrading light-path internal-tool-markup leaks to heavy instead of returning garbage to Telegram/Siri
+- Proved the text-driven stop path end to end against a synthetic heavy task:
+  - Siri created a heavy task
+  - a text `stop 1` control request was accepted
+  - the worker observed the control signal and the job ended `interrupted`
+- Confirmed the practical browser limits that still remain after the Browser-use migration:
+  - Cloudflare / human-verification pages
+  - heavy retail sites that crash or render blank result regions
+  - good final synthesized reports paired with ugly intermediate screenshots from blocked pages
+
 ### Change: dedicated worker path proved with resumable heavy-task execution
 
 - Goal:

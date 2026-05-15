@@ -103,11 +103,13 @@ Friday's heavy-task execution stack currently is:
 
 - `PydanticAI` for planning and typed tool use
 - deterministic research wrappers (`web_search`, `fetch_web_page`) before browser escalation
+- `Browser-use` as the primary browser/computer-use loop on the dedicated worker
 - `playwright-stealth` plus rotated user agents in the dedicated worker
-- a custom hardened Playwright layer for live website interaction
+- a Friday-owned local workspace MCP server for narrow file handoff inside the worker
+- `MarkItDown`-backed workspace document conversion
 - workspace file tools for PDF/text/table generation and shell/Python execution
 
-This is not yet a full `Browser-use` migration. The current browser substrate is still Friday-owned code on top of Playwright, hardened with retries, source-skipping, and deterministic-first routing.
+This is now a Browser-use-backed heavy-task substrate, not the older custom selector-centric Playwright path. The older direct Playwright browser layer is still useful as fallback code/history, but it is no longer the primary hands architecture.
 
 `/friday/agent/logfire-token` is only required when `LOGFIRE_ENABLED=true`.
 
@@ -215,8 +217,21 @@ Current live `iris` account status:
    - checkpointed heavy-task resume
    - browser screenshot + PDF artifact generation
    - real end-to-end camera research that generated and uploaded a final PDF artifact
+   - Browser-use as the primary browser/computer-use path on the dedicated worker
 
 Current known worker caveats:
+
+- Browser-use is materially better than the old selector-driven path, but it is still not magic on hostile sites. Current observed failure classes:
+  - Cloudflare / “verify you are human” challenge pages
+  - retail pages that crash or show blank result areas under automation
+  - anti-bot flows that still produce ugly step screenshots even when the final synthesized report is good
+- `playwright-stealth` helps but is not sufficient by itself for some hostile domains.
+- The right routing rule is still:
+  - connector/API if we have one
+  - deterministic search/fetch second
+  - browser only when interaction is required
+- Restaurant reservation availability is still on the browser/deterministic path because no vetted installed reservation connector exists in this stack yet.
+- The live “show my tasks / what’s the status / stop 1” control-plane path is now available and should be used instead of re-prompting the model for job state.
 
 - The dedicated worker deploy path now depends on local Docker image build + transfer. Rebuilding the Playwright image on the small worker host itself proved unreliable.
 - Operator IAM still needs `ec2:StartInstances`, `ec2:StopInstances`, `ec2:RebootInstances`, `cloudformation:DescribeStackResources`, and `s3:GetObject` if Codex should fully operate and debug the worker directly.
@@ -226,12 +241,20 @@ Current known worker caveats:
   - an operator-stopped worker container transitions the job to `interrupted`
   - `resume that task` preserves the original heavy-task prompt instead of treating the literal resume text as the new job body
   - resumed work reuses prior workspace state and can complete with carried-forward files
-- Real camera-research E2E is now proven on the hardened stack:
+- Real camera-research E2E is now proven on the Browser-use-backed stack:
   - auto-start from a stopped worker instance
   - deterministic search/fetch first
-  - browser escalation only when needed
+  - Browser-use browser escalation only when needed
+  - Friday-owned workspace MCP tools for file handoff inside the worker
   - a successful final PDF artifact:
     - `reports/vlogging-travel-snowboarding-cameras.pdf`
+    - `reports/adventure-cameras-2025.pdf`
+- Users should be able to ask for progress explicitly while a heavy task is running.
+  - Telegram/Siri status questions like `what's the status?`, `any update?`, and `did it finish?` should return the latest job state directly instead of invoking the model again.
+- Common-use connector policy:
+  - use real MCP/app connectors for categories that have them
+  - current examples include flights and hotels
+  - restaurant reservation availability does not currently have an installed production-worthy connector in this stack, so it still routes to deterministic web research and then browser automation when needed
 - Current remaining caveat:
   - Telegram interruption delivery was not independently observable from the current CloudWatch log shape, even though job-state interruption and resume behavior are proven live
 

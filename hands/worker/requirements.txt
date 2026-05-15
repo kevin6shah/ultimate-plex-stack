@@ -3,6 +3,8 @@ pydantic-ai-slim[openai]==0.8.1
 httpx==0.28.1
 playwright==1.49.1
 playwright-stealth==2.0.0
-pydantic==2.10.4
+pydantic==2.12.5
 openpyxl==3.1.5
-pypdf==5.5.0
+pypdf==6.9.1
+browser-use==0.12.6
+markitdown==0.1.5
