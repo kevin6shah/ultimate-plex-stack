@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import re
+import asyncio
 from html import unescape
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Awaitable, Callable, Iterable, Optional, TypeVar
 from urllib.parse import quote_plus, unquote, urlparse
 
 import httpx
@@ -26,6 +27,20 @@ BOT_BLOCK_PATTERNS = (
 )
 TEXT_SELECTORS = ("main", "article", "[role='main']", "body")
 MAX_EXCERPT_CHARS = 1600
+RETRYABLE_BROWSER_ERROR_PATTERNS = (
+    "net::err_http2_protocol_error",
+    "net::err_connection_reset",
+    "net::err_connection_closed",
+    "net::err_connection_aborted",
+    "net::err_network_changed",
+    "net::err_internet_disconnected",
+    "net::err_timed_out",
+    "net::err_name_not_resolved",
+    "timeout",
+    "target page, context or browser has been closed",
+)
+TRANSIENT_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +82,40 @@ def _search_url(task: str) -> str:
     return f"https://html.duckduckgo.com/html/?q={quote_plus(task)}"
 
 
+def _is_retryable_browser_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(pattern in message for pattern in RETRYABLE_BROWSER_ERROR_PATTERNS)
+
+
+async def _run_with_retries(
+    label: str,
+    operation: Callable[[], Awaitable[T]],
+    *,
+    attempts: int = 3,
+    base_delay_seconds: float = 1.0,
+) -> T:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_retryable_browser_error(exc):
+                raise
+            delay = base_delay_seconds * attempt
+            logger.warning(
+                "browser retry label=%s attempt=%s/%s delay=%.1fs error=%s",
+                label,
+                attempt,
+                attempts,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _selector_candidates(selector: str) -> list[str]:
     parts = [part.strip() for part in selector.split(",")]
     return [part for part in parts if part] or [selector]
@@ -81,9 +130,35 @@ async def _http_fetch_text(url: str) -> str:
         },
         follow_redirects=True,
     ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        return _strip_html(response.text)
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = await client.get(url)
+                if response.status_code in TRANSIENT_HTTP_STATUS_CODES:
+                    raise httpx.HTTPStatusError(
+                        f"transient status {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                return _strip_html(response.text)
+            except Exception as exc:
+                last_exc = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = isinstance(exc, httpx.TransportError) or status_code in TRANSIENT_HTTP_STATUS_CODES
+                if attempt >= 3 or not retryable:
+                    raise
+                delay = float(attempt)
+                logger.warning(
+                    "browser http retry url=%s attempt=%s/3 delay=%.1fs error=%s",
+                    url,
+                    attempt,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
 
 async def _extract_page_text_via_js(page) -> str:
@@ -182,7 +257,10 @@ class BrowserSession:
     async def goto(self, url: str) -> str:
         await self.ensure_started()
         logger.info("browser goto url=%s", url)
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        await _run_with_retries(
+            f"goto:{url}",
+            lambda: self._page.goto(url, wait_until="domcontentloaded", timeout=20000),
+        )
         await self._page.wait_for_timeout(800)
         return await self.describe()
 
@@ -278,7 +356,10 @@ class BrowserSession:
 
 async def _visit_url(page, url: str) -> tuple[str, str, str]:
     logger.info("browser visiting url=%s", url)
-    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+    await _run_with_retries(
+        f"visit:{url}",
+        lambda: page.goto(url, wait_until="domcontentloaded", timeout=15000),
+    )
     await page.wait_for_timeout(750)
     title = await page.title()
     text = await _extract_page_text(page)
@@ -289,7 +370,10 @@ async def _visit_url(page, url: str) -> tuple[str, str, str]:
 
 async def _search_result_links(page, task: str, *, max_pages: int) -> list[str]:
     logger.info("browser searching public web task=%s", task)
-    await page.goto(_search_url(task), wait_until="domcontentloaded", timeout=15000)
+    await _run_with_retries(
+        f"search:{task[:80]}",
+        lambda: page.goto(_search_url(task), wait_until="domcontentloaded", timeout=15000),
+    )
     await page.wait_for_timeout(500)
     links: list[str] = []
     for href in await page.locator("a[href]").evaluate_all("(els) => els.map((el) => el.getAttribute('href') || '')"):

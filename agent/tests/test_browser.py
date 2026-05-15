@@ -1,6 +1,6 @@
 import asyncio
 
-from app.browser import _extract_page_text
+from app.browser import _extract_page_text, _run_with_retries
 
 
 class FakeLocator:
@@ -58,3 +58,34 @@ def test_extract_page_text_uses_js_fallback_when_selectors_fail() -> None:
 
     text = asyncio.run(_extract_page_text(page, selector="body"))
     assert text == "Body text from JS fallback"
+
+
+def test_run_with_retries_recovers_from_transient_browser_error() -> None:
+    attempts = {"count": 0}
+
+    async def flaky() -> str:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("Page.goto: net::ERR_HTTP2_PROTOCOL_ERROR")
+        return "ok"
+
+    result = asyncio.run(_run_with_retries("goto:test", flaky, attempts=3, base_delay_seconds=0))
+    assert result == "ok"
+    assert attempts["count"] == 2
+
+
+def test_run_with_retries_does_not_retry_non_retryable_error() -> None:
+    attempts = {"count": 0}
+
+    async def broken() -> str:
+        attempts["count"] += 1
+        raise RuntimeError("permission denied")
+
+    try:
+        asyncio.run(_run_with_retries("goto:test", broken, attempts=3, base_delay_seconds=0))
+    except RuntimeError as exc:
+        assert "permission denied" in str(exc)
+    else:
+        raise AssertionError("expected runtime error")
+
+    assert attempts["count"] == 1
