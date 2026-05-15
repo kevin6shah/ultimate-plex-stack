@@ -1,0 +1,935 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Friday personal agent serverless stack.
+
+Parameters:
+  BootstrapOnly:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  AgentName:
+    Type: String
+    Default: friday-agent
+  ImageUri:
+    Type: String
+    Default: ''
+  DailyBudgetUsd:
+    Type: String
+    Default: '0.40'
+  MonthlyModelBudgetUsd:
+    Type: String
+    Default: '12.00'
+  AwsBudgetLimitUsd:
+    Type: Number
+    Default: 20
+  BudgetAlertEmail:
+    Type: String
+    Default: ''
+  MigrationAnchorDate:
+    Type: String
+    Default: '2026-05-10'
+  MigrationReminderDate:
+    Type: String
+    Default: '2026-10-26'
+  MigrationExpiryDate:
+    Type: String
+    Default: '2026-11-10'
+  MigrationReminderSchedule:
+    Type: String
+    Default: cron(0 14 26 10 ? 2026)
+  AgentReservedConcurrency:
+    Type: Number
+    Default: 0
+  SharedHostInstanceId:
+    Type: String
+    Default: ''
+  HandsWorkerMode:
+    Type: String
+    Default: shared_host
+    AllowedValues: [shared_host, dedicated_ec2]
+  HandsWorkerInstanceId:
+    Type: String
+    Default: ''
+  DeepSeekApiKeyParam:
+    Type: String
+    Default: /friday/agent/deepseek-api-key
+  TelegramBotTokenParam:
+    Type: String
+    Default: /friday/agent/telegram-bot-token
+  TelegramAllowedChatIdParam:
+    Type: String
+    Default: /friday/agent/telegram-chat-id
+  TelegramWebhookSecretParam:
+    Type: String
+    Default: /friday/agent/telegram-webhook-secret
+  SiriApiKeyParam:
+    Type: String
+    Default: /friday/agent/siri-api-key
+  WorkerApiKeyParam:
+    Type: String
+    Default: /friday/agent/worker-api-key
+  LogfireTokenParam:
+    Type: String
+    Default: /friday/agent/logfire-token
+  LogfireEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  LogfireFullContent:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  CreateRuntime: !Equals [!Ref BootstrapOnly, 'false']
+  HasImageUri: !Not [!Equals [!Ref ImageUri, '']]
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, '']]
+  HasSharedHostInstanceId: !Not [!Equals [!Ref SharedHostInstanceId, '']]
+  HasHandsWorkerInstanceId: !Not [!Equals [!Ref HandsWorkerInstanceId, '']]
+  HasReservedConcurrency: !Not [!Equals [!Ref AgentReservedConcurrency, 0]]
+  CreateRuntimeWithImage: !And
+    - !Condition CreateRuntime
+    - !Condition HasImageUri
+
+Resources:
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AgentName
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaImageRetrieval
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Condition:
+              StringEquals:
+                aws:sourceAccount: !Ref AWS::AccountId
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the latest 5 agent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {"type": "expire"}
+              }
+            ]
+          }
+
+  AgentTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateRuntimeWithImage
+    Properties:
+      TableName: !Sub '${AgentName}-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  AgentArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateRuntimeWithImage
+    Properties:
+      BucketName: !Sub '${AgentName}-${AWS::AccountId}-artifacts'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  AgentDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Condition: CreateRuntimeWithImage
+    Properties:
+      QueueName: !Sub '${AgentName}-dlq'
+      MessageRetentionPeriod: 1209600
+
+  AgentQueue:
+    Type: AWS::SQS::Queue
+    Condition: CreateRuntimeWithImage
+    Properties:
+      QueueName: !Sub '${AgentName}-jobs'
+      VisibilityTimeout: 960
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AgentDeadLetterQueue.Arn
+        maxReceiveCount: 2
+
+  CostAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateRuntimeWithImage
+    Properties:
+      TopicName: !Sub '${AgentName}-cost-alerts'
+
+  AgentRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRuntimeWithImage
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: friday-agent-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AgentName}:*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AgentTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !Sub '${AgentTable.Arn}/index/GSI1'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt AgentQueue.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeepSeekApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramAllowedChatIdParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramWebhookSecretParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SiriApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WorkerApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${LogfireTokenParam}'
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${AgentArtifactsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt AgentArtifactsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                Resource: '*'
+
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateRuntimeWithImage
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AgentName}'
+      RetentionInDays: 1
+
+  AgentFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateRuntimeWithImage
+    DependsOn:
+      - AgentLogGroup
+    Properties:
+      FunctionName: !Ref AgentName
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Role: !GetAtt AgentRole.Arn
+      Architectures:
+        - x86_64
+      MemorySize: 2048
+      Timeout: 900
+      ReservedConcurrentExecutions: !If
+        - HasReservedConcurrency
+        - !Ref AgentReservedConcurrency
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref AgentTable
+          JOB_QUEUE_URL: !Ref AgentQueue
+          AGENT_MODEL: deepseek:deepseek-chat
+          REASONER_MODEL: deepseek:deepseek-reasoner
+          DAILY_BUDGET_USD: !Ref DailyBudgetUsd
+          MONTHLY_BUDGET_USD: !Ref MonthlyModelBudgetUsd
+          TELEGRAM_BOT_TOKEN_PARAM: !Ref TelegramBotTokenParam
+          TELEGRAM_ALLOWED_CHAT_ID_PARAM: !Ref TelegramAllowedChatIdParam
+          TELEGRAM_WEBHOOK_SECRET_PARAM: !Ref TelegramWebhookSecretParam
+          SIRI_API_KEY_PARAM: !Ref SiriApiKeyParam
+          WORKER_API_KEY_PARAM: !Ref WorkerApiKeyParam
+          DEEPSEEK_API_KEY_PARAM: !Ref DeepSeekApiKeyParam
+          LOGFIRE_TOKEN_PARAM: !Ref LogfireTokenParam
+          LOGFIRE_ENABLED: !Ref LogfireEnabled
+          LOGFIRE_FULL_CONTENT: !Ref LogfireFullContent
+          ARTIFACTS_BUCKET: !Ref AgentArtifactsBucket
+          CONVERSATION_TTL_SECONDS: 172800
+          COMPLETED_JOB_TTL_DAYS: 7
+          INTERRUPTED_JOB_TTL_DAYS: 21
+          MAX_ATTACHMENT_BYTES: 20971520
+          ARTIFACT_URL_TTL_SECONDS: 3600
+          HANDS_WORKER_MODE: !Ref HandsWorkerMode
+          HANDS_WORKER_INSTANCE_ID: !Ref HandsWorkerInstanceId
+
+  AgentFunctionUrl:
+    Type: AWS::Lambda::Url
+    Condition: CreateRuntimeWithImage
+    Properties:
+      TargetFunctionArn: !Ref AgentFunction
+      AuthType: NONE
+      Cors:
+        AllowMethods: ['GET', 'POST']
+        AllowOrigins: ['*']
+        AllowHeaders:
+          - content-type
+          - x-friday-siri-key
+          - x-telegram-bot-api-secret-token
+
+  AgentFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateRuntimeWithImage
+    Properties:
+      FunctionName: !Ref AgentFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  AgentFunctionPublicInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateRuntimeWithImage
+    Properties:
+      FunctionName: !Ref AgentFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  AgentQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: CreateRuntimeWithImage
+    Properties:
+      EventSourceArn: !GetAtt AgentQueue.Arn
+      FunctionName: !Ref AgentFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      Enabled: true
+
+  CostNotifierRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRuntimeWithImage
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: friday-agent-cost-notifier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AgentName}-cost-notifier:*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramAllowedChatIdParam}'
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunctionConcurrency
+                  - lambda:PutFunctionConcurrency
+                  - lambda:DeleteFunctionConcurrency
+                Resource: !GetAtt AgentFunction.Arn
+
+  CostNotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateRuntimeWithImage
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AgentName}-cost-notifier'
+      RetentionInDays: 1
+
+  CostNotifierFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateRuntimeWithImage
+    DependsOn:
+      - CostNotifierLogGroup
+    Properties:
+      FunctionName: !Sub '${AgentName}-cost-notifier'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt CostNotifierRole.Arn
+      Environment:
+        Variables:
+          TARGET_FUNCTION_NAME: !Ref AgentFunction
+          TARGET_FUNCTION_CONCURRENCY: !Ref AgentReservedConcurrency
+          TELEGRAM_BOT_TOKEN_PARAM: !Ref TelegramBotTokenParam
+          TELEGRAM_ALLOWED_CHAT_ID_PARAM: !Ref TelegramAllowedChatIdParam
+          PAUSE_THRESHOLD_USD: !Ref AwsBudgetLimitUsd
+          MIGRATION_ANCHOR_DATE: !Ref MigrationAnchorDate
+          MIGRATION_REMINDER_DATE: !Ref MigrationReminderDate
+          MIGRATION_EXPIRY_DATE: !Ref MigrationExpiryDate
+      Code:
+        ZipFile: !Sub |
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+          import boto3
+
+          ssm = boto3.client("ssm")
+          lambda_client = boto3.client("lambda")
+
+          def get_secret(name):
+              response = ssm.get_parameter(Name=name, WithDecryption=True)
+              return response["Parameter"]["Value"]
+
+          def send_telegram(text):
+              token = get_secret(os.environ["TELEGRAM_BOT_TOKEN_PARAM"])
+              chat_id = get_secret(os.environ["TELEGRAM_ALLOWED_CHAT_ID_PARAM"])
+              data = urllib.parse.urlencode({
+                  "chat_id": chat_id,
+                  "text": text[:4000],
+                  "disable_web_page_preview": "true",
+              }).encode()
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=data,
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  response.read()
+
+          def pause_agent():
+              function_name = os.environ["TARGET_FUNCTION_NAME"]
+              desired = 0
+              current = lambda_client.get_function_concurrency(FunctionName=function_name).get("ReservedConcurrentExecutions")
+              if current == desired:
+                  return False
+              lambda_client.put_function_concurrency(FunctionName=function_name, ReservedConcurrentExecutions=desired)
+              return True
+
+          def restore_agent():
+              function_name = os.environ["TARGET_FUNCTION_NAME"]
+              desired = int(os.environ["TARGET_FUNCTION_CONCURRENCY"])
+              current = lambda_client.get_function_concurrency(FunctionName=function_name).get("ReservedConcurrentExecutions")
+              if desired <= 0:
+                  if current is None:
+                      return False
+                  lambda_client.delete_function_concurrency(FunctionName=function_name)
+                  return True
+              if current == desired:
+                  return False
+              lambda_client.put_function_concurrency(FunctionName=function_name, ReservedConcurrentExecutions=desired)
+              return True
+
+          def handle_alarm(message):
+              threshold = float(message.get("Trigger", {}).get("Threshold", 0))
+              alarm_name = message.get("AlarmName", "unknown-alarm")
+              state = message.get("NewStateValue", "UNKNOWN")
+              if state != "ALARM":
+                  return
+              charge = message.get("NewStateReason", "CloudWatch billing alarm triggered.")
+              send_telegram("AWS cost alert: "
+                            + f"{alarm_name} triggered at $"
+                            + f"{threshold:.0f}.\\n\\n{charge}")
+              pause_threshold = float(os.environ["PAUSE_THRESHOLD_USD"])
+              if threshold >= pause_threshold and pause_agent():
+                  send_telegram(
+                      "Friday agent services paused due to the $"
+                      + f"{pause_threshold:.0f} monthly limit. "
+                      "VPN and Iris remain running. Review the CloudWatch dashboard and AWS billing console before resuming."
+                  )
+
+          def handle_budget(message):
+              text = message if isinstance(message, str) else json.dumps(message)
+              send_telegram(f"AWS budget alert:\\n\\n{text[:3500]}")
+
+          def handler(event, context):
+              if event.get("action") == "migration_reminder":
+                  anchor = os.environ["MIGRATION_ANCHOR_DATE"]
+                  reminder = os.environ["MIGRATION_REMINDER_DATE"]
+                  expiry = os.environ["MIGRATION_EXPIRY_DATE"]
+                  send_telegram(
+                      "AWS migration reminder:\\n\\n"
+                      + f"Current account anchor date: {anchor}\\n"
+                      + f"Start migration prep now: {reminder}\\n"
+                      + f"Current 6-month window ends: {expiry}\\n\\n"
+                      + "Run the migration checklist, verify backups, and prepare the next AWS account."
+                  )
+                  return {"status": "migration-reminder"}
+
+              if event.get("source") == "aws.events":
+                  if restore_agent():
+                      send_telegram("Friday agent monthly concurrency guardrail reset for the new billing month.")
+                  return {"status": "reset"}
+
+              for record in event.get("Records", []):
+                  if record.get("EventSource") == "aws:sns":
+                      payload = record["Sns"]["Message"]
+                      try:
+                          message = json.loads(payload)
+                      except json.JSONDecodeError:
+                          message = payload
+                      if isinstance(message, dict) and "AlarmName" in message:
+                          handle_alarm(message)
+                      else:
+                          handle_budget(message)
+              return {"status": "ok"}
+
+  CostNotifierSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateRuntimeWithImage
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref CostAlertTopic
+      Endpoint: !GetAtt CostNotifierFunction.Arn
+
+  CostNotifierInvokeFromSns:
+    Type: AWS::Lambda::Permission
+    Condition: CreateRuntimeWithImage
+    Properties:
+      FunctionName: !Ref CostNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CostAlertTopic
+
+  AgentMonthlyResetRule:
+    Type: AWS::Events::Rule
+    Condition: CreateRuntimeWithImage
+    Properties:
+      Name: !Sub '${AgentName}-monthly-reset'
+      ScheduleExpression: cron(10 0 1 * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostNotifierFunction.Arn
+          Id: monthly-reset
+
+  AgentMigrationReminderRule:
+    Type: AWS::Events::Rule
+    Condition: CreateRuntimeWithImage
+    Properties:
+      Name: !Sub '${AgentName}-migration-reminder'
+      ScheduleExpression: !Ref MigrationReminderSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostNotifierFunction.Arn
+          Id: migration-reminder
+          Input: !Sub |
+            {
+              "action": "migration_reminder",
+              "anchor_date": "${MigrationAnchorDate}",
+              "reminder_date": "${MigrationReminderDate}",
+              "expiry_date": "${MigrationExpiryDate}"
+            }
+
+  CostNotifierInvokeFromEvents:
+    Type: AWS::Lambda::Permission
+    Condition: CreateRuntimeWithImage
+    Properties:
+      FunctionName: !Ref CostNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AgentMonthlyResetRule.Arn
+
+  CostNotifierInvokeFromMigrationReminder:
+    Type: AWS::Lambda::Permission
+    Condition: CreateRuntimeWithImage
+    Properties:
+      FunctionName: !Ref CostNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AgentMigrationReminderRule.Arn
+
+  BillingAlarm5:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateRuntimeWithImage
+    Properties:
+      AlarmName: !Sub '${AgentName}-billing-5'
+      AlarmDescription: Account estimated charges reached $5
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostAlertTopic
+
+  BillingAlarm10:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateRuntimeWithImage
+    Properties:
+      AlarmName: !Sub '${AgentName}-billing-10'
+      AlarmDescription: Account estimated charges reached $10
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostAlertTopic
+
+  BillingAlarm15:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateRuntimeWithImage
+    Properties:
+      AlarmName: !Sub '${AgentName}-billing-15'
+      AlarmDescription: Account estimated charges reached $15
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: 15
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostAlertTopic
+
+  BillingAlarm20:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateRuntimeWithImage
+    Properties:
+      AlarmName: !Sub '${AgentName}-billing-20'
+      AlarmDescription: Account estimated charges reached $20
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostAlertTopic
+
+  ProjectBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AgentName}-project-budget'
+        BudgetLimit:
+          Amount: !Ref AwsBudgetLimitUsd
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+
+  ProjectDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateRuntimeWithImage
+    Properties:
+      DashboardName: !Sub '${AgentName}-operations'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 3,
+              "properties": {
+                "markdown": "# Friday AWS Operations\nEstimated account charges, shared host health, and Friday agent health in one place.\nBilling widgets in `us-east-1` are the authoritative cost view. `NetworkOut` is only a proxy for potential VPN egress."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 3,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Estimated AWS Charges",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Maximum",
+                "metrics": [
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD" ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 3,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Shared Host Cost Breakdown",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Maximum",
+                "metrics": [
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonEC2" ],
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonVPC" ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 3,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Agent Cost Breakdown",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Maximum",
+                "metrics": [
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AWSLambda" ],
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonCloudWatch" ],
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonDynamoDB" ],
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonSQS" ],
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonSNS" ],
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD", "ServiceName", "AmazonEC2ContainerRegistry" ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 9,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Friday Agent Lambda",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${AgentName}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Throttles", ".", "." ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 9,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Friday Agent Duration / Concurrency",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${AgentName}", { "stat": "Average", "yAxis": "left" } ],
+                  [ ".", "ConcurrentExecutions", ".", ".", { "stat": "Maximum", "yAxis": "right" } ]
+                ]
+              }
+            },
+            {
+              "type": "text",
+              "x": 16,
+              "y": 9,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "markdown": "## Cost Guardrails\n- Billing alarms at `$5`, `$10`, `$15`, `$20`\n- Telegram notifications via SNS + notifier Lambda\n- At `$20`, the Friday agent Lambda is paused\n- VPN and Iris stay running"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 15,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Agent Queue",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${AgentName}-jobs" ],
+                  [ ".", "ApproximateAgeOfOldestMessage", ".", ".", { "stat": "Maximum", "yAxis": "right" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 15,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Agent DynamoDB",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${AgentName}-state" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ReadThrottleEvents", ".", "." ],
+                  [ ".", "WriteThrottleEvents", ".", "." ]
+                ]
+              }
+            },
+            {
+              "type": "text",
+              "x": 16,
+              "y": 15,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "markdown": "## Cost Reading Notes\n- `AmazonEC2` is the EC2 host itself.\n- `AmazonVPC` captures the public IPv4 charge.\n- `NetworkOut` helps spot VPN-heavy months, but the first 100 GB/month of internet egress is free.\n- Service billing lines only appear after AWS publishes charge data for that service."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 21,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Shared Host CPU / Status",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "InstanceId", "${SharedHostInstanceId}" ],
+                  [ ".", "StatusCheckFailed", ".", ".", { "stat": "Maximum", "yAxis": "right" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 21,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Shared Host Network",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "AWS/EC2", "NetworkIn", "InstanceId", "${SharedHostInstanceId}" ],
+                  [ ".", "NetworkOut", ".", "." ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  EcrRepositoryUri:
+    Value: !GetAtt AgentRepository.RepositoryUri
+  FunctionUrl:
+    Condition: CreateRuntimeWithImage
+    Value: !GetAtt AgentFunctionUrl.FunctionUrl
+  TelegramWebhookUrl:
+    Condition: CreateRuntimeWithImage
+    Value: !Sub '${AgentFunctionUrl.FunctionUrl}telegram'
+  SiriUrl:
+    Condition: CreateRuntimeWithImage
+    Value: !Sub '${AgentFunctionUrl.FunctionUrl}siri'
+  QueueUrl:
+    Condition: CreateRuntimeWithImage
+    Value: !Ref AgentQueue
+  StateTableName:
+    Condition: CreateRuntimeWithImage
+    Value: !Ref AgentTable
+  ArtifactsBucketName:
+    Condition: CreateRuntimeWithImage
+    Value: !Ref AgentArtifactsBucket
+  DashboardName:
+    Condition: CreateRuntimeWithImage
+    Value: !Ref ProjectDashboard
+  CostAlertTopicArn:
+    Condition: CreateRuntimeWithImage
+    Value: !Ref CostAlertTopic

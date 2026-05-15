@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from functools import cached_property
+
+
+@dataclass(frozen=True)
+class Settings:
+    state_table: str = os.environ.get("STATE_TABLE", "")
+    job_queue_url: str = os.environ.get("JOB_QUEUE_URL", "")
+    artifacts_bucket: str = os.environ.get("ARTIFACTS_BUCKET", "")
+    aws_region: str = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    agent_model: str = os.environ.get("AGENT_MODEL", "deepseek:deepseek-chat")
+    reasoner_model: str = os.environ.get("REASONER_MODEL", "deepseek:deepseek-reasoner")
+    daily_budget_usd: float = float(os.environ.get("DAILY_BUDGET_USD", "0.40"))
+    monthly_budget_usd: float = float(os.environ.get("MONTHLY_BUDGET_USD", "12.00"))
+    session_ttl_seconds: int = int(os.environ.get("SESSION_TTL_SECONDS", "600"))
+    conversation_ttl_seconds: int = int(os.environ.get("CONVERSATION_TTL_SECONDS", str(48 * 60 * 60)))
+    spend_ttl_days: int = int(os.environ.get("SPEND_TTL_DAYS", "45"))
+    completed_job_ttl_days: int = int(os.environ.get("COMPLETED_JOB_TTL_DAYS", "7"))
+    interrupted_job_ttl_days: int = int(os.environ.get("INTERRUPTED_JOB_TTL_DAYS", "21"))
+    siri_short_timeout_seconds: float = float(os.environ.get("SIRI_SHORT_TIMEOUT_SECONDS", "12"))
+    light_task_timeout_seconds: float = float(os.environ.get("LIGHT_TASK_TIMEOUT_SECONDS", "720"))
+    telegram_timeout_seconds: float = float(os.environ.get("TELEGRAM_HTTP_TIMEOUT_SECONDS", "10"))
+    max_browser_steps: int = int(os.environ.get("MAX_BROWSER_STEPS", "12"))
+    max_browser_pages: int = int(os.environ.get("MAX_BROWSER_PAGES", "3"))
+    heavy_task_wall_clock_seconds: int = int(os.environ.get("HEAVY_TASK_WALL_CLOCK_SECONDS", "1800"))
+    workspace_output_limit_bytes: int = int(os.environ.get("WORKSPACE_OUTPUT_LIMIT_BYTES", str(25 * 1024 * 1024)))
+    artifact_url_ttl_seconds: int = int(os.environ.get("ARTIFACT_URL_TTL_SECONDS", "3600"))
+    max_attachment_bytes: int = int(os.environ.get("MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
+    deepseek_input_cache_miss_per_1m: float = float(os.environ.get("DEEPSEEK_INPUT_CACHE_MISS_PER_1M", "0.55"))
+    deepseek_input_cache_hit_per_1m: float = float(os.environ.get("DEEPSEEK_INPUT_CACHE_HIT_PER_1M", "0.14"))
+    deepseek_output_per_1m: float = float(os.environ.get("DEEPSEEK_OUTPUT_PER_1M", "2.19"))
+    telegram_bot_token_param: str = os.environ.get("TELEGRAM_BOT_TOKEN_PARAM", "")
+    telegram_allowed_chat_id_param: str = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID_PARAM", "")
+    telegram_webhook_secret_param: str = os.environ.get("TELEGRAM_WEBHOOK_SECRET_PARAM", "")
+    siri_api_key_param: str = os.environ.get("SIRI_API_KEY_PARAM", "")
+    deepseek_api_key_param: str = os.environ.get("DEEPSEEK_API_KEY_PARAM", "")
+    logfire_token_param: str = os.environ.get("LOGFIRE_TOKEN_PARAM", "")
+    worker_api_key_param: str = os.environ.get("WORKER_API_KEY_PARAM", "")
+    logfire_enabled: bool = os.environ.get("LOGFIRE_ENABLED", "false").lower() == "true"
+    full_logfire_logging: bool = os.environ.get("LOGFIRE_FULL_CONTENT", "false").lower() == "true"
+    hands_worker_mode: str = os.environ.get("HANDS_WORKER_MODE", "shared_host")
+    hands_worker_instance_id: str = os.environ.get("HANDS_WORKER_INSTANCE_ID", "")
+
+    @cached_property
+    def ssm(self):
+        import boto3
+
+        return boto3.client("ssm", region_name=self.aws_region)
+
+    @cached_property
+    def s3(self):
+        import boto3
+
+        return boto3.client("s3", region_name=self.aws_region)
+
+    @cached_property
+    def ec2(self):
+        import boto3
+
+        return boto3.client("ec2", region_name=self.aws_region)
+
+    def secret(self, parameter_name: str) -> str:
+        if not parameter_name:
+            return ""
+        response = self.ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+        return response["Parameter"]["Value"]
+
+
+settings = Settings()

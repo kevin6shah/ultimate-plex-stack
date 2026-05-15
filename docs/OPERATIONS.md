@@ -193,6 +193,7 @@ The AWS EC2 host is shared infrastructure:
 
 - Friday WireGuard VPN
 - Iris backend from `/Users/kevinshah/Documents/mta-led-sign`
+- Friday personal agent account-rotation workflow
 
 Do not treat AWS rotation as a Friday-only VPN task.
 
@@ -209,6 +210,26 @@ Safe backup command:
 ./scripts/prepare-migration-day.sh
 ```
 
+Agent deployment and budget/cost visibility:
+
+```bash
+AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/bootstrap-agent-ssm.sh
+AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/check-agent-migration-readiness.sh
+AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/deploy-agent.sh
+AWS_PROFILE=iris AWS_REGION=us-east-1 HOST=<shared-host-ip> EC2_SSH_KEY=/path/to/key.pem ./scripts/deploy-hands-host.sh
+```
+
+Deterministic AWS cost model:
+
+- `docs/AWS_COST_MODEL.md`
+- update it whenever the AWS architecture changes
+
+AWS migration changelog:
+
+- `docs/AWS_MIGRATION_HISTORY.md`
+
+Before expecting CloudWatch billing widgets or `$5/$10/$15/$20` cost alarms to work, enable `Receive CloudWatch Billing Alerts` in the payer account's AWS Billing Preferences.
+
 Future migration entrypoint:
 
 ```bash
@@ -222,6 +243,67 @@ IAM bootstrap for future accounts:
 
 - `ops/aws/iam/README.md`
 - `ops/aws/iam/codex-migration-policy.json`
+
+## Friday Personal Agent
+
+Primary doc:
+
+- `docs/FRIDAY_AGENT.md`
+
+The control plane is serverless AWS infrastructure, but heavy-task execution now reuses the shared EC2 host through an isolated rootless Docker worker. It uses:
+
+- Lambda container image from `agent/`
+- ECR repository from `ops/aws/friday-agent.yaml`
+- Lambda Function URL for `/telegram`, `/siri`, and `/health`
+- SQS for async light Telegram work
+- DynamoDB for transient sessions, 48-hour context, durable `#memory`, heavy jobs, checkpoints, approvals, and spend
+- The 48-hour context layer now stores raw thread turns and a rolling summary, with retrieval controlled by persisted config rather than hard-coded assumptions.
+- S3 for heavy-task inputs and outputs
+- SSM SecureString parameters for tokens and the worker key
+- Rootless Docker on the shared host for the Friday hands runtime
+
+Required target-account preflight before deployment or migration:
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=us-east-1 ./scripts/check-agent-migration-readiness.sh
+```
+
+Deploy/update:
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=us-east-1 ./scripts/deploy-agent.sh
+```
+
+Install/update the shared-host hands runtime:
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=us-east-1 HOST=<shared-host-ip> EC2_SSH_KEY=/path/to/key.pem ./scripts/deploy-hands-host.sh
+```
+
+Deploy/update and set the Telegram webhook:
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=us-east-1 SET_TELEGRAM_WEBHOOK=1 ./scripts/deploy-agent.sh
+```
+
+Backup metadata before live agent infrastructure changes:
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=us-east-1 ./scripts/backup-agent-state.sh
+```
+
+Local validation:
+
+```bash
+python3 -m py_compile agent/app/*.py
+cd agent && python3 -m pytest -q
+```
+
+Operational notes:
+
+- Siri long tasks must notify through Telegram only; do not add delayed Siri speech for queued work.
+- `--skip-agent` on `scripts/migrate-aws-account.sh` is only for emergency host-only rotations.
+- Logfire is disabled by default; full content logging is opt-in only.
 
 ## Autonomous Cleanup Workflow
 

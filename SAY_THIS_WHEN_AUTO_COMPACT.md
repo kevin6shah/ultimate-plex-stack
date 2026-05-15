@@ -50,3 +50,10 @@ Current live baseline:
 - The current AWS migration model is no-domain by design; use `docs/AWS_BLUE_GREEN_RUNBOOK.md`, `./scripts/check-aws-migration-readiness.sh`, and `ops/aws/iam/codex-migration-policy.json` when preparing a new free AWS account
 - `./scripts/prepare-migration-day.sh` is the final green-light gate before the user says `migrate`
 - `./scripts/aws-infra-change.sh` is the default wrapper for ad hoc AWS infra changes because it forces pre/post backups automatically
+- `docs/AWS_MIGRATION_HISTORY.md` is the durable migration changelog; the first recorded migration to the current `iris` AWS account happened on `2026-05-10`
+- `docs/AWS_COST_MODEL.md` is the deterministic AWS pricing source of truth and must be updated whenever the AWS architecture changes
+- The Friday personal agent lives under `agent/`; read `docs/FRIDAY_AGENT.md` before touching it
+- Agent deployment is serverless through `ops/aws/friday-agent.yaml` and `./scripts/deploy-agent.sh`
+- Agent migration is included by default in `./scripts/migrate-aws-account.sh` after the shared host is restored; use `--skip-agent` only for emergency host-only rotations
+- Agent secrets are SSM SecureString parameters under `/friday/agent/*`; `./scripts/check-agent-migration-readiness.sh` validates a target account before deployment
+- Siri long tasks must return immediately and notify through Telegram only; do not add delayed Siri speech for queued work

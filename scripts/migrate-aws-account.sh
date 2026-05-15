@@ -21,6 +21,7 @@ SUBNET_ID_VALUE="${SUBNET_ID:-}"
 IMAGE_ID_VALUE="${IMAGE_ID:-}"
 UBUNTU_AMI_SSM_PARAM="${UBUNTU_AMI_SSM_PARAM:-/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}"
 MTA_LED_SIGN_ROOT="${MTA_LED_SIGN_ROOT:-$HOME/Documents/mta-led-sign}"
+DEPLOY_AGENT="${DEPLOY_AGENT:-1}"
 RUN_LOCAL_UPDATES=1
 CREATE_BACKUP_FIRST=1
 RUN_SMOKE=1
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-smoke)
       RUN_SMOKE=0
+      shift
+      ;;
+    --skip-agent)
+      DEPLOY_AGENT=0
       shift
       ;;
     --offline-restore)
@@ -70,6 +75,10 @@ for cmd in aws ssh scp curl rg perl tar; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "required command not found: $cmd" >&2; exit 1; }
 done
 
+if [[ "$DEPLOY_AGENT" -eq 1 ]]; then
+  command -v docker >/dev/null 2>&1 || { echo "required command not found for agent deployment: docker" >&2; exit 1; }
+fi
+
 [[ -n "$AWS_PROFILE_NAME" ]] || { echo "AWS_PROFILE is required" >&2; exit 1; }
 [[ -n "$EC2_SSH_KEY_VALUE" ]] || { echo "EC2_SSH_KEY is required" >&2; exit 1; }
 [[ -n "$KEY_NAME_VALUE" ]] || { echo "KEY_NAME is required" >&2; exit 1; }
@@ -86,6 +95,10 @@ KEY_NAME="$KEY_NAME_VALUE" \
 EC2_SSH_KEY="$EC2_SSH_KEY_VALUE" \
 BACKUP_DIR="$BACKUP_DIR_VALUE" \
 ./scripts/prepare-migration-day.sh "${prepare_args[@]}"
+
+if [[ "$DEPLOY_AGENT" -eq 1 ]]; then
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" ./scripts/check-agent-migration-readiness.sh
+fi
 
 if [[ "$CREATE_BACKUP_FIRST" -eq 1 ]]; then
   if ./scripts/backup-aws-host.sh; then
@@ -219,6 +232,11 @@ fi
 
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
   NEW_PUBLIC_IP="$new_public_ip" EC2_SSH_KEY="$EC2_SSH_KEY_VALUE" ./scripts/post-migration-smoke.sh "$new_public_ip"
+fi
+
+if [[ "$DEPLOY_AGENT" -eq 1 ]]; then
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" ./scripts/deploy-agent.sh
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" HOST="$new_public_ip" EC2_SSH_KEY="$EC2_SSH_KEY_VALUE" ./scripts/deploy-hands-host.sh
 fi
 
 echo "Migration host ready."

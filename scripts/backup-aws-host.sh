@@ -8,13 +8,23 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 WG_FILE="${ROOT_DIR}/config/wireguard/wg_confs/wg0.conf"
-AWS_PROFILE_NAME="${AWS_PROFILE:-friday-ec2}"
+DISCOVERED_ENV_FILE="${ROOT_DIR}/backup/aws/latest/metadata/discovered.env"
+read_discovered_env() {
+  local key="$1"
+  if [[ -f "$DISCOVERED_ENV_FILE" ]]; then
+    sed -n "s/^${key}=//p" "$DISCOVERED_ENV_FILE" | head -n 1
+  fi
+}
+
+AWS_PROFILE_NAME="${AWS_PROFILE:-$(read_discovered_env AWS_PROFILE)}"
 AWS_REGION_NAME="${AWS_REGION:-us-east-1}"
 EC2_HOST_VALUE="${EC2_HOST:-}"
 EC2_USER_VALUE="${EC2_USER:-ubuntu}"
-EC2_SSH_KEY_VALUE="${EC2_SSH_KEY:-$ROOT_DIR/Friday-key-pair-11102025.pem}"
+EC2_SSH_KEY_VALUE="${EC2_SSH_KEY:-$(read_discovered_env EC2_SSH_KEY)}"
 EC2_INSTANCE_ID_VALUE="${EC2_INSTANCE_ID:-}"
 EC2_SECURITY_GROUP_ID_VALUE="${EC2_SECURITY_GROUP_ID:-}"
+
+[[ -n "$AWS_PROFILE_NAME" ]] || { echo "AWS_PROFILE is required; set it explicitly or ensure $DISCOVERED_ENV_FILE exists" >&2; exit 1; }
 
 if [[ -z "$EC2_HOST_VALUE" && -f "$WG_FILE" ]]; then
   EC2_HOST_VALUE="$(sed -n 's/^Endpoint = \([^:]*\):51820$/\1/p' "$WG_FILE" | head -n 1)"
@@ -89,11 +99,13 @@ remote_tar="/tmp/friday-aws-host-state-${timestamp}.tgz"
 ssh_opts=(-i "$EC2_SSH_KEY_VALUE" -o StrictHostKeyChecking=accept-new)
 
 ssh "${ssh_opts[@]}" "${EC2_USER_VALUE}@${EC2_HOST_VALUE}" \
-  "sudo tar -C / --exclude='opt/iris-backend/node_modules' -czf '$remote_tar' \
+  "sudo tar -C / --ignore-failed-read --exclude='opt/iris-backend/node_modules' -czf '$remote_tar' \
     etc/wireguard/wg0.conf \
     etc/nginx/sites-available/iris-backend \
     etc/systemd/system/iris-backend.service \
-    opt/iris-backend"
+    etc/systemd/system/friday-hands-broker.service \
+    opt/iris-backend \
+    opt/friday-hands"
 
 scp "${ssh_opts[@]}" "${EC2_USER_VALUE}@${EC2_HOST_VALUE}:$remote_tar" "$remote_dir/aws-host-state.tgz"
 

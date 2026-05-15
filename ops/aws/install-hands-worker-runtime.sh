@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+RUNTIME_TGZ="${1:-}"
+API_BASE_URL="${2:-}"
+WORKER_API_KEY="${3:-}"
+DEEPSEEK_API_KEY="${4:-}"
+WORKER_IMAGE_ARCHIVE="${5:-}"
+AGENT_MODEL_VALUE="${6:-deepseek:deepseek-chat}"
+REASONER_MODEL_VALUE="${7:-deepseek:deepseek-reasoner}"
+WORK_ROOT="/srv/friday-hands"
+INSTALL_ROOT="/opt/friday-hands"
+SWAPFILE_MB="${FRIDAY_SWAPFILE_MB:-2048}"
+
+[[ -f "$RUNTIME_TGZ" ]] || { echo "runtime archive not found: $RUNTIME_TGZ" >&2; exit 1; }
+[[ -n "$API_BASE_URL" ]] || { echo "api base url is required" >&2; exit 1; }
+[[ -n "$WORKER_API_KEY" ]] || { echo "worker api key is required" >&2; exit 1; }
+[[ -n "$DEEPSEEK_API_KEY" ]] || { echo "deepseek api key is required" >&2; exit 1; }
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl jq docker.io python3
+
+systemctl enable --now docker
+usermod -aG docker ubuntu || true
+
+install -d -m 755 \
+  "$WORK_ROOT/workspaces" \
+  "$WORK_ROOT/cache" \
+  "$WORK_ROOT/artifacts-staging" \
+  "$INSTALL_ROOT"
+
+systemctl stop friday-hands-broker.service >/dev/null 2>&1 || true
+
+rm -rf "$INSTALL_ROOT"/*
+tar -xzf "$RUNTIME_TGZ" -C "$INSTALL_ROOT"
+
+if [[ "$SWAPFILE_MB" -gt 0 ]] && ! swapon --show | grep -q .; then
+  available_kb="$(df --output=avail / | tail -1 | tr -d ' ')"
+  required_kb=$((SWAPFILE_MB * 1024 + 1048576))
+  if [[ "${available_kb:-0}" -gt "$required_kb" ]]; then
+    fallocate -l "${SWAPFILE_MB}M" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$SWAPFILE_MB"
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  fi
+fi
+
+cat >/etc/friday-hands.env <<ENVEOF
+FRIDAY_API_BASE_URL=${API_BASE_URL}
+FRIDAY_WORKER_KEY=${WORKER_API_KEY}
+DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+AGENT_MODEL=${AGENT_MODEL_VALUE}
+REASONER_MODEL=${REASONER_MODEL_VALUE}
+FRIDAY_WORKSPACE_ROOT=${WORK_ROOT}/workspaces
+FRIDAY_POLL_INTERVAL_SECONDS=10
+FRIDAY_CONTAINER_ENGINE=docker
+FRIDAY_WORKER_IMAGE=friday-hands-worker:latest
+FRIDAY_WORKER_TIMEOUT_SECONDS=5400
+FRIDAY_WORKER_CPUS=1.50
+FRIDAY_WORKER_MEMORY=1536m
+FRIDAY_WORKER_PIDS_LIMIT=1024
+FRIDAY_STOP_ON_IDLE=1
+FRIDAY_IDLE_STOP_SECONDS=600
+ENVEOF
+chmod 600 /etc/friday-hands.env
+
+docker system prune -af >/dev/null 2>&1 || true
+cd "$INSTALL_ROOT"
+if [[ -n "$WORKER_IMAGE_ARCHIVE" && -f "$WORKER_IMAGE_ARCHIVE" ]]; then
+  case "$WORKER_IMAGE_ARCHIVE" in
+    *.gz)
+      gunzip -c "$WORKER_IMAGE_ARCHIVE" | docker load
+      ;;
+    *)
+      docker load -i "$WORKER_IMAGE_ARCHIVE"
+      ;;
+  esac
+else
+  docker build --platform linux/amd64 -t friday-hands-worker:latest -f hands/worker/Dockerfile .
+fi
+
+cat >/etc/systemd/system/friday-hands-broker.service <<SERVICEEOF
+[Unit]
+Description=Friday hands broker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/friday-hands.env
+ExecStart=/usr/bin/python3 ${INSTALL_ROOT}/hands/host/broker.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+systemctl daemon-reload
+systemctl enable --now friday-hands-broker.service
+
+echo "Friday dedicated hands worker runtime installed."

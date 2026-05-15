@@ -54,6 +54,8 @@ You also need:
 
 The policy now also includes `ec2:CreateKeyPair` and `ec2:DeleteKeyPair`, so Codex can create the migration key pair directly if you prefer not to do it manually in the console.
 
+It also includes the serverless permissions needed for the Friday personal agent stack: ECR, Lambda, DynamoDB, SQS, CloudWatch Logs, Budgets, IAM role creation/pass-through for Lambda, and `/friday/agent/*` SSM parameters.
+
 Typical migration inputs:
 
 ```bash
@@ -63,3 +65,12 @@ KEY_NAME=<new-keypair-name> \
 EC2_SSH_KEY=/path/to/new-key.pem \
 ./scripts/migrate-aws-account.sh --yes
 ```
+
+Before running a migration that includes the agent, create the required SSM SecureString parameters in the target account and validate them:
+
+```bash
+AWS_PROFILE=<new-profile> AWS_REGION=us-east-1 ./scripts/bootstrap-agent-ssm.sh
+AWS_PROFILE=<new-profile> AWS_REGION=us-east-1 ./scripts/check-agent-migration-readiness.sh
+```
+
+For the agent cost dashboard and billing alarms to work, the payer account must also have `Receive CloudWatch Billing Alerts` enabled in AWS Billing Preferences.

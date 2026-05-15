@@ -24,6 +24,9 @@ ln -sfn /etc/nginx/sites-available/iris-backend /etc/nginx/sites-enabled/iris-ba
 rm -f /etc/nginx/sites-enabled/default
 
 chown -R "${REMOTE_USER}:${REMOTE_USER}" /opt/iris-backend
+if [[ -d /opt/friday-hands ]]; then
+  chown -R "${REMOTE_USER}:${REMOTE_USER}" /opt/friday-hands || true
+fi
 
 cd /opt/iris-backend
 npm install --omit=dev
@@ -34,5 +37,9 @@ systemctl enable wg-quick@wg0 iris-backend nginx
 systemctl restart wg-quick@wg0
 systemctl restart iris-backend
 systemctl restart nginx
+if [[ -f /etc/systemd/system/friday-hands-broker.service ]]; then
+  systemctl enable friday-hands-broker || true
+  systemctl restart friday-hands-broker || true
+fi
 
 echo "Restore complete."

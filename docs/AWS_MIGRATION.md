@@ -10,28 +10,48 @@ That means a future AWS account rotation must preserve both:
 
 - Friday VPN continuity
 - Iris backend state and runtime
+- Friday personal agent infrastructure
 
 This document is the durable source of truth for that shared-host migration.
 
+Migration changelog:
+
+- `docs/AWS_MIGRATION_HISTORY.md`
+
 ## Current Live Inventory
 
-Verified on `2026-04-10` from local AWS CLI and SSH:
+Verified on `2026-05-13` from local WireGuard config and `backup/aws/latest` metadata:
 
-- AWS CLI profile: `friday-ec2`
-- AWS account ID: `767582655895`
-- IAM user used locally: `arn:aws:iam::767582655895:user/codex-ec2-deploy`
+- AWS CLI profile: `iris`
+- AWS account ID: `301142908919`
+- IAM user used locally: `arn:aws:iam::301142908919:user/codex-migration`
 - Region: `us-east-1`
-- EC2 instance ID: `i-0c824a5a2b18d31d5`
-- Public IP: `54.90.132.5`
-- Public DNS: `ec2-54-90-132-5.compute-1.amazonaws.com`
-- Private IP: `172.31.20.30`
-- VPC: `vpc-08b8e549449b2d539`
-- Subnet: `subnet-0ebe079417aec95cb`
-- Security group: `sg-09479da35bed15790`
-- Key pair name: `Friday-key-pair-11102025`
+- EC2 instance ID: `i-0263b221709dce545`
+- Public IP: `13.216.214.108`
+- Public DNS: `ec2-13-216-214-108.compute-1.amazonaws.com`
+- Private IP: `172.31.38.96`
+- VPC: `vpc-0250e8d95b4d6e169`
+- Subnet: `subnet-04105c013717bf298`
+- Security group: `sg-0541241698170a453`
+- Key pair name: `iris-migration-20260510`
 - Instance type: `t3.micro`
-- Launch time: `2025-11-10T07:04:42Z`
+- Launch time: `2026-05-10T23:09:25Z`
 - OS: Ubuntu `24.04`
+
+## Migration History
+
+Recorded migration count: `1`
+
+First recorded migration:
+
+- migration date: `2026-05-10`
+- destination AWS account: `301142908919`
+- destination AWS profile: `iris`
+- migration reminder date: `2026-10-26`
+- current 6-month window end: `2026-11-10`
+- durable log: `docs/AWS_MIGRATION_HISTORY.md`
+
+For the current account, migration prep should start on `2026-10-26`, which is `15` days before the current six-month expiry target of `2026-11-10`.
 
 Live services on the host:
 
@@ -97,11 +117,15 @@ The backup directory is already ignored by Git.
 Tracked artifacts:
 
 - [friday-shared-host.yaml](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/friday-shared-host.yaml)
+- [friday-agent.yaml](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/friday-agent.yaml)
 - [bootstrap-host.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/bootstrap-host.sh)
 - [restore-host-from-backup.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/restore-host-from-backup.sh)
 - [ops/aws/iam/README.md](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/iam/README.md)
 - [codex-migration-policy.json](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/iam/codex-migration-policy.json)
 - [backup-aws-host.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/backup-aws-host.sh)
+- [backup-agent-state.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/backup-agent-state.sh)
+- [check-agent-migration-readiness.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/check-agent-migration-readiness.sh)
+- [deploy-agent.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/deploy-agent.sh)
 - [aws-infra-change.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/aws-infra-change.sh)
 - [check-aws-migration-readiness.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/check-aws-migration-readiness.sh)
 - [prepare-migration-day.sh](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/scripts/prepare-migration-day.sh)
@@ -126,6 +150,8 @@ Recommended validation:
 AWS_PROFILE=<new-profile> ./scripts/check-aws-migration-readiness.sh
 AWS_PROFILE=<new-profile> KEY_NAME=<new-keypair-name> EC2_SSH_KEY=/path/to/new-key.pem ./scripts/prepare-migration-day.sh
 ```
+
+If a raw `aws ...` command fails on this Mac, use `/usr/local/bin/aws ...` or run the repo scripts directly. The scripts already prepend `/usr/local/bin:/opt/homebrew/bin` to `PATH`.
 
 This is the minimum clean handoff so Codex can:
 
@@ -157,7 +183,31 @@ What that command is designed to do:
 7. restore the saved shared-host state onto the new instance
 8. update the local Friday WireGuard endpoint and VPN expected IP
 9. update local `mta-led-sign` source references from the old backend URL to the new one
-10. run the combined Friday + Iris smoke checks before returning success
+10. run the combined Friday + Iris smoke checks
+11. validate the target account for agent deployment
+12. rebuild/push the Friday agent Lambda image and deploy the serverless stack
+13. install the Friday hands runtime onto the shared host with the live Function URL and worker key
+14. print the new Telegram and Siri webhook URLs before returning success
+
+To migrate only the shared host in an emergency, pass `--skip-agent`.
+
+Agent secrets are expected as SSM SecureString standard parameters in the target account:
+
+- `/friday/agent/deepseek-api-key`
+- `/friday/agent/telegram-bot-token`
+- `/friday/agent/telegram-chat-id`
+- `/friday/agent/telegram-webhook-secret`
+- `/friday/agent/siri-api-key`
+- `/friday/agent/worker-api-key`
+
+`/friday/agent/logfire-token` is only required when Logfire is enabled.
+
+Agent runtime state is now split:
+
+- 48-hour conversation context is intentionally ephemeral
+- explicit `#memory` and heavy-task checkpoints are durable and should survive account rotation
+- `./scripts/backup-agent-state.sh` captures stack metadata, image digests, bucket/table metadata, and webhook URLs before account changes; it does not export plaintext secret values
+- `./scripts/deploy-hands-host.sh` must be rerun on the new shared host after the Lambda stack is live so the rootless Docker worker receives the current worker key and Function URL without relying on backed-up secret env files
 
 Current resilience improvements from the May 10, 2026 migration:
 
@@ -166,6 +216,7 @@ Current resilience improvements from the May 10, 2026 migration:
 - `migrate-aws-account.sh` now re-runs preflight internally, can continue from the latest saved backup if the old host dies before a fresh backup completes, and runs a combined post-cutover smoke test automatically.
 - `restore-host-from-backup.sh` now explicitly enables the `iris-backend` nginx site and removes the default site, which was the real restore gap found during the May 10 cutover.
 - `aws-infra-change.sh` now exists as the default wrapper for ad hoc AWS CLI changes so Codex-managed infra changes automatically capture pre-change and post-change shared-host backups.
+- `docs/AWS_COST_MODEL.md` is now the deterministic AWS cost source of truth and must be updated whenever migration changes the AWS topology.
 
 What it does not do yet:
 

@@ -28,6 +28,14 @@ Before implementation work:
 3. `docs/TROUBLESHOOTING.md`
 4. the relevant live config and logs
 
+For Friday personal agent work, also read:
+
+1. `docs/FRIDAY_AGENT.md`
+2. `docs/AWS_MIGRATION.md`
+3. `docs/AWS_MIGRATION_HISTORY.md`
+4. `docs/AWS_COST_MODEL.md`
+5. `ops/aws/iam/README.md`
+
 ## Change Loop
 
 1. Inspect
@@ -42,6 +50,8 @@ For AWS infrastructure work:
 1. Run `./scripts/backup-aws-host.sh` before the change.
 2. Prefer `./scripts/aws-infra-change.sh --reason "..." -- <command ...>` so pre/post backups happen automatically.
 3. If a script already performs the backups internally, note that explicitly in the journal.
+4. For Friday personal agent changes, run `./scripts/backup-agent-state.sh` before touching live agent infrastructure when the agent stack already exists.
+5. If the AWS topology or service mix changes, update `docs/AWS_COST_MODEL.md` in the same change.
 
 No step may be skipped without an explicit note in the journal.
 

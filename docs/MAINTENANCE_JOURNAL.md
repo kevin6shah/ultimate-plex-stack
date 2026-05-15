@@ -1,5 +1,174 @@
 # Maintenance Journal
 
+## 2026-05-15
+
+### Change: dedicated worker path proved with resumable heavy-task execution
+
+- Goal:
+  - Move P1 from “infrastructure deployed” to “dedicated hands path does real work.”
+- Change:
+  - Switched the live `friday-agent` stack to `dedicated_ec2` worker mode with a `t3a.small` on-demand EC2 worker.
+  - Fixed live config persistence so `PUT /config` can store float budget values in DynamoDB without crashing on raw Python `float` serialization.
+  - Confirmed live config now enforces:
+    - `daily_budget_usd = 0.4`
+    - `monthly_budget_usd = 12.0`
+  - Fixed the dedicated worker runtime by ensuring `boto3` is present in the worker image and by changing the worker deployment path to prefer a locally built image transfer over rebuilding Playwright on the small EC2 host.
+  - Hardened `hands/host/broker.py` so container launch failures can be reported back to the API instead of silently leaving jobs stuck forever.
+  - Added local filtering in `agent/app/workspace.py` so hidden runtime/browser-profile files are no longer treated as user-facing deliverables.
+- Result:
+  - The dedicated worker can now complete real long-running tasks and return real artifacts.
+  - A resumed heavy task completed successfully and produced:
+    - a browser screenshot
+    - a PDF report
+  - A controlled long-running workspace task also completed and returned its output files.
+  - The hands runtime is now materially closer to a real P1 proof of concept instead of only a deployed shell.
+- Remaining caveats:
+  - Direct operator IAM still lacks some debugging/control actions for Codex:
+    - `ec2:StartInstances`
+    - `ec2:StopInstances`
+    - `ec2:RebootInstances`
+    - `cloudformation:DescribeStackResources`
+    - `s3:GetObject`
+  - A fresh live validation after the newer Lambda deploy confirmed that heavy tasks now remain `running` after early checkpoints instead of being incorrectly flipped to `checkpointed`.
+  - Follow-up live validation on `2026-05-15` closed the substantive interruption/resume gap:
+    - stopping the live worker container now transitions the job to `interrupted`
+    - `resume that task` now preserves the original heavy-task query on the resumed job record
+    - the resumed run completed with carried-forward workspace state
+    - proof output from the completed resumed job:
+      - `progress/state.txt` contained both `FIRST_RUN` and `RESUMED_OK`
+      - `reports/resume-proof.txt` stated that the earlier file already existed before the resumed run continued
+  - Remaining observability caveat:
+    - Telegram interruption delivery was not independently observable from the current CloudWatch log shape, even though the job-state interruption/resume path is now proven live
+
+### Change: deterministic AWS cost model added and wired into operations docs
+
+- Goal:
+  - Make the AWS cost picture durable, deterministic, and easy to maintain as the Friday shared host, Iris backend, and Friday agent evolve.
+- Change:
+  - Added `docs/AWS_COST_MODEL.md` as the canonical AWS-only cost model.
+  - Added `docs/AWS_MIGRATION_HISTORY.md` as the durable changelog of AWS account migrations.
+  - Expanded the cost model to include DeepSeek as a separate external model-cost section with deterministic task-based estimates.
+  - Fixed the model to a deterministic `720-hour` month and live official AWS pricing inputs.
+  - Used the live stack inventory plus current ECR image storage to calculate the current raw monthly AWS cost.
+  - Recorded the user-verified current credit balance of `$120.00` and the first recorded AWS migration date of `2026-05-10`.
+  - Recorded the current migration-prep reminder date of `2026-10-26` and the current six-month expiry target of `2026-11-10`.
+  - Added future scenario tables for the shared-host POC, a dedicated on-demand `t3a.small` worker, and simple horizontal scaling examples.
+  - Added explicit notes covering the post-`2025-07-15` AWS six-month Free account plan so the model distinguishes between raw cost and current expected out-of-pocket spend.
+  - Linked the new cost model and migration changelog from `docs/OPERATIONS.md` and `docs/AWS_MIGRATION.md`.
+  - Added a one-time EventBridge migration reminder to the agent stack so Telegram will notify on `2026-10-26`.
+- Result:
+  - The repo now has a maintained cost source of truth that can later feed the dashboard work.
+  - The current raw AWS architecture is modeled at `$12.566/month`, while the expected out-of-pocket number remains `$0.000/month` with the current `$120.00` credit balance, assuming current charges stay credit-eligible.
+- Validation:
+  - Verified live stack outputs through AWS CLI for `friday-shared-host` and `friday-agent`.
+  - Verified live ECR image storage through AWS CLI and encoded the resulting `8.379806 GiB` in the model.
+
+### Change: long-term roadmap priorities recorded explicitly
+
+- Goal:
+  - Preserve the user’s multi-day priority stack so future sessions do not lose track of the intended sequencing.
+- Change:
+  - Added explicit P1/P2/P3 roadmap sections to `docs/HANDOFF.md`.
+  - Recorded that current focus remains P1: agent readiness, dedicated hands, runtime hardening, and E2E validation.
+  - Recorded that P2 is the dashboard and secure configuration/memory/token management surface.
+  - Recorded that P3 is the future repo/monorepo reorganization across Friday infrastructure, Iris backend, and possible future FBA harness work.
+  - Updated `docs/FRIDAY_AGENT.md` so the long-term execution direction reflects the dedicated on-demand worker path rather than treating the shared host as the permanent hands target.
+- Result:
+  - Future Codex sessions now have a durable roadmap and should not prematurely optimize for repo reorganization or dashboard work while P1 is still in flight.
+
+## 2026-05-14
+
+### Change: shared-host hands substrate implemented in repo
+
+- Goal:
+  - Turn the Friday agent from a Lambda-only coordinator into a control plane with a real heavy-task execution substrate while keeping the project inside the single-EC2 budget model.
+- Change:
+  - Expanded the agent state model in `agent/app/storage.py` to support 48-hour conversation context, durable `#memory`, heavy-job metadata, checkpoints, approvals, and spend.
+  - Reworked the agent API in `agent/app/main.py` to classify light vs heavy tasks, preserve 48-hour follow-up context, store `#memory`, expose job/memory/status endpoints, and add internal worker claim/heartbeat/checkpoint/complete/fail endpoints.
+  - Refactored `agent/app/agent_core.py` so Lambda light-mode stays coordination-only while heavy-mode can register browser and workspace tools.
+  - Added `agent/app/workspace.py` and expanded `agent/app/browser.py` so the heavy worker has isolated browser/session/file/shell tools.
+  - Added the hands runtime under `hands/` plus host/runtime install helpers:
+    - `hands/host/broker.py`
+    - `hands/worker/runner.py`
+    - `scripts/deploy-hands-host.sh`
+    - `ops/aws/install-hands-runtime.sh`
+  - Extended `ops/aws/friday-agent.yaml` with an artifacts S3 bucket, a worker API key parameter, and a DynamoDB GSI used for heavy-job claiming.
+  - Updated shared-host bootstrap/restore/backup/migration scripts so the hands runtime is part of the shared-host lifecycle instead of a second EC2 plan.
+- Result:
+  - The repo now supports a shared-host heavy-task substrate design with private 48-hour context, durable `#memory`, job checkpoints, and a rootless Docker worker path.
+  - Live deployment of the shared-host hands runtime was not performed in this session; the repo and migration paths were updated for it.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py hands/host/broker.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests` passed with `16 passed`.
+  - `bash -n` passed for the updated/new agent and host scripts.
+  - YAML parsing passed for `ops/aws/friday-agent.yaml` and `ops/aws/friday-shared-host.yaml`.
+
+### Change: Friday Siri/browser routing stabilized after live queue misclassification
+
+- Goal:
+  - Stop simple Siri knowledge questions from needlessly queueing and stop the browser worker from relying on fragile Google result scraping.
+- Change:
+  - Tightened `agent/app/routing.py` so only clearly live-web or automation-oriented prompts expose the browser tool or pre-queue as long-running work.
+  - Updated `agent/app/agent_core.py` so stable general questions do not even register `web_browser_task`, which keeps Siri answers synchronous when browser access is not actually needed.
+  - Replaced the original Google-search browser scaffold in `agent/app/browser.py` with a Playwright flow that prefers direct URLs, falls back to DuckDuckGo HTML search, and uses HTTP text extraction when a page blocks normal automation.
+  - Restored Lambda browser stability by using a simpler Playwright page creation path and the Lambda-friendly Chromium launch flags.
+  - Added CloudWatch-facing browser logs so future debugging shows attempted targets and fallback behavior.
+- Result:
+  - A live Siri request for `how does one get water in barcelona?` now returns synchronously instead of queueing.
+  - A live Siri request that explicitly needed current web content still queues as intended for Telegram follow-up.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests` passed with `12 passed`.
+  - Redeployed `friday-agent` on `iris` with live image `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260514-013002`.
+  - Live Siri checks confirmed synchronous behavior for the Barcelona question and queued behavior for an explicit current-homepage query.
+
+### Change: Friday agent live deployment completed on `iris`
+
+- Goal:
+  - Finish the first real AWS deployment of the Friday serverless agent and clear the runtime blockers after CloudFormation reached green.
+- Change:
+  - Deployed the live `friday-agent` stack in `us-east-1` with ECR, Lambda Function URL, SQS, DynamoDB, SNS, billing alarms, and the CloudWatch dashboard.
+  - Registered the Telegram webhook against the Function URL `/telegram`.
+  - Corrected `/friday/agent/telegram-chat-id` to the real direct-chat ID observed in Telegram webhook payloads.
+  - Fixed a PydanticAI tool-registration bug in `agent/app/agent_core.py` by moving `RunContext` import scope out of `run_agent()` so the nested `web_browser_task` annotation resolves correctly at runtime.
+  - Fixed the mixed HTTP/SQS Lambda warm-container bug in `agent/app/main.py` by recreating an event loop before handing non-SQS events to Mangum after `asyncio.run(...)` was used for SQS processing.
+  - Expanded `ops/aws/iam/codex-migration-policy.json` with additional live-debug permissions for CloudWatch Logs, Lambda policy reads, Lambda invoke, and EventBridge tag operations.
+- Result:
+  - `/health` returns `200`.
+  - Authenticated `/siri` returns `200` and can answer a short prompt.
+  - `/telegram` accepts webhook events and queues jobs successfully.
+  - The SQS queue drains back to zero after worker processing.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py` passed.
+  - Local container reproduction of `run_agent()` after the `RunContext` fix returned `pong` successfully.
+  - Live AWS checks confirmed `friday-agent` stack `UPDATE_COMPLETE`, Function URL health, Siri success, Telegram webhook registration, and empty SQS queue after processing.
+
+## 2026-05-13
+
+### Change: Friday personal agent stack added and documented
+
+- Goal:
+  - Add a portable, near-zero-idle personal agent to the same AWS account-rotation workflow that already preserves WireGuard and Iris.
+- Change:
+  - Added the agent application under `agent/` with FastAPI routes for Telegram, Siri, health checks, and SQS worker handling.
+  - Added PydanticAI/DeepSeek wiring, spend accounting, confirmation gating, Siri long-task routing to Telegram, and a Playwright browser-task scaffold.
+  - Set default DeepSeek spend accounting to the higher current `deepseek-reasoner` rates so the budget guard is conservative for mixed model usage.
+  - Added `ops/aws/friday-agent.yaml` for the serverless stack: ECR, Lambda Function URL, SQS, DynamoDB, IAM, CloudWatch retention, and optional Budget alert.
+  - Added `scripts/deploy-agent.sh`, `scripts/check-agent-migration-readiness.sh`, and `scripts/backup-agent-state.sh`.
+  - Updated `scripts/migrate-aws-account.sh` so agent deployment runs by default after shared-host restore and smoke checks; `--skip-agent` is available for emergency host-only migrations.
+  - Expanded `ops/aws/iam/codex-migration-policy.json` so new migration accounts can create and update the serverless agent resources.
+- Documentation:
+  - Added `docs/FRIDAY_AGENT.md` as the durable source of truth for agent architecture, repo map, behavior contract, deployment, migration, validation, budget/privacy, and troubleshooting.
+  - Updated `docs/CODEX_MAINTENANCE_LOOP.md`, `docs/OPERATIONS.md`, `docs/AWS_MIGRATION.md`, `docs/HANDOFF.md`, `ops/aws/iam/README.md`, and `SAY_THIS_WHEN_AUTO_COMPACT.md` so fresh sessions know the agent exists and where to start.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q` passed with `10 passed`.
+  - `bash -n scripts/deploy-agent.sh scripts/check-agent-migration-readiness.sh scripts/backup-agent-state.sh scripts/migrate-aws-account.sh` passed.
+  - `python3 -m json.tool ops/aws/iam/codex-migration-policy.json >/dev/null` passed.
+  - Ruby YAML parsing passed for `ops/aws/friday-shared-host.yaml` and `ops/aws/friday-agent.yaml`.
+- Not validated:
+  - Real `aws cloudformation validate-template`, Docker image build, and deployment were not run because `aws` and `docker` were not available on `PATH` in the working environment.
+
 ## 2026-04-09
 
 ### Incident: Sonarr TV search returned zero active indexers
@@ -431,6 +600,30 @@
 - Result:
   - The new `iris` account already has a recoverable shared-host backup.
   - Future Codex-managed AWS infrastructure changes now have an explicit automation path that captures before/after restore points instead of relying on memory or manual discipline.
+
+### Change: 48-hour thread memory upgraded from summary-only to turns + summary
+
+- Evidence:
+  - The prior 48-hour memory layer behaved too much like isolated requests because it only kept one coarse summary blob per conversation.
+  - Follow-up UX did not feel like a long-lived chat thread, especially when the user returned with a related but not identical request.
+- Change:
+  - Added raw thread-turn storage for each conversation with 48-hour TTL.
+  - Added persisted agent config for context-window behavior (`context_max_turns`, `context_summary_max_chars`, `conversation_ttl_hours`, `system_prompt_suffix`, optional budget overrides).
+  - Updated prompt assembly so the agent now receives:
+    - durable `#memory`
+    - rolling thread summary
+    - recent raw turns
+    - current request
+  - Added authenticated backend endpoints for later dashboard control:
+    - `GET /config`
+    - `PUT /config`
+    - `GET /threads/{conversation_id}`
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py hands/host/broker.py`
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests` → `18 passed`
+- Result:
+  - The memory layer is closer to “one long thread for 48 hours” instead of a summary-only approximation.
+  - Dashboard work can later expose these config and inspection surfaces without backend redesign.
 
 ### Change: VPN guard false-positive spam reduced
 

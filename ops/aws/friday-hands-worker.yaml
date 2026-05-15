@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Friday dedicated on-demand hands worker EC2 instance.
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: FridayHandsWorker
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  ImageId:
+    Type: AWS::EC2::Image::Id
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3a.small
+      - t3a.medium
+      - t3.small
+      - t3.medium
+  SshCidr:
+    Type: String
+    Description: CIDR allowed to SSH to the hands worker.
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 20
+
+Resources:
+  FridayHandsWorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Friday dedicated hands worker security group
+      GroupName: !Sub '${AWS::StackName}-hands-worker'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-sg'
+        - Key: FridayRole
+          Value: hands-worker
+
+  FridayHandsWorker:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      InstanceInitiatedShutdownBehavior: stop
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref FridayHandsWorkerSecurityGroup
+          SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: FridayRole
+          Value: hands-worker
+
+Outputs:
+  InstanceId:
+    Value: !Ref FridayHandsWorker
+  PublicIp:
+    Value: !GetAtt FridayHandsWorker.PublicIp
+  PublicDnsName:
+    Value: !GetAtt FridayHandsWorker.PublicDnsName
+  SecurityGroupId:
+    Value: !Ref FridayHandsWorkerSecurityGroup
