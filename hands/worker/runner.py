@@ -73,6 +73,19 @@ class WorkerApiClient:
         await self._post("/internal/worker/fail", payload.model_dump())
 
 
+def _status_summary_for_query(query: str, *, attachments: bool) -> str:
+    lowered = query.lower()
+    if any(token in lowered for token in ("research", "compare", "review", "reddit", "google")):
+        return "researching sources and comparing findings"
+    if any(token in lowered for token in ("browser", "website", "site", "search")):
+        return "working through website steps"
+    if any(token in lowered for token in ("pdf", "report", "summary", "table")):
+        return "preparing a report and output files"
+    if attachments:
+        return "working through the uploaded files"
+    return "working through the task"
+
+
 async def download_attachments(claim: WorkerClaimResponse, workspace: Workspace) -> None:
     async with httpx.AsyncClient(timeout=120) as client:
         for attachment in claim.attachments:
@@ -115,6 +128,7 @@ async def main() -> None:
     status_interval = max(60, int(claim.config.status_update_interval_seconds or 300))
     current_step = "starting worker"
     current_summary = "worker picked up job"
+    task_summary = _status_summary_for_query(claim.job.query, attachments=bool(attachment_names))
     interrupted = asyncio.Event()
     main_task = asyncio.current_task()
 
@@ -139,12 +153,12 @@ async def main() -> None:
         await api.heartbeat(claim.job.job_id, current_step, current_summary)
         await download_attachments(claim, workspace)
         current_step = "attachments_ready"
-        current_summary = "attachments downloaded"
+        current_summary = "workspace prepared"
         await api.checkpoint(claim.job.job_id, "attachments downloaded", "attachments_ready", workspace.list_files())
         if interrupted.is_set():
             raise KeyboardInterrupt("worker interrupted after attachment download")
         current_step = "running_agent"
-        current_summary = "agent is working through the task"
+        current_summary = task_summary
         result = await run_agent(
             claim.job.query,
             settings=settings,
@@ -159,7 +173,7 @@ async def main() -> None:
             resume_checkpoint=claim.resume_checkpoint,
         )
         current_step = "uploading_outputs"
-        current_summary = "agent finished and is uploading outputs"
+        current_summary = "preparing final files and upload"
         await api.checkpoint(claim.job.job_id, "agent completed", "uploading_outputs", workspace.list_files())
         if interrupted.is_set():
             raise KeyboardInterrupt("worker interrupted before output upload")

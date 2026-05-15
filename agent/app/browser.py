@@ -67,6 +67,11 @@ def _search_url(task: str) -> str:
     return f"https://html.duckduckgo.com/html/?q={quote_plus(task)}"
 
 
+def _selector_candidates(selector: str) -> list[str]:
+    parts = [part.strip() for part in selector.split(",")]
+    return [part for part in parts if part] or [selector]
+
+
 async def _http_fetch_text(url: str) -> str:
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(12.0, connect=6.0),
@@ -81,20 +86,55 @@ async def _http_fetch_text(url: str) -> str:
         return _strip_html(response.text)
 
 
+async def _extract_page_text_via_js(page) -> str:
+    text = await page.evaluate(
+        """() => {
+            const body = document.body;
+            const root = document.documentElement;
+            const value =
+              (body && (body.innerText || body.textContent)) ||
+              (root && (root.innerText || root.textContent)) ||
+              '';
+            return value;
+        }"""
+    )
+    return _normalize_whitespace(str(text or ""))
+
+
+async def _extract_selector_text(page, selector: str, *, timeout_ms: int) -> str:
+    for candidate in _selector_candidates(selector):
+        locator = page.locator(candidate).first
+        try:
+            if await locator.count():
+                text = await locator.inner_text(timeout=timeout_ms)
+                normalized = _normalize_whitespace(text)
+                if normalized:
+                    return normalized
+        except Exception as exc:
+            logger.info("browser selector read fallback selector=%s error=%s", candidate, exc)
+            continue
+    return ""
+
+
 async def _extract_page_text(page, selector: str = "body") -> str:
     if selector == "body":
         for candidate in TEXT_SELECTORS:
-            locator = page.locator(candidate).first
-            try:
-                if await locator.count():
-                    text = await locator.inner_text(timeout=2000)
-                    if _normalize_whitespace(text):
-                        return _normalize_whitespace(text)
-            except Exception:
-                continue
-    locator = page.locator(selector).first
-    text = await locator.inner_text(timeout=3000)
-    return _normalize_whitespace(text)
+            text = await _extract_selector_text(page, candidate, timeout_ms=2000)
+            if text:
+                return text
+        text = await _extract_page_text_via_js(page)
+        if text:
+            return text
+        return ""
+
+    text = await _extract_selector_text(page, selector, timeout_ms=3000)
+    if text:
+        return text
+
+    fallback = await _extract_page_text_via_js(page)
+    if fallback:
+        return fallback
+    return ""
 
 
 class BrowserSession:
