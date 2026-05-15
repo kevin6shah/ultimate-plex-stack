@@ -1,6 +1,6 @@
 import asyncio
 
-from app.browser import _extract_page_text, _run_with_retries
+from app.browser import _extract_page_text, _extract_search_result_links_from_html, _run_with_retries
 
 
 class FakeLocator:
@@ -89,3 +89,19 @@ def test_run_with_retries_does_not_retry_non_retryable_error() -> None:
         raise AssertionError("expected runtime error")
 
     assert attempts["count"] == 1
+
+
+def test_extract_search_result_links_from_html_decodes_duckduckgo_redirects() -> None:
+    html = """
+    <html><body>
+      <a href="/l/?uddg=https%3A%2F%2Fexample.com%2Fcamera-review">Result 1</a>
+      <a href="https://duckduckgo.com/y.js">ignore</a>
+      <a href="https://www.reddit.com/r/cameras/comments/abc123/">Result 2</a>
+    </body></html>
+    """
+
+    links = _extract_search_result_links_from_html(html, max_pages=5)
+    assert links == [
+        "https://example.com/camera-review",
+        "https://www.reddit.com/r/cameras/comments/abc123/",
+    ]

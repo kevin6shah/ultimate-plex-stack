@@ -665,3 +665,36 @@
   - Updated `docs/REMOTE_ACCESS.md` so the remote-access checklist explicitly says a timed Amphetamine session must actually be active before the lid is closed.
 - Result:
   - There is now a concrete local command to answer “is this Mac safe to close right now?” instead of relying on menu-bar guesswork.
+
+### Change: Heavy-task research hardened enough for real camera-search E2E
+
+- Evidence:
+  - The first real camera-research task on the dedicated worker failed on a single blocked source (`403` from DPReview).
+  - After deterministic search/fetch was added, the next failure mode was a single brittle browser action (`Locator.click` on `#article-body`) aborting the whole task.
+  - A later live run proved the PDF was actually generated, but worker output handling needed to avoid treating runtime junk as meaningful output.
+- Change:
+  - Added deterministic research wrappers in `agent/app/research.py` with Brave Search support when configured and public fallback otherwise.
+  - Updated heavy-task prompt guidance and tool wrappers so:
+    - blocked deterministic fetches become warnings, not task-ending exceptions
+    - failed browser actions become `BROWSER_ACTION_BLOCKED...` warnings instead of hard failures
+    - the agent is instructed to continue with alternate sources instead of retrying one dead path forever
+  - Kept the dedicated worker security posture:
+    - read-only container filesystem
+    - tmpfs for `/tmp`
+    - dropped Linux capabilities
+    - no-new-privileges
+    - CPU / memory / pids limits
+- Live validation:
+  - Stopped-worker lifecycle proved again: `stopped -> auto-start -> claim -> complete`.
+  - Real camera-search job `c6f5cb9f-ef4b-4c6c-a9ea-a0af1eaaf7da` completed successfully.
+  - Output artifact:
+    - `reports/vlogging-travel-snowboarding-cameras.pdf`
+  - The uploaded PDF extracted cleanly and contained a structured multi-tier recommendation report covering budget, mid, and premium camera options with review/spec context.
+- Result:
+  - Friday now has a working end-to-end heavy research flow that:
+    - starts the dedicated worker automatically
+    - performs deterministic research first
+    - escalates to browser only as needed
+    - creates a user-facing PDF artifact
+    - uploads the artifact back through the control plane
+  - The browser layer is substantially more resilient than before, but it is still a custom hardened Playwright layer, not yet a full Browser-use migration.

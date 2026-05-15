@@ -37,8 +37,11 @@ class Settings:
     telegram_webhook_secret_param: str = os.environ.get("TELEGRAM_WEBHOOK_SECRET_PARAM", "")
     siri_api_key_param: str = os.environ.get("SIRI_API_KEY_PARAM", "")
     deepseek_api_key_param: str = os.environ.get("DEEPSEEK_API_KEY_PARAM", "")
+    brave_search_api_key_param: str = os.environ.get("BRAVE_SEARCH_API_KEY_PARAM", "")
     logfire_token_param: str = os.environ.get("LOGFIRE_TOKEN_PARAM", "")
     worker_api_key_param: str = os.environ.get("WORKER_API_KEY_PARAM", "")
+    browser_stealth_enabled: bool = os.environ.get("BROWSER_STEALTH_ENABLED", "true").lower() == "true"
+    browser_user_agent_rotation: bool = os.environ.get("BROWSER_USER_AGENT_ROTATION", "true").lower() == "true"
     logfire_enabled: bool = os.environ.get("LOGFIRE_ENABLED", "false").lower() == "true"
     full_logfire_logging: bool = os.environ.get("LOGFIRE_FULL_CONTENT", "false").lower() == "true"
     hands_worker_mode: str = os.environ.get("HANDS_WORKER_MODE", "shared_host")

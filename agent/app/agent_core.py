@@ -13,6 +13,7 @@ from .budget import estimate_deepseek_cost, usage_from_pydantic_ai
 from .jobs import AgentConfig, AgentResult, ThreadTurn, ThreadTurnRole
 from .jobs import CheckpointPayload
 from .prompts import STATIC_SYSTEM_PROMPT
+from .research import fetch_page_content, sanitize_tool_output, search_web
 from .routing import needs_confirmation
 from .settings import Settings
 from .storage import StateStore
@@ -75,8 +76,12 @@ def _render_user_query(
         parts.append("\n".join(resume_parts))
     if mode == "heavy":
         parts.append(
-            "You are running inside the shared-host hands worker. "
-            "Use browser and workspace tools when needed, keep actions bounded, and leave clear intermediate state."
+            "You are running inside the dedicated hands worker. "
+            "Prefer deterministic search/fetch tools for research first. "
+            "Use browser tools only when a site actually requires interaction or the deterministic tools are insufficient. "
+            "If one public source blocks you or fails, skip it, note the warning, and continue with other sources. "
+            "Do not fail the whole task just because one site returns 403/404/timeout. "
+            "Keep actions bounded and leave clear intermediate state."
         )
     parts.append("User request:\n" + query)
     return "\n\n".join(parts)
@@ -128,7 +133,7 @@ async def run_agent(
     deps = AgentDependencies(
         settings=settings,
         workspace=workspace,
-        browser=BrowserSession(workspace=workspace) if mode == "heavy" else None,
+        browser=BrowserSession(workspace=workspace, settings=settings) if mode == "heavy" else None,
     )
     system_prompt = STATIC_SYSTEM_PROMPT
     if effective_config.agent_name.strip() and effective_config.agent_name.strip() != "Friday":
@@ -143,80 +148,154 @@ async def run_agent(
             "Prefer concise, useful files over large raw dumps."
         )
 
+        def _browser_tool_warning(action: str, exc: Exception) -> str:
+            logger.warning("browser tool degraded action=%s error=%s", action, exc)
+            return sanitize_tool_output(
+                f"BROWSER_ACTION_BLOCKED: {action} failed due to {exc}. "
+                "Try another selector, another source, or continue with the information already gathered."
+            )
+
+        @agent.tool
+        async def web_search(ctx: RunContext[AgentDependencies], task: str, max_results: int = 5) -> str:
+            """Use deterministic web search results before escalating to full browser automation."""
+            try:
+                result = await search_web(task, settings=ctx.deps.settings, max_results=max_results)
+            except Exception as exc:
+                logger.warning("web_search degraded task=%s error=%s", task, exc)
+                return sanitize_tool_output(
+                    f"DETERMINISTIC_SEARCH_UNAVAILABLE: search failed for '{task}' due to {exc}. "
+                    "Try another query or use the browser only if needed."
+                )
+            return sanitize_tool_output(result)
+
+        @agent.tool
+        async def fetch_web_page(ctx: RunContext[AgentDependencies], url: str, max_chars: int = 6000) -> str:
+            """Fetch and clean a public web page without opening a full browser."""
+            try:
+                result = await fetch_page_content(url, max_chars=max_chars)
+            except Exception as exc:
+                logger.warning("fetch_web_page degraded url=%s error=%s", url, exc)
+                return sanitize_tool_output(
+                    f"PUBLIC_PAGE_FETCH_BLOCKED: could not fetch {url} due to {exc}. "
+                    "Skip this source, try another public source, or use browser tools only if interaction is truly needed.",
+                    limit=max_chars,
+                )
+            return sanitize_tool_output(result, limit=max_chars)
+
         @agent.tool
         async def web_browser_task(ctx: RunContext[AgentDependencies], task: str, max_pages: int = 3, max_steps: int = 12) -> str:
-            """Read live web pages when current/public web information is needed."""
+            """Read live web pages when deterministic search/fetch is insufficient or browser interaction is required."""
             bounded_pages = min(max(max_pages, 1), ctx.deps.settings.max_browser_pages)
             bounded_steps = min(max(max_steps, 1), ctx.deps.settings.max_browser_steps)
-            return await run_browser_task(task, max_pages=bounded_pages, max_steps=bounded_steps)
+            try:
+                return await run_browser_task(task, max_pages=bounded_pages, max_steps=bounded_steps)
+            except Exception as exc:
+                logger.warning("web_browser_task degraded task=%s error=%s", task, exc)
+                return sanitize_tool_output(
+                    "BROWSER_TASK_UNAVAILABLE: live browser reading failed for this step due to "
+                    f"{exc}. Try another source or finish with the information already gathered."
+                )
 
         @agent.tool
         async def browser_start(ctx: RunContext[AgentDependencies], start_url: str = "") -> str:
             """Start a persistent browser session for multi-step website actions."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.start(start_url)
+            try:
+                return await ctx.deps.browser.start(start_url)
+            except Exception as exc:
+                return _browser_tool_warning("browser_start", exc)
 
         @agent.tool
         async def browser_navigate(ctx: RunContext[AgentDependencies], url: str) -> str:
             """Navigate the persistent browser session to a URL."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.goto(url)
+            try:
+                return await ctx.deps.browser.goto(url)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_navigate({url})", exc)
 
         @agent.tool
         async def browser_click(ctx: RunContext[AgentDependencies], selector: str) -> str:
             """Click an element in the persistent browser session using a CSS selector."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.click(selector)
+            try:
+                return await ctx.deps.browser.click(selector)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_click({selector})", exc)
 
         @agent.tool
         async def browser_type(ctx: RunContext[AgentDependencies], selector: str, text: str, submit: bool = False) -> str:
             """Fill an input in the persistent browser session."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.type_text(selector, text, submit=submit)
+            try:
+                return await ctx.deps.browser.type_text(selector, text, submit=submit)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_type({selector})", exc)
 
         @agent.tool
         async def browser_press(ctx: RunContext[AgentDependencies], selector: str, key: str) -> str:
             """Press a keyboard key on an element in the persistent browser session."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.press(selector, key)
+            try:
+                return await ctx.deps.browser.press(selector, key)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_press({selector}, {key})", exc)
 
         @agent.tool
         async def browser_read(ctx: RunContext[AgentDependencies], selector: str = "body", limit: int = 3500) -> str:
             """Read visible text from the current page or a selector in the persistent browser session."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.read(selector=selector, limit=limit)
+            try:
+                return await ctx.deps.browser.read(selector=selector, limit=limit)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_read({selector})", exc)
 
         @agent.tool
         async def browser_wait_for_text(ctx: RunContext[AgentDependencies], text: str, timeout_seconds: int = 10) -> str:
             """Wait for specific text to appear on the current page."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.wait_for_text(text=text, timeout_seconds=timeout_seconds)
+            try:
+                return await ctx.deps.browser.wait_for_text(text=text, timeout_seconds=timeout_seconds)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_wait_for_text({text[:60]})", exc)
 
         @agent.tool
         async def browser_upload_file(ctx: RunContext[AgentDependencies], selector: str, relative_path: str) -> str:
             """Upload a workspace file through a file input selector."""
             assert ctx.deps.browser is not None
             assert ctx.deps.workspace is not None
-            return await ctx.deps.browser.upload_file(selector, str(ctx.deps.workspace.resolve(relative_path)))
+            try:
+                return await ctx.deps.browser.upload_file(selector, str(ctx.deps.workspace.resolve(relative_path)))
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_upload_file({selector}, {relative_path})", exc)
 
         @agent.tool
         async def browser_list_links(ctx: RunContext[AgentDependencies], limit: int = 20) -> str:
             """List visible links on the current page."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.list_links(limit=limit)
+            try:
+                return await ctx.deps.browser.list_links(limit=limit)
+            except Exception as exc:
+                return _browser_tool_warning("browser_list_links", exc)
 
         @agent.tool
         async def browser_screenshot(ctx: RunContext[AgentDependencies], relative_path: str = "browser/current-page.png", full_page: bool = True) -> str:
             """Save a screenshot of the current page into the workspace."""
             assert ctx.deps.browser is not None
-            return await ctx.deps.browser.screenshot(relative_path=relative_path, full_page=full_page)
+            try:
+                return await ctx.deps.browser.screenshot(relative_path=relative_path, full_page=full_page)
+            except Exception as exc:
+                return _browser_tool_warning(f"browser_screenshot({relative_path})", exc)
 
         @agent.tool
         async def browser_close(ctx: RunContext[AgentDependencies]) -> str:
             """Close the persistent browser session."""
             assert ctx.deps.browser is not None
-            await ctx.deps.browser.close()
-            return "Browser session closed."
+            try:
+                await ctx.deps.browser.close()
+                return "Browser session closed."
+            except Exception as exc:
+                return _browser_tool_warning("browser_close", exc)
 
         if workspace is not None:
 

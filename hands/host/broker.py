@@ -94,6 +94,7 @@ def run_worker(claim: dict) -> None:
         "--security-opt",
         "no-new-privileges",
         "--cap-drop=ALL",
+        "--read-only",
         "--network",
         "bridge" if CONTAINER_ENGINE == "docker" else "slirp4netns",
         "--tmpfs",
@@ -108,8 +109,8 @@ def run_worker(claim: dict) -> None:
         f"DEEPSEEK_API_KEY={os.environ['DEEPSEEK_API_KEY']}",
         "-e",
         "HOME=/workspace",
-        "-v",
-        f"{workspace}:/workspace",
+        "--mount",
+        f"type=bind,src={workspace},dst=/workspace",
         WORKER_IMAGE,
     ]
     result = subprocess.run(

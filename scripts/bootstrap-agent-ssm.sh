@@ -9,6 +9,7 @@ AWS_REGION_NAME="${AWS_REGION:-us-east-1}"
 LOGFIRE_ENABLED_VALUE="${LOGFIRE_ENABLED:-false}"
 
 DEEPSEEK_API_KEY_PARAM_VALUE="${DEEPSEEK_API_KEY_PARAM:-/friday/agent/deepseek-api-key}"
+BRAVE_SEARCH_API_KEY_PARAM_VALUE="${BRAVE_SEARCH_API_KEY_PARAM:-/friday/agent/brave-search-api-key}"
 TELEGRAM_BOT_TOKEN_PARAM_VALUE="${TELEGRAM_BOT_TOKEN_PARAM:-/friday/agent/telegram-bot-token}"
 TELEGRAM_ALLOWED_CHAT_ID_PARAM_VALUE="${TELEGRAM_ALLOWED_CHAT_ID_PARAM:-/friday/agent/telegram-chat-id}"
 TELEGRAM_WEBHOOK_SECRET_PARAM_VALUE="${TELEGRAM_WEBHOOK_SECRET_PARAM:-/friday/agent/telegram-webhook-secret}"
@@ -38,6 +39,25 @@ put_secret() {
       >/dev/null
 }
 
+put_optional_secret() {
+  local name="$1"
+  local prompt="$2"
+  local value
+
+  printf "%s (optional, press Enter to skip): " "$prompt" > /dev/tty
+  read -r -s value < /dev/tty || true
+  echo
+  [[ -n "$value" ]] || return 0
+
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm put-parameter \
+      --name "$name" \
+      --type SecureString \
+      --value "$value" \
+      --overwrite \
+      >/dev/null
+}
+
 put_plaintext() {
   local name="$1"
   local prompt="$2"
@@ -57,6 +77,7 @@ put_plaintext() {
 }
 
 put_secret "$DEEPSEEK_API_KEY_PARAM_VALUE" "DeepSeek API key"
+put_optional_secret "$BRAVE_SEARCH_API_KEY_PARAM_VALUE" "Brave Search API key"
 put_secret "$TELEGRAM_BOT_TOKEN_PARAM_VALUE" "Telegram bot token"
 put_plaintext "$TELEGRAM_ALLOWED_CHAT_ID_PARAM_VALUE" "Telegram allowed chat id"
 put_secret "$TELEGRAM_WEBHOOK_SECRET_PARAM_VALUE" "Telegram webhook secret"

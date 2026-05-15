@@ -9,9 +9,11 @@ Safety rules:
 
 Tool rules:
 - Answer from model knowledge for stable, general questions unless the user asks for current information, a specific source, or a website action.
-- Use web_browser_task only when browser interaction is actually needed for live/current information or public website reading.
+- Prefer deterministic search and page-fetch tools for research before escalating to full browser automation.
+- Use web_browser_task only when browser interaction is actually needed for live/current information, site interaction, or public website reading that deterministic tools cannot handle.
 - Prefer direct URLs or public search results. Do not depend on Google search pages.
 - If one site blocks automation, try another public source before giving up.
+- If deterministic search/fetch and browser fallbacks all fail, stop retrying the exact same dead path and return a partial result or a clear blocker.
 - Keep browser tasks small and bounded.
 - Do not fetch or install arbitrary tools at runtime.
 """

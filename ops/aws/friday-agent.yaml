@@ -52,6 +52,9 @@ Parameters:
   DeepSeekApiKeyParam:
     Type: String
     Default: /friday/agent/deepseek-api-key
+  BraveSearchApiKeyParam:
+    Type: String
+    Default: /friday/agent/brave-search-api-key
   TelegramBotTokenParam:
     Type: String
     Default: /friday/agent/telegram-bot-token
@@ -251,6 +254,7 @@ Resources:
                   - ssm:GetParameter
                 Resource:
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeepSeekApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BraveSearchApiKeyParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramAllowedChatIdParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramWebhookSecretParam}'
@@ -314,6 +318,7 @@ Resources:
           SIRI_API_KEY_PARAM: !Ref SiriApiKeyParam
           WORKER_API_KEY_PARAM: !Ref WorkerApiKeyParam
           DEEPSEEK_API_KEY_PARAM: !Ref DeepSeekApiKeyParam
+          BRAVE_SEARCH_API_KEY_PARAM: !Ref BraveSearchApiKeyParam
           LOGFIRE_TOKEN_PARAM: !Ref LogfireTokenParam
           LOGFIRE_ENABLED: !Ref LogfireEnabled
           LOGFIRE_FULL_CONTENT: !Ref LogfireFullContent

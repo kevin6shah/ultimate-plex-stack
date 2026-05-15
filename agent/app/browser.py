@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import asyncio
+import random
 from html import unescape
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional, TypeVar
@@ -10,11 +11,18 @@ from urllib.parse import quote_plus, unquote, urlparse
 
 import httpx
 
+from .settings import Settings
+
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
+)
+ROTATING_USER_AGENTS = (
+    DEFAULT_USER_AGENT,
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
 )
 BOT_BLOCK_PATTERNS = (
     "captcha",
@@ -43,6 +51,12 @@ TRANSIENT_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+def _choose_user_agent(settings: Settings | None) -> str:
+    if settings is not None and not settings.browser_user_agent_rotation:
+        return DEFAULT_USER_AGENT
+    return random.choice(ROTATING_USER_AGENTS)
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -80,6 +94,23 @@ def _is_bot_blocked(text: str, title: str = "") -> bool:
 
 def _search_url(task: str) -> str:
     return f"https://html.duckduckgo.com/html/?q={quote_plus(task)}"
+
+
+def _extract_search_result_links_from_html(html: str, *, max_pages: int) -> list[str]:
+    links: list[str] = []
+    for match in re.finditer(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+        candidate = _decode_duckduckgo_href(match.group(1).strip())
+        if not _is_web_url(candidate):
+            continue
+        host = urlparse(candidate).netloc.lower()
+        if "duckduckgo.com" in host:
+            continue
+        if candidate in links:
+            continue
+        links.append(candidate)
+        if len(links) >= max_pages:
+            break
+    return links
 
 
 def _is_retryable_browser_error(exc: Exception) -> bool:
@@ -161,6 +192,47 @@ async def _http_fetch_text(url: str) -> str:
         raise last_exc
 
 
+async def _http_search_result_links(task: str, *, max_pages: int) -> list[str]:
+    search_url = _search_url(task)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(12.0, connect=6.0),
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        follow_redirects=True,
+    ) as client:
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = await client.get(search_url)
+                if response.status_code in TRANSIENT_HTTP_STATUS_CODES:
+                    raise httpx.HTTPStatusError(
+                        f"transient status {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                return _extract_search_result_links_from_html(response.text, max_pages=max_pages)
+            except Exception as exc:
+                last_exc = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = isinstance(exc, httpx.TransportError) or status_code in TRANSIENT_HTTP_STATUS_CODES
+                if attempt >= 3 or not retryable:
+                    raise
+                delay = float(attempt)
+                logger.warning(
+                    "browser search retry task=%s attempt=%s/3 delay=%.1fs error=%s",
+                    task[:120],
+                    attempt,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
+
 async def _extract_page_text_via_js(page) -> str:
     text = await page.evaluate(
         """() => {
@@ -213,12 +285,15 @@ async def _extract_page_text(page, selector: str = "body") -> str:
 
 
 class BrowserSession:
-    def __init__(self, workspace=None) -> None:
+    def __init__(self, workspace=None, *, settings: Settings | None = None) -> None:
         self._playwright = None
         self._browser = None
         self._context = None
         self._page = None
         self._workspace = workspace
+        self._settings = settings
+        self._stealth = None
+        self._user_agent = _choose_user_agent(settings)
 
     async def start(self, start_url: str = "") -> str:
         if self._page is not None:
@@ -226,8 +301,10 @@ class BrowserSession:
                 await self.goto(start_url)
             return await self.describe()
         from playwright.async_api import async_playwright
+        from playwright_stealth import Stealth
 
         self._playwright = await async_playwright().start()
+        self._stealth = Stealth(init_scripts_only=True) if (self._settings is None or self._settings.browser_stealth_enabled) else None
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=[
@@ -240,11 +317,13 @@ class BrowserSession:
             ],
         )
         self._context = await self._browser.new_context(
-            user_agent=DEFAULT_USER_AGENT,
+            user_agent=self._user_agent,
             locale="en-US",
             viewport={"width": 1440, "height": 900},
             accept_downloads=True,
         )
+        if self._stealth is not None:
+            await self._stealth.apply_stealth_async(self._context)
         self._page = await self._context.new_page()
         if start_url:
             await self.goto(start_url)
@@ -370,24 +449,31 @@ async def _visit_url(page, url: str) -> tuple[str, str, str]:
 
 async def _search_result_links(page, task: str, *, max_pages: int) -> list[str]:
     logger.info("browser searching public web task=%s", task)
-    await _run_with_retries(
-        f"search:{task[:80]}",
-        lambda: page.goto(_search_url(task), wait_until="domcontentloaded", timeout=15000),
-    )
-    await page.wait_for_timeout(500)
-    links: list[str] = []
-    for href in await page.locator("a[href]").evaluate_all("(els) => els.map((el) => el.getAttribute('href') || '')"):
-        candidate = _decode_duckduckgo_href(href.strip())
-        if not _is_web_url(candidate):
-            continue
-        host = urlparse(candidate).netloc.lower()
-        if "duckduckgo.com" in host:
-            continue
-        if candidate not in links:
-            links.append(candidate)
-        if len(links) >= max_pages:
-            break
-    return links
+    try:
+        await _run_with_retries(
+            f"search:{task[:80]}",
+            lambda: page.goto(_search_url(task), wait_until="domcontentloaded", timeout=15000),
+        )
+        await page.wait_for_timeout(500)
+        links: list[str] = []
+        for href in await page.locator("a[href]").evaluate_all("(els) => els.map((el) => el.getAttribute('href') || '')"):
+            candidate = _decode_duckduckgo_href(href.strip())
+            if not _is_web_url(candidate):
+                continue
+            host = urlparse(candidate).netloc.lower()
+            if "duckduckgo.com" in host:
+                continue
+            if candidate not in links:
+                links.append(candidate)
+            if len(links) >= max_pages:
+                break
+        if links:
+            return links
+    except Exception as exc:
+        logger.warning("browser search via playwright failed task=%s error=%s", task, exc)
+
+    logger.info("browser search falling back to http task=%s", task)
+    return await _http_search_result_links(task, max_pages=max_pages)
 
 
 def _format_observations(task: str, observations: Iterable[tuple[str, str, str]]) -> str:
@@ -403,8 +489,10 @@ def _format_observations(task: str, observations: Iterable[tuple[str, str, str]]
 async def run_browser_task(task: str, *, max_pages: int, max_steps: int) -> str:
     del max_steps
     from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
 
     direct_urls = _extract_urls(task)
+    user_agent = _choose_user_agent(None)
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
@@ -418,10 +506,12 @@ async def run_browser_task(task: str, *, max_pages: int, max_steps: int) -> str:
             ],
         )
         page = await browser.new_page(
-            user_agent=DEFAULT_USER_AGENT,
+            user_agent=user_agent,
             locale="en-US",
             viewport={"width": 1440, "height": 900},
         )
+        stealth = Stealth(init_scripts_only=True)
+        await stealth.apply_stealth_async(page.context)
         observations: list[tuple[str, str, str]] = []
         failures: list[str] = []
 
@@ -455,8 +545,10 @@ async def run_browser_task(task: str, *, max_pages: int, max_steps: int) -> str:
             failure_block = "; ".join(failures[:4]) or "no public pages could be read"
             logger.warning("browser task failed task=%s failures=%s", task, failure_block)
             return (
-                "Browser task could not read a public page for this request. "
-                f"Last failures: {failure_block}"
+                "Browser task could not read any public pages for this request after retries and fallbacks. "
+                f"Last failures: {failure_block}. "
+                "Do not keep retrying the same public-web read path in this run. "
+                "Continue with any other available evidence, or return a partial result that clearly says live web research was blocked."
             )
         finally:
             await page.close()

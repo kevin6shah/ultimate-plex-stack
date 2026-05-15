@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -167,6 +168,23 @@ class Workspace:
         return self.read_text(relative_path)
 
     def run_shell(self, command: str, timeout_seconds: int = 60) -> str:
+        blocked_patterns = (
+            r"\bsudo\b",
+            r"\bshutdown\b",
+            r"\breboot\b",
+            r"\bhalt\b",
+            r"\bpoweroff\b",
+            r"\bmkfs\b",
+            r"\bmount\b",
+            r"\bumount\b",
+            r"rm\s+-rf\s+/",
+            r":\(\)\s*\{",
+            r"curl\s+[^|]+\|\s*sh",
+            r"wget\s+[^|]+\|\s*sh",
+            r">\s*/dev/sd",
+        )
+        if any(re.search(pattern, command) for pattern in blocked_patterns):
+            return "Blocked shell command by Friday tool policy."
         result = subprocess.run(
             command,
             shell=True,

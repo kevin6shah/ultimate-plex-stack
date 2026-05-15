@@ -11,8 +11,9 @@ Before changing or deploying the agent:
 1. `docs/HANDOFF.md`
 2. `docs/CODEX_MAINTENANCE_LOOP.md`
 3. `docs/FRIDAY_AGENT.md`
-4. `docs/AWS_MIGRATION.md`
-5. `ops/aws/iam/README.md`
+4. `docs/FRIDAY_TOOL_SECURITY.md`
+5. `docs/AWS_MIGRATION.md`
+6. `ops/aws/iam/README.md`
 
 For code changes, inspect `agent/app/` and run local tests. For live AWS changes, inspect the current CloudFormation stack and run `./scripts/backup-agent-state.sh` first if the stack exists.
 
@@ -47,6 +48,7 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - `agent/app/storage.py`: DynamoDB access for session context, memory, jobs, checkpoints, approvals, and spend.
 - `agent/app/telegram.py`: Telegram update parsing and notification delivery.
 - `agent/app/browser.py`: Playwright browser task implementation.
+- `agent/app/research.py`: deterministic search/fetch wrappers and tool-output sanitization.
 - `agent/app/workspace.py`: isolated workspace file and shell helpers used by the hands worker.
 - `hands/host/broker.py`: local broker used by the hands worker host to claim heavy jobs and launch the isolated worker container.
 - `hands/worker/runner.py`: hands worker container entrypoint.
@@ -85,12 +87,27 @@ Required SSM SecureString parameters in each AWS account:
 
 ```text
 /friday/agent/deepseek-api-key
+/friday/agent/brave-search-api-key
 /friday/agent/telegram-bot-token
 /friday/agent/telegram-chat-id
 /friday/agent/telegram-webhook-secret
 /friday/agent/siri-api-key
 /friday/agent/worker-api-key
 ```
+
+`/friday/agent/brave-search-api-key` is optional. When present, heavy-task research uses Brave Search API as the deterministic search layer before escalating to full browser automation.
+
+## Current Hands Stack
+
+Friday's heavy-task execution stack currently is:
+
+- `PydanticAI` for planning and typed tool use
+- deterministic research wrappers (`web_search`, `fetch_web_page`) before browser escalation
+- `playwright-stealth` plus rotated user agents in the dedicated worker
+- a custom hardened Playwright layer for live website interaction
+- workspace file tools for PDF/text/table generation and shell/Python execution
+
+This is not yet a full `Browser-use` migration. The current browser substrate is still Friday-owned code on top of Playwright, hardened with retries, source-skipping, and deterministic-first routing.
 
 `/friday/agent/logfire-token` is only required when `LOGFIRE_ENABLED=true`.
 
@@ -197,17 +214,24 @@ Current live `iris` account status:
    - long-running workspace tasks that create and return files
    - checkpointed heavy-task resume
    - browser screenshot + PDF artifact generation
+   - real end-to-end camera research that generated and uploaded a final PDF artifact
 
 Current known worker caveats:
 
 - The dedicated worker deploy path now depends on local Docker image build + transfer. Rebuilding the Playwright image on the small worker host itself proved unreliable.
 - Operator IAM still needs `ec2:StartInstances`, `ec2:StopInstances`, `ec2:RebootInstances`, `cloudformation:DescribeStackResources`, and `s3:GetObject` if Codex should fully operate and debug the worker directly.
-- Hidden browser-profile files should not be treated as user deliverables. The repo now filters hidden workspace artifacts locally, but that fix must be propagated to the live worker runtime on the next worker refresh.
+- Hidden runtime files should not be treated as user deliverables. `Workspace.list_files()` now filters dotfiles/directories so `.cache/...` and `.pki/...` do not become reported outputs.
 - Live validation on `2026-05-15` confirmed that newer Lambda checkpoint handling keeps active heavy jobs in `running` state instead of incorrectly flipping them to `checkpointed` after the first checkpoint.
 - Explicit operator interruption is now proven on the live dedicated worker path:
   - an operator-stopped worker container transitions the job to `interrupted`
   - `resume that task` preserves the original heavy-task prompt instead of treating the literal resume text as the new job body
   - resumed work reuses prior workspace state and can complete with carried-forward files
+- Real camera-research E2E is now proven on the hardened stack:
+  - auto-start from a stopped worker instance
+  - deterministic search/fetch first
+  - browser escalation only when needed
+  - a successful final PDF artifact:
+    - `reports/vlogging-travel-snowboarding-cameras.pdf`
 - Current remaining caveat:
   - Telegram interruption delivery was not independently observable from the current CloudWatch log shape, even though job-state interruption and resume behavior are proven live
 
