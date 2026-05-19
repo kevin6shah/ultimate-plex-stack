@@ -20,7 +20,7 @@ Future Codex/Friday sessions should read this early and keep it current.
 - Routing target for common-use work:
   - spreadsheets / data outputs -> filesystem MCP + local file/spreadsheet tools + MarkItDown where needed
   - itineraries / maps / general web facts -> deterministic APIs/connectors or deterministic search/fetch first
-  - booking / reservations / commerce -> vetted connector if one is actually installed and approved, otherwise deterministic fetch first and Browser-use only for the interaction step
+  - booking / reservations / commerce -> vetted connector if one is actually installed and approved, otherwise deterministic fetch first, then Stagehand, then Browser-use only as the last browser fallback
   - login walls / sign-up pages -> pause and ask instead of improvising account creation
 - Keep the dedicated on-demand Friday worker as the default heavy-task execution surface; do not fall back to the shared Iris/VPN host for rebuilds or runtime patching.
 - Finish one clean end-to-end validation of the new screenshot-delivery defaults on a completed browser-heavy task.
@@ -84,6 +84,7 @@ Future Codex/Friday sessions should read this early and keep it current.
 - Add login-wall pause/resume handling on top of the new `paused_for_input` substrate before attempting autonomous account creation.
 - Keep Gmail disabled until a safer mailbox strategy is ready; use operator-assisted pause/resume for email/OTP gates in the meantime.
 - Improve Browser-use behavior on hostile domains without drifting back into the old selector-hardening detour.
+- Finish the current Stagehand migration and validate it live as the primary interactive browser fallback ahead of Browser-use.
 - Review common-use connectors only after security review and only where they materially beat deterministic search/fetch plus browser fallback.
 - Evaluate deterministic web extraction/search upgrades only if they fit Friday's current security and deployment model.
 - Evaluate whether optional Browser Use Cloud and/or CAPTCHA support is worth the additional risk/complexity.
@@ -119,6 +120,10 @@ Future Codex/Friday sessions should read this early and keep it current.
 - Added Skiplagged MCP runtime wiring through `mcp-remote` so flights/hotels/rental cars can move off brittle browser-first flows.
 - Restored the proper dedicated Friday on-demand worker and proved live Skiplagged flights, hotels, and rental cars through the Siri -> worker path.
 - Deployed the cleaned-up paused-input/status UX so blocked tasks now ask for missing details in readable sections instead of raw/internal-looking status text.
+- Added the first local Stagehand integration path in code:
+  - deterministic public-web read still runs first
+  - Stagehand now sits ahead of Browser-use in the interactive browser fallback order
+  - Browser-use remains the last-resort browser fallback instead of the default interactive lane
 
 ## Notes
 

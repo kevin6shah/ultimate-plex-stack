@@ -25,7 +25,7 @@ Keep this repository as a maintained operations project for a local MacBook Pro 
 This is the current highest-priority work and should stay the focus until validated live:
 
 1. Keep the dedicated on-demand hands worker path as the production heavy-task path.
-2. Keep the new Browser-use + deterministic-first + Friday-owned workspace MCP stack as the primary hands substrate.
+2. Keep the deterministic-first + Friday-owned workspace MCP stack as the primary hands substrate, with Stagehand becoming the preferred interactive browser lane and Browser-use retained as the last-resort browser fallback.
 3. Direct interruption/resume is now proven on the dedicated worker path. Text-driven task listing, status lookup, and stop commands are also live:
    - `show my tasks`
    - `what's the status?`
@@ -42,7 +42,7 @@ This is the current highest-priority work and should stay the focus until valida
 2. Build the explicit common-use routing hierarchy so Friday does not browse for work that should be deterministic:
    - spreadsheets / data outputs -> filesystem MCP + local file/spreadsheet tools + MarkItDown where needed
    - maps / itinerary / general fact gathering -> deterministic APIs, connectors, or deterministic search/fetch first
-   - booking / reservation / commerce tasks -> vetted connector if one is actually installed and approved, otherwise deterministic fetch first and Browser-use only for the interaction step
+   - booking / reservation / commerce tasks -> vetted connector if one is actually installed and approved, otherwise deterministic fetch first, then Stagehand, then Browser-use only for the interaction step
 3. Deploy and validate the current selected MCP/app comparison set for common use cases:
    - Firecrawl MCP
    - Skiplagged MCP for flights/hotels/rental cars
@@ -151,7 +151,7 @@ After dashboard work is underway, Friday should grow a real reminder system:
 - The Friday personal agent now lives under `agent/` and is deployed by `scripts/deploy-agent.sh`; account migration includes it by default after the shared host is restored, with `--skip-agent` available for emergency host-only rotations.
 - The medium-term direction is now dedicated on-demand hands infrastructure for heavy tasks, with the shared host retained for VPN + Iris and as the current bridge state during the transition.
 - Docker Desktop storage and macOS storage views are larger than `share/media`; that overhead must be tracked separately from the media cap.
-- Browser-use is now the primary browser/computer-use loop, but it is still not enough by itself for some challenge-heavy sites. Current observed failure classes:
+- Browser-use remains available, but it is no longer the preferred first interactive browser lane. Stagehand is now being introduced ahead of it because Browser-use by itself was still too brittle on some challenge-heavy sites. Current observed failure classes that still matter across the browser stack:
   - Cloudflare verification / anti-bot pages
   - retail site “page crashed” or blank result regions
   - successful final reports paired with ugly intermediate screenshots from blocked pages
@@ -159,7 +159,8 @@ After dashboard work is underway, Friday should grow a real reminder system:
   - real connector or deterministic API when one exists and is vetted
   - workspace MCP / MarkItDown / local structured file tools for files and spreadsheets
   - deterministic search/fetch and page conversion for general web reading
-  - Browser-use only for interaction, login, form fill, confirmation, or unsupported flows
+  - Stagehand for bounded interactive fallback after deterministic read paths fail
+  - Browser-use only for the final interaction/login/form-fill fallback when Stagehand is unavailable or also fails
 - The current restaurant-reservation path does not yet have a vetted installed connector. Friday must use deterministic search/fetch first and browser fallback only when necessary.
 - The current active travel connector direction is Skiplagged for flights/hotels/rental cars; the old Google Flights browser path is not good enough.
 - Do not rely on the current LobeHub listing for `musemen-resy-mcp-server` as an install source. The listing points to a GitHub repo that currently 404s, so it is metadata only until a real source artifact appears.
@@ -179,7 +180,7 @@ After dashboard work is underway, Friday should grow a real reminder system:
 1. Keep the Friday control-plane + dedicated-worker deployment path healthy.
 2. Work directly from `docs/FRIDAY_MANUAL_VERIFICATION_REPORT_2026-05-18.md` until the current manual-verification failures are closed.
 3. Finish live validation of the new screenshot-delivery defaults and zip behavior on a completed browser-heavy task.
-4. Implement the explicit hybrid tool-routing layer for common-use tasks so Friday stays deterministic-first.
+4. Finish the Stagehand migration and implement the explicit hybrid tool-routing layer for common-use tasks so Friday stays deterministic-first.
 5. Deploy and validate the new official filesystem MCP worker path on real file/spreadsheet tasks.
 6. Build the first tiered MCP isolation harnesses for filesystem, helper, and read-only network MCPs.
 7. Deploy and validate the now-wired travel/maps candidates, with Skiplagged first, before narrowing any primary path.

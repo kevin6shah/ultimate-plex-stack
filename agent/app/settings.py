@@ -71,6 +71,15 @@ class Settings:
     browser_use_step_timeout_seconds: int = int(os.environ.get("BROWSER_USE_STEP_TIMEOUT_SECONDS", "120"))
     browser_use_max_failures: int = int(os.environ.get("BROWSER_USE_MAX_FAILURES", "3"))
     browser_use_task_timeout_seconds: int = int(os.environ.get("BROWSER_USE_TASK_TIMEOUT_SECONDS", "90"))
+    stagehand_enabled: bool = os.environ.get("STAGEHAND_ENABLED", "true").lower() == "true"
+    stagehand_model: str = os.environ.get("STAGEHAND_MODEL", "deepseek/deepseek-chat")
+    stagehand_mode: str = os.environ.get("STAGEHAND_MODE", "hybrid")
+    stagehand_self_heal: bool = os.environ.get("STAGEHAND_SELF_HEAL", "true").lower() == "true"
+    stagehand_local_headless: bool = os.environ.get("STAGEHAND_LOCAL_HEADLESS", "true").lower() == "true"
+    stagehand_local_chrome_path: str = os.environ.get("STAGEHAND_LOCAL_CHROME_PATH", os.environ.get("CHROME_PATH", ""))
+    stagehand_local_ready_timeout_seconds: float = float(os.environ.get("STAGEHAND_LOCAL_READY_TIMEOUT_SECONDS", "20"))
+    stagehand_task_timeout_seconds: int = int(os.environ.get("STAGEHAND_TASK_TIMEOUT_SECONDS", "120"))
+    stagehand_tool_timeout_ms: int = int(os.environ.get("STAGEHAND_TOOL_TIMEOUT_MS", "20000"))
     mcp_registration_timeout_seconds: int = int(os.environ.get("MCP_REGISTRATION_TIMEOUT_SECONDS", "20"))
     firecrawl_mcp_enabled: bool = os.environ.get("FIRECRAWL_MCP_ENABLED", "false").lower() == "true"
     skiplagged_mcp_enabled: bool = os.environ.get("SKIPLAGGED_MCP_ENABLED", "false").lower() == "true"

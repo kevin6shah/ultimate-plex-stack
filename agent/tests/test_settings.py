@@ -48,3 +48,19 @@ def test_skiplagged_defaults_are_remote_bridge_based(monkeypatch):
     assert settings.skiplagged_mcp_enabled is False
     assert settings.skiplagged_mcp_command == "npx"
     assert settings.skiplagged_mcp_args == "-y mcp-remote https://mcp.skiplagged.com/mcp"
+
+
+def test_stagehand_defaults_are_local_and_enabled(monkeypatch):
+    monkeypatch.delenv("STAGEHAND_ENABLED", raising=False)
+    monkeypatch.delenv("STAGEHAND_MODEL", raising=False)
+    monkeypatch.delenv("STAGEHAND_MODE", raising=False)
+    monkeypatch.delenv("STAGEHAND_LOCAL_CHROME_PATH", raising=False)
+    monkeypatch.delenv("CHROME_PATH", raising=False)
+
+    reloaded = importlib.reload(settings_module)
+    settings = reloaded.Settings()
+
+    assert settings.stagehand_enabled is True
+    assert settings.stagehand_model == "deepseek/deepseek-chat"
+    assert settings.stagehand_mode == "hybrid"
+    assert settings.stagehand_local_chrome_path == ""

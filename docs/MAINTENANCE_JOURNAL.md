@@ -2,6 +2,16 @@
 
 ## 2026-05-18
 
+- Started the first real Stagehand migration in repo instead of leaving it as a pure architecture note:
+  - added `stagehand==3.20.0` to the Lambda and dedicated-worker dependency sets
+  - added new Stagehand runtime settings in `agent/app/settings.py`
+  - added `agent/app/stagehand_runner.py` as a guarded local Stagehand browser lane
+  - kept MCP/API/public-web reads first, inserted Stagehand before Browser-use, and left Browser-use as the last browser fallback
+  - added focused fallback-order tests plus Stagehand settings/tests
+- Local validation for the Stagehand migration passed:
+  - `python3 -m py_compile` on the patched browser files
+  - focused pytest slice: `24 passed`
+  - broader routing/Telegram/Siri/browser regression slice: `45 passed`
 - Pulled the exact operator Telegram thread and converted the observed issues into a dedicated repo report:
   - `docs/FRIDAY_MANUAL_VERIFICATION_REPORT_2026-05-18.md`
 - Captured the main operator-visible failures that still block a “stable” handoff:

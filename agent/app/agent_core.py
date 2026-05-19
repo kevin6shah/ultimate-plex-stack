@@ -27,6 +27,7 @@ from .restaurant_cli import (
 )
 from .routing import needs_confirmation, task_routing_profile
 from .skiplagged import call_skiplagged_tool
+from .stagehand_runner import run_stagehand_task
 from .settings import Settings
 from .storage import StateStore
 from .workspace import Workspace
@@ -163,12 +164,34 @@ async def _run_travel_browser_fallback(
     )
     if not _browser_fallback_failed(public_web_result):
         return public_web_result
-    if workspace is None or not settings.browser_use_enabled:
+    if workspace is None:
         raise RuntimeError(public_web_result)
+
+    stagehand_result = await run_stagehand_task(
+        (
+            "Travel interaction fallback. The direct travel tools were unavailable or rate-limited, "
+            "and the lightweight public-web pass could not gather enough data. "
+            "Use at most one or two mainstream travel sites, keep steps bounded, and return the best live options you can verify.\n\n"
+            + task
+        ),
+        max_steps=max(10, min(max_steps * 2, 16)),
+        settings=settings,
+        workspace=workspace,
+    )
+    if not _browser_fallback_failed(stagehand_result):
+        return stagehand_result
+
+    if not settings.browser_use_enabled:
+        raise RuntimeError(
+            "public-web and stagehand travel fallback failed. "
+            f"Public-web result: {public_web_result}. "
+            f"Stagehand result: {stagehand_result}."
+        )
+
     interaction_result = await run_browser_use_task(
         (
             "Last-resort travel interaction mode. The direct travel tools were unavailable or rate-limited, "
-            "and the lightweight public-web pass could not gather enough data. "
+            "the lightweight public-web pass was insufficient, and the Stagehand browser pass did not finish cleanly. "
             "Use at most one or two mainstream travel sites, keep steps bounded, avoid loops, "
             "and return the best live options you can find.\n\n"
             + task
@@ -181,8 +204,9 @@ async def _run_travel_browser_fallback(
     )
     if _browser_fallback_failed(interaction_result):
         raise RuntimeError(
-            "public-web fallback failed and last-resort browser interaction also failed. "
+            "public-web fallback failed, Stagehand fallback failed, and last-resort browser interaction also failed. "
             f"Public-web result: {public_web_result}. "
+            f"Stagehand result: {stagehand_result}. "
             f"Interaction result: {interaction_result}."
         )
     return interaction_result
@@ -201,6 +225,10 @@ def _browser_fallback_failed(result: str) -> bool:
             "public-web fallback failed",
             "no public pages could be read",
             "browser task unavailable",
+            "stagehand browser task failed",
+            "stagehand browser task unavailable",
+            "stagehand_browser_task_failed",
+            "stagehand_browser_task_unavailable",
         )
     )
 
@@ -220,11 +248,25 @@ async def _run_general_browser_task(
     )
     if not _browser_fallback_failed(public_web_result):
         return public_web_result
-    if workspace is None or not settings.browser_use_enabled:
+    if workspace is None:
         return public_web_result
-    return await run_browser_use_task(
+    stagehand_result = await run_stagehand_task(
         (
             "Interactive browser escalation mode. The lightweight public-web pass could not gather enough information. "
+            "Use browser automation only as needed, keep steps bounded, and finish with a concise summary.\n\n"
+            + task
+        ),
+        max_steps=max_steps,
+        settings=settings,
+        workspace=workspace,
+    )
+    if not _browser_fallback_failed(stagehand_result):
+        return stagehand_result
+    if not settings.browser_use_enabled:
+        return stagehand_result
+    return await run_browser_use_task(
+        (
+            "Last-resort browser escalation mode. The lightweight public-web pass was insufficient and the Stagehand browser pass did not finish cleanly. "
             "Use browser automation only as needed, keep the steps bounded, and finish with a concise summary.\n\n"
             + task
         ),
