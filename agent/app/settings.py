@@ -107,6 +107,8 @@ class Settings:
     full_logfire_logging: bool = os.environ.get("LOGFIRE_FULL_CONTENT", "false").lower() == "true"
     hands_worker_mode: str = os.environ.get("HANDS_WORKER_MODE", "shared_host")
     hands_worker_instance_id: str = os.environ.get("HANDS_WORKER_INSTANCE_ID", "")
+    hands_worker_stop_enabled: bool = os.environ.get("HANDS_WORKER_STOP_ENABLED", "true").lower() == "true"
+    hands_worker_idle_grace_seconds: int = int(os.environ.get("HANDS_WORKER_IDLE_GRACE_SECONDS", "1800"))
 
     @cached_property
     def ssm(self):

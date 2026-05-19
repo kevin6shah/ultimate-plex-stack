@@ -131,6 +131,9 @@ def _ensure_dedicated_worker_running() -> None:
 def _maybe_stop_dedicated_worker_if_idle(state: StateStore) -> None:
     if not _dedicated_worker_enabled():
         return
+    if not settings.hands_worker_stop_enabled:
+        logger.info("dedicated worker stop disabled; leaving instance running")
+        return
     active = state.list_jobs(
         statuses=(
             JobStatus.QUEUED,
@@ -142,6 +145,34 @@ def _maybe_stop_dedicated_worker_if_idle(state: StateStore) -> None:
     if heavy_active:
         logger.info("dedicated worker remains running; active heavy jobs=%s", len(heavy_active))
         return
+    grace_seconds = max(0, settings.hands_worker_idle_grace_seconds)
+    if grace_seconds:
+        recent_statuses = (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.INTERRUPTED,
+            JobStatus.TIMED_OUT,
+            JobStatus.PAUSED_FOR_INPUT,
+            JobStatus.WAITING_APPROVAL,
+            JobStatus.CHECKPOINTED,
+            JobStatus.PAUSED_BUDGET,
+        )
+        recent_jobs = state.list_jobs(statuses=recent_statuses, limit=20)
+        now = datetime.now(timezone.utc)
+        for job in recent_jobs:
+            if job.task_class != TaskClass.HEAVY:
+                continue
+            last_activity = _parse_job_timestamp(job.last_heartbeat_at or job.created_at)
+            if last_activity is None:
+                continue
+            idle_seconds = (now - last_activity).total_seconds()
+            if idle_seconds < grace_seconds:
+                logger.info(
+                    "dedicated worker remains running; last heavy activity was %.1fs ago (grace=%ss)",
+                    idle_seconds,
+                    grace_seconds,
+                )
+                return
     instance_state = _worker_instance_state()
     if instance_state == "running":
         logger.info("stopping dedicated worker instance_id=%s after queue drain", settings.hands_worker_instance_id)
@@ -632,6 +663,7 @@ def _resolve_stop_target(query: str, jobs: list[AgentJob]) -> Optional[AgentJob]
         for job in jobs
         if job.status in {JobStatus.RUNNING, JobStatus.WAITING_WORKER, JobStatus.QUEUED, JobStatus.WAITING_APPROVAL}
     ]
+    running_jobs = [job for job in jobs if job.status == JobStatus.RUNNING]
     non_paused = [job for job in jobs if job.status != JobStatus.PAUSED_FOR_INPUT]
     if any(
         phrase in lowered
@@ -649,6 +681,8 @@ def _resolve_stop_target(query: str, jobs: list[AgentJob]) -> Optional[AgentJob]
         if running_or_pending:
             return running_or_pending[0]
         return jobs[0]
+    if len(running_jobs) == 1:
+        return running_jobs[0]
     if len(running_or_pending) == 1:
         return running_or_pending[0]
     if len(non_paused) == 1:
@@ -1153,6 +1187,8 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
                     reply = f"Stopped task {target.job_id[:8]}."
                     if findings:
                         reply += f"\n\nWhat it found so far:\n{findings}"
+                    elif _wants_findings_after_stop(query):
+                        reply += "\n\nI do not have usable findings to show yet."
                 elif signaled:
                     reply = f"I asked the worker to stop task {target.job_id[:8]}."
                     if _wants_findings_after_stop(query):
@@ -1371,6 +1407,8 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
                     reply = f"Stopped task {target.job_id[:8]}."
                     if findings:
                         reply += f"\n\nWhat it found so far:\n{findings}"
+                    elif _wants_findings_after_stop(query):
+                        reply += "\n\nI do not have usable findings to show yet."
                 elif signaled:
                     reply = f"I asked the worker to stop task {target.job_id[:8]}."
                     if _wants_findings_after_stop(query):

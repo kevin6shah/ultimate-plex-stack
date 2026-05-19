@@ -119,12 +119,16 @@ def _direct_tool_mode_summary(query: str, routing_profile_name: str) -> str:
         if any(token in lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "car rental", "car rentals")):
             return (
                 "This is a structured travel booking task. Complete it with direct travel tools first. "
-                "Do not open aggregator or airline websites unless the direct travel tools are unavailable."
+                "Do not open aggregator or airline websites unless the direct travel tools are unavailable. "
+                "Stay strictly grounded in the tool output: do not invent itineraries, do not combine one-way legs unless the tool output explicitly supports that pairing, "
+                "and do not narrate intermediate reasoning like 'let me calculate' or 'here's where things stand'. "
+                "If nothing matches every constraint, say that plainly and then list the closest verified options with exact tradeoffs."
             )
     if routing_profile_name == "itinerary_maps":
         return (
             "This is a structured travel/maps task. Prefer direct travel and maps tools, plus deterministic research/fetch. "
-            "Do not browse map or travel UIs unless a direct tool cannot support the needed step."
+            "Do not browse map or travel UIs unless a direct tool cannot support the needed step. "
+            "For travel results, stay strictly grounded in the tool output: no invented route pairings, no speculative pricing math, and no internal reasoning chatter."
         )
     return ""
 

@@ -3,10 +3,12 @@ from dataclasses import replace
 from app.settings import Settings
 from app.stagehand_runner import (
     _merge_stagehand_partial_findings,
+    _stagehand_browser_payload,
     _stagehand_chrome_path,
     _stagehand_model_name,
     _stagehand_result_needs_fallback,
 )
+from app.workspace import Workspace
 
 
 def test_stagehand_model_name_preserves_provider_prefixed_value() -> None:
@@ -28,6 +30,24 @@ def test_stagehand_result_needs_fallback_for_low_quality_summary() -> None:
 def test_stagehand_chrome_path_prefers_explicit_setting() -> None:
     settings = replace(Settings(), stagehand_local_chrome_path="/custom/chrome")
     assert _stagehand_chrome_path(settings) == "/custom/chrome"
+
+
+def test_stagehand_browser_payload_includes_launch_options(tmp_path) -> None:
+    settings = replace(Settings(), stagehand_local_headless=False)
+    workspace = Workspace(tmp_path)
+    payload = _stagehand_browser_payload(
+        settings=settings,
+        workspace=workspace,
+        chrome_path="/custom/chrome",
+    )
+    assert payload["type"] == "local"
+    launch_options = payload["launchOptions"]
+    assert launch_options["args"] == ["--no-sandbox", "--disable-dev-shm-usage"]
+    assert launch_options["chromiumSandbox"] is False
+    assert launch_options["headless"] is False
+    assert launch_options["executablePath"] == "/custom/chrome"
+    assert launch_options["preserveUserDataDir"] is True
+    assert str(tmp_path / ".stagehand" / "profile") == launch_options["userDataDir"]
 
 
 def test_merge_stagehand_partial_findings_preserves_message_and_partial_context() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -100,13 +101,23 @@ async def call_skiplagged_tool(
         args=_split_mcp_args(settings.skiplagged_mcp_args),
         env=env,
     )
-    read_timeout = timedelta(seconds=timeout_seconds or max(30, settings.browser_use_task_timeout_seconds))
-    try:
+    effective_timeout = timeout_seconds or max(30, settings.browser_use_task_timeout_seconds)
+    read_timeout = timedelta(seconds=effective_timeout)
+
+    async def _invoke() -> str:
         async with stdio_client(server) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments, read_timeout_seconds=read_timeout)
                 return _call_result_to_text(result)
+
+    try:
+        return await asyncio.wait_for(_invoke(), timeout=effective_timeout + 10)
+    except asyncio.TimeoutError as exc:
+        message = f"Skiplagged MCP timed out after {effective_timeout}s"
+        outage_seconds = _skiplagged_outage_seconds(message) or 60
+        _SKIPLAGGED_OUTAGE_UNTIL = time.monotonic() + outage_seconds
+        raise RuntimeError(message) from exc
     except Exception as exc:
         message = str(exc)
         outage_seconds = _skiplagged_outage_seconds(message)

@@ -22,10 +22,16 @@ WORKER_PIDS_LIMIT = os.environ.get("FRIDAY_WORKER_PIDS_LIMIT", "512")
 STOP_ON_IDLE = os.environ.get("FRIDAY_STOP_ON_IDLE", "0") == "1"
 IDLE_STOP_SECONDS = int(os.environ.get("FRIDAY_IDLE_STOP_SECONDS", "600"))
 WORKER_CODE_ROOT = Path(os.environ.get("FRIDAY_WORKER_CODE_ROOT", "/opt/friday-hands"))
+WORKER_COMMAND = os.environ.get("FRIDAY_WORKER_COMMAND", "/usr/bin/python3 /opt/friday/runner.py").strip()
 
 
 def _container_env_var(name: str) -> list[str]:
     return ["-e", f"{name}={os.environ.get(name, '')}"]
+
+
+def _worker_command_parts() -> list[str]:
+    parts = WORKER_COMMAND.split()
+    return parts if parts else ["/usr/bin/python3", "/opt/friday/runner.py"]
 
 
 class WorkerRunError(RuntimeError):
@@ -223,6 +229,7 @@ def run_worker(claim: dict) -> None:
     ):
         run_cmd.extend(_container_env_var(env_name))
     run_cmd.append(WORKER_IMAGE)
+    run_cmd.extend(_worker_command_parts())
     result = subprocess.run(
         run_cmd,
         check=False,
