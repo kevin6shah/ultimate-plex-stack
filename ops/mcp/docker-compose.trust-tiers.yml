@@ -1,0 +1,200 @@
+services:
+  filesystem-mcp:
+    image: node:20-bookworm-slim
+    command:
+      - sh
+      - -lc
+      - npx -y @modelcontextprotocol/server-filesystem /workspace
+    read_only: true
+    tmpfs:
+      - /tmp
+    working_dir: /workspace
+    volumes:
+      - friday_workspace:/workspace
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.50
+    restart: unless-stopped
+
+  workspace-helper-mcp:
+    image: friday-worker-local
+    command:
+      - python
+      - -m
+      - app.mcp_workspace_server
+    environment:
+      FRIDAY_WORKSPACE_ROOT: /workspace
+      PYTHONPATH: /opt/friday
+    read_only: true
+    tmpfs:
+      - /tmp
+    working_dir: /opt/friday
+    volumes:
+      - friday_workspace:/workspace
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.50
+    restart: unless-stopped
+
+  firecrawl-mcp:
+    image: node:20-bookworm-slim
+    command:
+      - sh
+      - -lc
+      - npx -y firecrawl-mcp
+    environment:
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.50
+    restart: unless-stopped
+
+  google-maps-mcp:
+    image: node:20-bookworm-slim
+    command:
+      - sh
+      - -lc
+      - npx -y @cablate/mcp-google-map --stdio
+    environment:
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      GOOGLE_MAPS_ENABLED_TOOLS: ${GOOGLE_MAPS_ENABLED_TOOLS:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.50
+    restart: unless-stopped
+
+  maps-openapi-mcp:
+    image: node:20-bookworm-slim
+    command:
+      - sh
+      - -lc
+      - >
+        npx -y @openapi-mcp/server --api ${MAPS_OPENAPI_SPEC_URL}
+    environment:
+      BASE_URL: ${MAPS_OPENAPI_BASE_URL:-}
+      HEADERS: ${MAPS_OPENAPI_HEADERS:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.25
+    restart: unless-stopped
+
+  resy-mcp:
+    image: friday-worker-local
+    working_dir: /opt/friday/mcp/resy-mcp
+    command:
+      - sh
+      - -lc
+      - >
+        node /opt/friday/mcp/resy-mcp/build/index.js --stdio
+    environment:
+      RESY_API_KEY: ${RESY_API_KEY:-}
+      RESY_AUTH_TOKEN: ${RESY_AUTH_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.50
+    restart: unless-stopped
+
+  opentable-mcp:
+    image: friday-worker-local
+    command:
+      - sh
+      - -lc
+      - >
+        npx -y @striderlabs/mcp-opentable
+    environment:
+      OPENTABLE_EMAIL: ${OPENTABLE_EMAIL:-}
+      OPENTABLE_PASSWORD: ${OPENTABLE_PASSWORD:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.25
+    restart: unless-stopped
+
+  gmail-mcp:
+    image: node:20-bookworm-slim
+    command:
+      - sh
+      - -lc
+      - npx -y github:Sallytion/Gmail-MCP
+    environment:
+      EMAIL_ADDRESS: ${GMAIL_ACCOUNT_EMAIL:-}
+      EMAIL_PASSWORD: ${GMAIL_APP_PASSWORD:-}
+      IMAP_HOST: imap.gmail.com
+      IMAP_PORT: 993
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.25
+    restart: unless-stopped
+
+  identity-mcp:
+    image: node:20-bookworm-slim
+    command:
+      - sh
+      - -lc
+      - |
+        echo "placeholder service: install temp-mail and secondary identity MCP candidates here" && sleep infinity
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.25
+    restart: unless-stopped
+
+volumes:
+  friday_workspace:

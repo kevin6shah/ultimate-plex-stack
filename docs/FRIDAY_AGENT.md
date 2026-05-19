@@ -9,11 +9,18 @@ The Friday personal agent is a serverless AI assistant that lives in this repo a
 Before changing or deploying the agent:
 
 1. `docs/HANDOFF.md`
-2. `docs/CODEX_MAINTENANCE_LOOP.md`
-3. `docs/FRIDAY_AGENT.md`
-4. `docs/FRIDAY_TOOL_SECURITY.md`
-5. `docs/AWS_MIGRATION.md`
-6. `ops/aws/iam/README.md`
+2. `docs/FRIDAY_OPERATOR_BOARD.md`
+3. `docs/FRIDAY_CAPABILITIES_MATRIX.md`
+4. `docs/CODEX_MAINTENANCE_LOOP.md`
+5. `docs/FRIDAY_AGENT.md`
+6. `docs/FRIDAY_TOOL_SECURITY.md`
+7. `docs/FRIDAY_AWS_SYSTEM_DESIGN.md`
+8. `docs/AWS_MIGRATION.md`
+9. `ops/aws/iam/README.md`
+
+For account-creation / identity-management work, also read:
+
+- `docs/FRIDAY_ACCOUNT_IDENTITY_FLOW.md`
 
 For code changes, inspect `agent/app/` and run local tests. For live AWS changes, inspect the current CloudFormation stack and run `./scripts/backup-agent-state.sh` first if the stack exists.
 
@@ -60,7 +67,8 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - `scripts/deploy-hands-worker.sh`: creates the dedicated worker instance, builds the worker image locally, transfers it to the worker host, and installs the hands runtime onto it.
 - `scripts/deploy-agent.sh`: two-pass ECR/image/runtime deployment.
 - `scripts/check-agent-migration-readiness.sh`: target-account preflight.
-- `scripts/bootstrap-agent-ssm.sh`: interactive SecureString creation for required agent secrets.
+- `scripts/sync-env-from-ssm.sh`: syncs known Friday secrets from AWS SSM into the local `.env` file.
+- `scripts/sync-ssm-from-env.sh`: syncs all non-empty mapped values from the local `.env` file back into AWS SSM.
 - `scripts/backup-agent-state.sh`: metadata-only backup; no plaintext secrets.
 
 ## Behavior Contract
@@ -70,6 +78,15 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - Siri long tasks are queued and return the immediate fixed response; updates and final answers go to Telegram only.
 - The browser tool is not offered in Lambda light-mode at all.
 - Heavy tasks are classified before execution. Browser actions, attachments, file-processing work, and explicit resume requests are routed to the hands runtime instead of Lambda.
+- Heavy tasks can now pause durably for missing user input instead of failing terminally. The worker writes a `paused_for_input` state, preserves a checkpoint, and asks the user for the missing answer.
+- The current explicit resume contract for paused-input jobs is: reply with `answer: ...` or send the requested attachment. That reply creates a new heavy job that resumes from the saved workspace/checkpoint state.
+- Browser-use step screenshots are no longer sent back to Telegram by default. They are only kept/sent when the original request explicitly asks for screenshots or images, and multiple requested screenshots are bundled into one zip.
+- The intended common-use routing hierarchy is:
+  - real connector or deterministic API when one exists and is vetted
+  - workspace MCP / MarkItDown / local structured file tools for files, spreadsheets, and document outputs
+  - deterministic search/fetch and page conversion for general web reading
+  - Browser-use only for interaction, login, form fill, confirmation, or unsupported flows
+- The capability contract for what Friday may actually promise lives in `docs/FRIDAY_CAPABILITIES_MATRIX.md`.
 - Stable general questions should stay synchronous and answer from model knowledge.
 - Conversation/task context is remembered for up to 48 hours per channel/user/conversation so follow-up questions still work.
 - The 48-hour layer now stores raw thread turns plus a rolling summary. Prompt assembly uses both, instead of relying on one coarse summary blob.
@@ -97,6 +114,31 @@ Required SSM SecureString parameters in each AWS account:
 
 `/friday/agent/brave-search-api-key` is optional. When present, heavy-task research uses Brave Search API as the deterministic search layer before escalating to full browser automation.
 
+Optional MCP/connector SSM SecureString parameters now supported by the stack:
+
+```text
+/friday/agent/firecrawl-api-key
+/friday/agent/google-maps-api-key
+/friday/agent/maps-openapi-headers
+/friday/agent/maps-openapi-auth-token
+/friday/agent/resy-api-key
+/friday/agent/resy-auth-token
+/friday/agent/opentable-email
+/friday/agent/opentable-password
+/friday/agent/gmail-account-email
+/friday/agent/gmail-app-password
+/friday/agent/gmail-client-id
+/friday/agent/gmail-client-secret
+/friday/agent/gmail-refresh-token
+```
+
+Those are only needed when the corresponding MCP/connector is enabled in deployment settings.
+
+For the Friday mailbox specifically:
+
+- preferred current path: `/friday/agent/gmail-account-email` + `/friday/agent/gmail-app-password`
+- legacy path kept only for migration compatibility: `/friday/agent/gmail-client-id`, `/friday/agent/gmail-client-secret`, `/friday/agent/gmail-refresh-token`
+
 ## Current Hands Stack
 
 Friday's heavy-task execution stack currently is:
@@ -105,11 +147,61 @@ Friday's heavy-task execution stack currently is:
 - deterministic research wrappers (`web_search`, `fetch_web_page`) before browser escalation
 - `Browser-use` as the primary browser/computer-use loop on the dedicated worker
 - `playwright-stealth` plus rotated user agents in the dedicated worker
-- a Friday-owned local workspace MCP server for narrow file handoff inside the worker
+- the official filesystem MCP server for broad file/directory operations within the worker workspace roots
+- a Friday-owned workspace helper MCP server for preview, markdown conversion, and PDF generation
 - `MarkItDown`-backed workspace document conversion
 - workspace file tools for PDF/text/table generation and shell/Python execution
 
+Additional repo-wired MCP candidates now exist behind settings/secrets for evaluation:
+
+- Firecrawl MCP
+- cablate Google Maps MCP
+- Google Maps / Places / Routes via OpenAPI MCP
+- Resy MCP runtime hook
+- OpenTable MCP runtime hook
+- Gmail IMAP/SMTP MCP candidate for a dedicated Friday mailbox
+
+Current live proof on the dedicated worker:
+
+- Firecrawl-backed research has completed real file/report tasks
+- cablate Google Maps has completed real map/planning tasks
+- direct Skiplagged travel tools have completed real flights, hotels, and rental-car tasks
+- Gmail remains intentionally disabled because the dedicated Friday mailbox was blocked by Google; email/OTP steps should currently fall back to pause/resume plus operator input
+
 This is now a Browser-use-backed heavy-task substrate, not the older custom selector-centric Playwright path. The older direct Playwright browser layer is still useful as fallback code/history, but it is no longer the primary hands architecture.
+
+Current explicit direction:
+
+- keep the official filesystem MCP server as the primary broad file surface, scoped to allowed worker roots
+- keep root scope bounded to the isolated worker workspace rather than the full host filesystem
+
+The near-term product direction on top of this stack is a hybrid hands layer for common-use tasks:
+
+- spreadsheets / structured data should primarily use local file/spreadsheet tooling, not the browser
+- itinerary planning and map lookups should prefer deterministic APIs/connectors or deterministic search/fetch
+- reservations and commerce should prefer vetted connectors when they actually exist in this stack
+- Browser-use should be reserved for interaction steps, unsupported sites, and true browser-only flows
+
+The repo now includes a first task-routing-profile pass for that direction:
+
+- spreadsheet/data requests
+- itinerary/maps requests
+- booking/commerce requests
+- login/account-gated requests
+
+Those profiles currently shape heavy-task routing guidance and heavy/light classification. They are not yet the full connector-backed routing layer by themselves.
+
+The repo now also includes a first-pass durable pause-for-input path on top of this substrate. Live validation on `2026-05-15` proved:
+- a heavy Siri task can enter `paused_for_input`
+- a follow-up `answer: ...` reply creates a resumed heavy job with `resume_from_job_id`
+- the resumed job can claim the worker and continue from the prior checkpoint path
+
+The screenshot-suppression default is deployed live as part of the same rollout, but a clean end-to-end completed browser job proving the exact Telegram artifact/zip behavior is still pending.
+
+The remaining acceptance gap is operator validation:
+- pause/resume has been live-tested by Codex, but the operator has not yet accepted it through normal use
+- login-wall and sign-in/sign-up gate pausing is still a backlog item, not a finished behavior
+- the old OAuth-style Gmail MCP path is no longer the intended direction; use a headless IMAP/App Password MCP path for the Friday mailbox instead
 
 `/friday/agent/logfire-token` is only required when `LOGFIRE_ENABLED=true`.
 
@@ -117,10 +209,16 @@ This is now a Browser-use-backed heavy-task substrate, not the older custom sele
 
 Do not commit plaintext values or export them through backup scripts.
 
-Create or update them interactively:
+Pull the current AWS SSM secrets into the local `.env`:
 
 ```bash
-AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/bootstrap-agent-ssm.sh
+bash ./scripts/sync-env-from-ssm.sh
+```
+
+Push the local `.env` values back into AWS SSM:
+
+```bash
+bash ./scripts/sync-ssm-from-env.sh
 ```
 
 Deploy or update:
@@ -241,6 +339,11 @@ Current known worker caveats:
   - an operator-stopped worker container transitions the job to `interrupted`
   - `resume that task` preserves the original heavy-task prompt instead of treating the literal resume text as the new job body
   - resumed work reuses prior workspace state and can complete with carried-forward files
+- Live validation on `2026-05-15` also proved the newer paused-input path:
+  - an underspecified reservation task entered `paused_for_input`
+  - the checkpoint stored a structured missing-input prompt
+  - an `answer: ...` follow-up created a resumed heavy job linked through `resume_from_job_id`
+  - the resumed job successfully reclaimed the worker and entered `running`
 - Real camera-research E2E is now proven on the Browser-use-backed stack:
   - auto-start from a stopped worker instance
   - deterministic search/fetch first

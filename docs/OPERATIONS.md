@@ -213,7 +213,8 @@ Safe backup command:
 Agent deployment and budget/cost visibility:
 
 ```bash
-AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/bootstrap-agent-ssm.sh
+bash ./scripts/sync-env-from-ssm.sh
+bash ./scripts/sync-ssm-from-env.sh
 AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/check-agent-migration-readiness.sh
 AWS_PROFILE=iris AWS_REGION=us-east-1 ./scripts/deploy-agent.sh
 AWS_PROFILE=iris AWS_REGION=us-east-1 HOST=<shared-host-ip> EC2_SSH_KEY=/path/to/key.pem ./scripts/deploy-hands-host.sh

@@ -21,6 +21,15 @@ AGENT_STACK_NAME_VALUE="${AGENT_STACK_NAME:-friday-agent}"
 WORKER_API_KEY_PARAM_VALUE="${WORKER_API_KEY_PARAM:-/friday/agent/worker-api-key}"
 DEEPSEEK_API_KEY_PARAM_VALUE="${DEEPSEEK_API_KEY_PARAM:-/friday/agent/deepseek-api-key}"
 BROWSER_USE_API_KEY_PARAM_VALUE="${BROWSER_USE_API_KEY_PARAM:-/friday/agent/browser-use-api-key}"
+BRAVE_SEARCH_API_KEY_PARAM_VALUE="${BRAVE_SEARCH_API_KEY_PARAM:-/friday/agent/brave-search-api-key}"
+FIRECRAWL_API_KEY_PARAM_VALUE="${FIRECRAWL_API_KEY_PARAM:-/friday/agent/firecrawl-api-key}"
+GOOGLE_MAPS_API_KEY_PARAM_VALUE="${GOOGLE_MAPS_API_KEY_PARAM:-/friday/agent/google-maps-api-key}"
+RESY_API_KEY_PARAM_VALUE="${RESY_API_KEY_PARAM:-/friday/agent/resy-api-key}"
+RESY_AUTH_TOKEN_PARAM_VALUE="${RESY_AUTH_TOKEN_PARAM:-/friday/agent/resy-auth-token}"
+OPENTABLE_EMAIL_PARAM_VALUE="${OPENTABLE_EMAIL_PARAM:-/friday/agent/opentable-email}"
+OPENTABLE_PASSWORD_PARAM_VALUE="${OPENTABLE_PASSWORD_PARAM:-/friday/agent/opentable-password}"
+AGENT_MODEL_VALUE="${AGENT_MODEL:-deepseek:deepseek-chat}"
+REASONER_MODEL_VALUE="${REASONER_MODEL:-deepseek:deepseek-reasoner}"
 BROWSER_USE_CLOUD_ENABLED_VALUE="${BROWSER_USE_CLOUD_ENABLED:-false}"
 BROWSER_USE_MODEL_VALUE="${BROWSER_USE_MODEL:-deepseek-chat}"
 BROWSER_USE_CLOUD_MODEL_VALUE="${BROWSER_USE_CLOUD_MODEL:-bu-latest}"
@@ -81,6 +90,34 @@ browser_use_key="$(
   AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
     aws ssm get-parameter --name "$BROWSER_USE_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
 )"
+brave_search_key="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$BRAVE_SEARCH_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+firecrawl_key="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$FIRECRAWL_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+google_maps_key="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$GOOGLE_MAPS_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+resy_api_key="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$RESY_API_KEY_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+resy_auth_token="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$RESY_AUTH_TOKEN_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+opentable_email="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$OPENTABLE_EMAIL_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+opentable_password="$(
+  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+    aws ssm get-parameter --name "$OPENTABLE_PASSWORD_PARAM_VALUE" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
 
 AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
   aws ec2 wait instance-running --instance-ids "$instance_id"
@@ -96,13 +133,34 @@ trap 'rm -rf "$tmp_dir"' EXIT
 COPYFILE_DISABLE=1 tar -czf "$tmp_dir/friday-hands-runtime.tgz" agent/app hands
 /usr/local/bin/docker build --platform linux/amd64 -t friday-hands-worker:latest -f "$ROOT_DIR/hands/worker/Dockerfile" "$ROOT_DIR"
 /usr/local/bin/docker save friday-hands-worker:latest | gzip -1 > "$tmp_dir/friday-hands-worker.tar.gz"
+cat >"$tmp_dir/friday-hands-secrets.env" <<EOF
+BRAVE_SEARCH_API_KEY_PARAM=
+BRAVE_SEARCH_API_KEY=${brave_search_key}
+FIRECRAWL_API_KEY_PARAM=
+FIRECRAWL_API_KEY=${firecrawl_key}
+GOOGLE_MAPS_API_KEY_PARAM=
+GOOGLE_MAPS_API_KEY=${google_maps_key}
+RESY_API_KEY_PARAM=
+RESY_API_KEY=${resy_api_key}
+RESY_AUTH_TOKEN_PARAM=
+RESY_AUTH_TOKEN=${resy_auth_token}
+OPENTABLE_EMAIL_PARAM=
+OPENTABLE_EMAIL=${opentable_email}
+OPENTABLE_PASSWORD_PARAM=
+OPENTABLE_PASSWORD=${opentable_password}
+GMAIL_ACCOUNT_EMAIL_PARAM=
+GMAIL_APP_PASSWORD_PARAM=
+GMAIL_CLIENT_ID_PARAM=
+GMAIL_CLIENT_SECRET_PARAM=
+GMAIL_REFRESH_TOKEN_PARAM=
+EOF
 
 ssh_opts=(-i "$EC2_SSH_KEY_VALUE" -o StrictHostKeyChecking=accept-new)
-scp "${ssh_opts[@]}" "$ROOT_DIR/ops/aws/install-hands-worker-runtime.sh" "$tmp_dir/friday-hands-runtime.tgz" "$tmp_dir/friday-hands-worker.tar.gz" \
+scp "${ssh_opts[@]}" "$ROOT_DIR/ops/aws/install-hands-worker-runtime.sh" "$tmp_dir/friday-hands-runtime.tgz" "$tmp_dir/friday-hands-worker.tar.gz" "$tmp_dir/friday-hands-secrets.env" \
   "${REMOTE_USER}@${public_ip}:/tmp/"
 
 ssh "${ssh_opts[@]}" "${REMOTE_USER}@${public_ip}" \
-  "sudo bash /tmp/install-hands-worker-runtime.sh /tmp/friday-hands-runtime.tgz '${function_url%/}' '$worker_key' '$deepseek_key' /tmp/friday-hands-worker.tar.gz '$browser_use_key' '$BROWSER_USE_CLOUD_ENABLED_VALUE' '$BROWSER_USE_MODEL_VALUE' '$BROWSER_USE_CLOUD_MODEL_VALUE' '$BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE_VALUE'"
+  "sudo bash /tmp/install-hands-worker-runtime.sh /tmp/friday-hands-runtime.tgz '${function_url%/}' '$worker_key' '$deepseek_key' /tmp/friday-hands-worker.tar.gz '$AGENT_MODEL_VALUE' '$REASONER_MODEL_VALUE' '$browser_use_key' '$BROWSER_USE_CLOUD_ENABLED_VALUE' '$BROWSER_USE_MODEL_VALUE' '$BROWSER_USE_CLOUD_MODEL_VALUE' '$BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE_VALUE' /tmp/friday-hands-secrets.env"
 
 echo "Dedicated hands worker deployed."
 echo "Instance ID: ${instance_id}"

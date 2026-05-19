@@ -8,6 +8,7 @@ WORKER_API_KEY="${3:-}"
 DEEPSEEK_API_KEY="${4:-}"
 AGENT_MODEL_VALUE="${5:-deepseek:deepseek-chat}"
 REASONER_MODEL_VALUE="${6:-deepseek:deepseek-reasoner}"
+SECRETS_ENV_FILE="${7:-}"
 WORKER_USER="friday-hands"
 WORK_ROOT="/srv/friday-hands"
 INSTALL_ROOT="/opt/friday-hands"
@@ -73,8 +74,40 @@ FRIDAY_WORKER_TIMEOUT_SECONDS=1800
 FRIDAY_WORKER_CPUS=0.50
 FRIDAY_WORKER_MEMORY=512m
 FRIDAY_WORKER_PIDS_LIMIT=512
+BRAVE_SEARCH_API_KEY_PARAM=/friday/agent/brave-search-api-key
+FIRECRAWL_MCP_ENABLED=${FIRECRAWL_MCP_ENABLED:-true}
+FIRECRAWL_API_KEY_PARAM=/friday/agent/firecrawl-api-key
+SKIPLAGGED_MCP_ENABLED=${SKIPLAGGED_MCP_ENABLED:-true}
+SKIPLAGGED_MCP_COMMAND=${SKIPLAGGED_MCP_COMMAND:-npx}
+SKIPLAGGED_MCP_ARGS=${SKIPLAGGED_MCP_ARGS:--y mcp-remote https://mcp.skiplagged.com/mcp}
+RESTAURANT_CLI_ENABLED=${RESTAURANT_CLI_ENABLED:-true}
+RESTAURANT_CLI_COMMAND=${RESTAURANT_CLI_COMMAND:-restaurant}
+RESTAURANT_CLI_OT_MODE=${RESTAURANT_CLI_OT_MODE:-auto}
+RESTAURANT_CLI_TIMEZONE=${RESTAURANT_CLI_TIMEZONE:-America/New_York}
+GOOGLE_MAPS_MCP_ENABLED=${GOOGLE_MAPS_MCP_ENABLED:-true}
+GOOGLE_MAPS_API_KEY_PARAM=/friday/agent/google-maps-api-key
+GOOGLE_MAPS_ENABLED_TOOLS=
+MAPS_OPENAPI_MCP_ENABLED=${MAPS_OPENAPI_MCP_ENABLED:-false}
+MAPS_OPENAPI_SPEC_URL=
+MAPS_OPENAPI_BASE_URL=
+MAPS_OPENAPI_HEADERS_PARAM=/friday/agent/maps-openapi-headers
+MAPS_OPENAPI_AUTH_TOKEN_PARAM=/friday/agent/maps-openapi-auth-token
+RESY_MCP_ENABLED=${RESY_MCP_ENABLED:-false}
+RESY_API_KEY_PARAM=/friday/agent/resy-api-key
+RESY_AUTH_TOKEN_PARAM=/friday/agent/resy-auth-token
+OPENTABLE_MCP_ENABLED=${OPENTABLE_MCP_ENABLED:-false}
+OPENTABLE_EMAIL_PARAM=/friday/agent/opentable-email
+OPENTABLE_PASSWORD_PARAM=/friday/agent/opentable-password
+GMAIL_MCP_ENABLED=${GMAIL_MCP_ENABLED:-false}
+GMAIL_ACCOUNT_EMAIL_PARAM=/friday/agent/gmail-account-email
+GMAIL_APP_PASSWORD_PARAM=/friday/agent/gmail-app-password
 EOF
 chmod 600 /etc/friday-hands.env
+
+if [[ -n "$SECRETS_ENV_FILE" && -f "$SECRETS_ENV_FILE" ]]; then
+  cat "$SECRETS_ENV_FILE" >> /etc/friday-hands.env
+  chmod 600 /etc/friday-hands.env
+fi
 
 su - "$WORKER_USER" -c "podman system prune -af >/dev/null 2>&1 || true"
 su - "$WORKER_USER" -c "cd '$INSTALL_ROOT' && podman build --format docker -t friday-hands-worker:latest -f hands/worker/Dockerfile ."

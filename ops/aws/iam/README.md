@@ -54,7 +54,20 @@ You also need:
 
 The policy now also includes `ec2:CreateKeyPair` and `ec2:DeleteKeyPair`, so Codex can create the migration key pair directly if you prefer not to do it manually in the console.
 
-It also includes the serverless permissions needed for the Friday personal agent stack: ECR, Lambda, DynamoDB, SQS, CloudWatch Logs, Budgets, IAM role creation/pass-through for Lambda, and `/friday/agent/*` SSM parameters.
+It also includes the serverless permissions needed for the Friday personal agent stack: ECR, Lambda, DynamoDB, SQS, CloudWatch Logs, Budgets, IAM role creation/pass-through for Lambda, `/friday/agent/*` SSM parameters, and enough Friday state-table access to inspect or delete stale job rows when a broken worker run leaves bad control-plane state behind.
+
+It also includes the IAM role and instance-profile lifecycle permissions needed to clean up and recreate the dedicated `friday-hands-worker` stack if a failed worker stack leaves behind stale IAM resources.
+
+It also includes the Friday worker access permissions Codex needs for live debugging and rollout validation on the dedicated worker:
+
+- `ec2-instance-connect:SendSSHPublicKey` so Codex can inject the current local SSH public key into the worker without relying on a separate `.pem`
+- SSM managed-instance inspection/command permissions so Codex can inspect or repair the worker through Systems Manager when SSH is unavailable
+
+When Codex later needs more AWS permissions, the workflow should be:
+
+1. update [codex-migration-policy.json](/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack/ops/aws/iam/codex-migration-policy.json) in the repo first
+2. ask the operator to copy/paste the full policy into the `codex-migration` user
+3. continue only after the operator confirms it was applied
 
 Typical migration inputs:
 

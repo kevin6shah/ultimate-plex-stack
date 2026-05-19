@@ -51,6 +51,14 @@
       "Resource": "*"
     },
     {
+      "Sid": "Ec2InstanceConnectForFridayWorkerOps",
+      "Effect": "Allow",
+      "Action": [
+        "ec2-instance-connect:SendSSHPublicKey"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:301142908919:instance/*"
+    },
+    {
       "Sid": "SsmUbuntuAmiLookup",
       "Effect": "Allow",
       "Action": [
@@ -169,10 +177,27 @@
         "iam:CreateRole",
         "iam:DeleteRole",
         "iam:GetRole",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRolePolicies",
         "iam:PutRolePolicy",
         "iam:DeleteRolePolicy",
         "iam:GetRolePolicy",
-        "iam:TagRole"
+        "iam:TagRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "HandsWorkerInstanceProfileLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:ListInstanceProfilesForRole"
       ],
       "Resource": "*"
     },
@@ -206,10 +231,40 @@
       "Sid": "AgentSsmParameters",
       "Effect": "Allow",
       "Action": [
+        "ssm:DescribeParameters",
         "ssm:GetParameter",
         "ssm:PutParameter"
       ],
-      "Resource": "arn:aws:ssm:*:*:parameter/friday/agent/*"
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/friday/agent/*",
+        "*"
+      ]
+    },
+    {
+      "Sid": "SsmManagedInstanceInspection",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:DescribeInstanceInformation",
+        "ssm:SendCommand",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AgentStateTableReadWriteForOps",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:DeleteItem",
+        "dynamodb:BatchWriteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/friday-agent-state",
+        "arn:aws:dynamodb:*:*:table/friday-agent-state/index/*"
+      ]
     }
   ]
 }

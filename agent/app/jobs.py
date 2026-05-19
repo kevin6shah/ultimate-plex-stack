@@ -27,6 +27,7 @@ class JobStatus(str, Enum):
     WAITING_WORKER = "waiting_worker"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
+    PAUSED_FOR_INPUT = "paused_for_input"
     CHECKPOINTED = "checkpointed"
     PAUSED_BUDGET = "paused_budget"
     TIMED_OUT = "timed_out"
@@ -163,6 +164,13 @@ class WorkerHeartbeat(BaseModel):
 
 class WorkerCheckpointRequest(BaseModel):
     job_id: str
+    checkpoint: CheckpointPayload
+
+
+class WorkerPauseRequest(BaseModel):
+    job_id: str
+    question: str
+    details: str = ""
     checkpoint: CheckpointPayload
 
 

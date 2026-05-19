@@ -5,6 +5,7 @@ share/
 # Environment files
 .env
 .friday-ops.env
+.env.*
 
 # Key files
 *.pem

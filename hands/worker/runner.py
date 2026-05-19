@@ -10,8 +10,9 @@ from typing import Any
 
 import httpx
 
-from app.agent_core import run_agent
-from app.jobs import ArtifactUploadRequest, ControlCommand, WorkerCheckpointRequest, WorkerClaimResponse, WorkerCompleteRequest, WorkerFailureRequest, WorkerHeartbeat
+from app.agent_core import PauseForInputRequested, run_agent
+from app.artifacts import is_browser_step_screenshot, query_requests_browser_images
+from app.jobs import ArtifactUploadRequest, CheckpointPayload, ControlCommand, WorkerCheckpointRequest, WorkerClaimResponse, WorkerCompleteRequest, WorkerFailureRequest, WorkerHeartbeat, WorkerPauseRequest
 from app.settings import Settings
 from app.workspace import Workspace
 
@@ -72,6 +73,15 @@ class WorkerApiClient:
         )
         await self._post("/internal/worker/checkpoint", payload.model_dump())
 
+    async def pause_for_input(self, job_id: str, *, question: str, details: str, checkpoint: CheckpointPayload) -> None:
+        payload = WorkerPauseRequest(
+            job_id=job_id,
+            question=question,
+            details=details,
+            checkpoint=checkpoint,
+        )
+        await self._post("/internal/worker/pause", payload.model_dump())
+
     async def artifact_url(self, job_id: str, file_name: str, content_type: str) -> dict:
         payload = ArtifactUploadRequest(job_id=job_id, file_name=file_name, content_type=content_type)
         return await self._post("/internal/worker/artifact-url", payload.model_dump())
@@ -83,6 +93,30 @@ class WorkerApiClient:
     async def fail(self, job_id: str, error_message: str, *, interrupted: bool = False, timed_out: bool = False) -> None:
         payload = WorkerFailureRequest(job_id=job_id, error_message=error_message, interrupted=interrupted, timed_out=timed_out)
         await self._post("/internal/worker/fail", payload.model_dump())
+
+
+def _normalize_worker_error_message(query: str, message: str) -> str:
+    normalized = (message or "").strip()
+    lowered = normalized.lower()
+    query_lowered = query.lower()
+    if "request_limit of 50" in lowered or "would exceed the request_limit" in lowered:
+        if any(token in query_lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "google flights", "google travel")):
+            return (
+                "I hit an internal browser/tool step limit before finishing the travel search. "
+                "This usually means the task drifted into a browser loop instead of staying on direct travel tools. "
+                "The task did not complete."
+            )
+        if any(token in query_lowered for token in ("restaurant", "reservation", "resy", "opentable", "booking")):
+            return (
+                "I hit an internal browser/tool step limit before finishing the reservation task. "
+                "This usually means the task drifted into a browser loop instead of staying on structured reservation tools. "
+                "The task did not complete."
+            )
+        return (
+            "I hit an internal step limit before finishing the task. "
+            "The task did not complete."
+        )
+    return normalized
 
 
 def _status_summary_for_query(query: str, *, attachments: bool) -> str:
@@ -108,12 +142,20 @@ async def download_attachments(claim: WorkerClaimResponse, workspace: Workspace)
             target.write_bytes(response.content)
 
 
-async def upload_outputs(api: WorkerApiClient, job_id: str, workspace: Workspace) -> tuple[list[str], list[str]]:
+async def upload_outputs(
+    api: WorkerApiClient,
+    job_id: str,
+    workspace: Workspace,
+    *,
+    include_browser_step_screenshots: bool,
+) -> tuple[list[str], list[str]]:
     output_files: list[str] = []
     artifact_keys: list[str] = []
     async with httpx.AsyncClient(timeout=120) as client:
         for relative_path in workspace.list_files():
             if relative_path == "claim.json" or relative_path.startswith(".pki/"):
+                continue
+            if not include_browser_step_screenshots and is_browser_step_screenshot(relative_path):
                 continue
             file_path = workspace.resolve(relative_path)
             response = await api.artifact_url(job_id, relative_path, "application/octet-stream")
@@ -137,6 +179,7 @@ async def main() -> None:
     local_store = LocalBudgetStore()
     settings = Settings()
     attachment_names = [attachment["file_name"] for attachment in claim.attachments]
+    include_browser_step_screenshots = query_requests_browser_images(claim.job.query)
     status_interval = max(60, int(claim.config.status_update_interval_seconds or 300))
     current_step = "starting worker"
     current_summary = "worker picked up job"
@@ -204,8 +247,32 @@ async def main() -> None:
         await api.checkpoint(claim.job.job_id, "agent completed", "uploading_outputs", workspace.list_files())
         if interrupted.is_set():
             raise KeyboardInterrupt("worker interrupted before output upload")
-        output_files, artifact_keys = await upload_outputs(api, claim.job.job_id, workspace)
+        output_files, artifact_keys = await upload_outputs(
+            api,
+            claim.job.job_id,
+            workspace,
+            include_browser_step_screenshots=include_browser_step_screenshots,
+        )
         await api.complete(claim.job.job_id, result.text, output_files, artifact_keys)
+    except PauseForInputRequested as exc:
+        current_step = exc.current_step
+        current_summary = exc.summary
+        await api.pause_for_input(
+            claim.job.job_id,
+            question=exc.question,
+            details=exc.details,
+            checkpoint=CheckpointPayload(
+                summary=exc.summary,
+                current_step=exc.current_step,
+                workspace_files=workspace.list_files(),
+                resume_instructions=exc.resume_instructions,
+                metadata={
+                    "input_question": exc.question,
+                    "input_details": exc.details,
+                    "pause_kind": "user_input",
+                },
+            ),
+        )
     except (KeyboardInterrupt, asyncio.CancelledError) as exc:
         await api.checkpoint(
             claim.job.job_id,
@@ -215,7 +282,7 @@ async def main() -> None:
         )
         await api.fail(claim.job.job_id, str(exc), interrupted=True)
     except Exception as exc:
-        await api.fail(claim.job.job_id, str(exc))
+        await api.fail(claim.job.job_id, _normalize_worker_error_message(claim.job.query, str(exc)))
         raise
     finally:
         status_task.cancel()

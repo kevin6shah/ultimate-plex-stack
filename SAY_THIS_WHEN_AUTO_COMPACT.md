@@ -5,10 +5,15 @@ Treat `/Users/kevinshah/Documents/Friday.nosync/friday-plex-stack` as an activel
 Before you do anything:
 
 1. Read `docs/HANDOFF.md`
-2. Read `docs/CODEX_MAINTENANCE_LOOP.md`
-3. Read `docs/MAINTENANCE_JOURNAL.md`
-4. Run `./scripts/check-stack.sh`
-5. Inspect the relevant logs and local config before making any claim
+2. Read `docs/FRIDAY_OPERATOR_BOARD.md`
+3. Read `docs/FRIDAY_CAPABILITIES_MATRIX.md`
+4. Read `docs/FRIDAY_MCP_STACK_PLAN.md`
+5. Read `docs/CODEX_MAINTENANCE_LOOP.md`
+6. Read `docs/MAINTENANCE_JOURNAL.md`
+7. Read `docs/FRIDAY_AGENT.md`
+8. Read `docs/FRIDAY_TOOL_SECURITY.md`
+9. Run `./scripts/check-stack.sh`
+10. Inspect the relevant logs and local config before making any claim
 
 Rules:
 
@@ -57,3 +62,11 @@ Current live baseline:
 - Agent migration is included by default in `./scripts/migrate-aws-account.sh` after the shared host is restored; use `--skip-agent` only for emergency host-only rotations
 - Agent secrets are SSM SecureString parameters under `/friday/agent/*`; `./scripts/check-agent-migration-readiness.sh` validates a target account before deployment
 - Siri long tasks must return immediately and notify through Telegram only; do not add delayed Siri speech for queued work
+- For Friday agent work, keep the current P1 execution order:
+  - validate shipped pause/resume and screenshot-delivery behavior
+  - build the hybrid tool-routing layer for spreadsheets, itinerary/maps, and booking/reservations
+  - adopt and validate the official filesystem MCP server scoped to worker roots
+  - build tiered MCP isolation harnesses instead of running all MCPs in one flat trust boundary
+  - review real connectors/MCPs only where they materially beat deterministic tools
+  - keep Browser-use as the interaction fallback, not the default reader
+  - add login-wall / sign-up gating on top of the existing pause-for-input substrate

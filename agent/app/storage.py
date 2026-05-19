@@ -294,7 +294,7 @@ class StateStore:
         ttl = None
         if status == JobStatus.COMPLETED:
             ttl = ttl_epoch(self.settings.completed_job_ttl_days)
-        elif status in (JobStatus.INTERRUPTED, JobStatus.CHECKPOINTED, JobStatus.TIMED_OUT, JobStatus.FAILED):
+        elif status in (JobStatus.INTERRUPTED, JobStatus.CHECKPOINTED, JobStatus.PAUSED_FOR_INPUT, JobStatus.TIMED_OUT, JobStatus.FAILED):
             ttl = ttl_epoch(self.settings.interrupted_job_ttl_days)
 
         expression = [

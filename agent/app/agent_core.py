@@ -1,26 +1,56 @@
 from __future__ import annotations
 
+import json
 import os
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from pydantic_ai import Agent, RunContext
 
-from .browser import BrowserSession
+from .browser import BrowserSession, run_browser_task
 from .browser_use_runner import run_browser_use_task
 from .budget import estimate_deepseek_cost, usage_from_pydantic_ai
 from .jobs import AgentConfig, AgentResult, ThreadTurn, ThreadTurnRole
 from .jobs import CheckpointPayload
 from .prompts import STATIC_SYSTEM_PROMPT
 from .research import fetch_page_content, sanitize_tool_output, search_web
-from .routing import needs_confirmation
+from .restaurant_cli import (
+    build_opentable_booking_url,
+    choose_best_restaurant_result,
+    normalize_restaurant_provider,
+    run_restaurant_cli,
+    run_restaurant_cli_json,
+)
+from .routing import needs_confirmation, task_routing_profile
+from .skiplagged import call_skiplagged_tool
 from .settings import Settings
 from .storage import StateStore
 from .workspace import Workspace
 
 logger = logging.getLogger(__name__)
+
+
+class PauseForInputRequested(RuntimeError):
+    def __init__(
+        self,
+        *,
+        question: str,
+        details: str = "",
+        summary: str = "",
+        current_step: str = "waiting_for_user_input",
+        resume_instructions: str = "",
+    ) -> None:
+        normalized_question = question.strip() or "additional user input required"
+        super().__init__(normalized_question)
+        self.question = normalized_question
+        self.details = details.strip()
+        self.summary = (summary.strip() or normalized_question)[:2000]
+        self.current_step = (current_step.strip() or "waiting_for_user_input")[:500]
+        self.resume_instructions = resume_instructions.strip()
 
 
 @dataclass
@@ -30,6 +60,81 @@ class AgentDependencies:
     browser: Optional[BrowserSession] = None
 
 
+def _should_expose_browser_tools(query: str, routing_profile_name: str) -> bool:
+    lowered = query.lower()
+    if routing_profile_name == "booking_commerce":
+        return False
+    if routing_profile_name == "itinerary_maps":
+        travel_tokens = (
+            "flight",
+            "flights",
+            "airfare",
+            "hotel",
+            "hotels",
+            "rental car",
+            "rental cars",
+            "car rental",
+            "car rentals",
+            "google flights",
+            "google travel",
+            "skiplagged",
+        )
+        if any(token in lowered for token in travel_tokens):
+            return False
+    return True
+
+
+def _should_expose_travel_browser_fallback(query: str, routing_profile_name: str) -> bool:
+    lowered = query.lower()
+    if routing_profile_name not in {"booking_commerce", "itinerary_maps"}:
+        return False
+    travel_tokens = (
+        "flight",
+        "flights",
+        "airfare",
+        "hotel",
+        "hotels",
+        "rental car",
+        "rental cars",
+        "car rental",
+        "car rentals",
+        "google flights",
+        "google travel",
+        "skiplagged",
+    )
+    return any(token in lowered for token in travel_tokens)
+
+
+def _direct_tool_mode_summary(query: str, routing_profile_name: str) -> str:
+    lowered = query.lower()
+    if routing_profile_name == "booking_commerce":
+        if any(token in lowered for token in ("restaurant", "reservation", "resy", "opentable", "table")):
+            return (
+                "This is a structured reservation task for restaurants. Use restaurant_search first to find the venue, "
+                "prefer restaurant_find_availability for the full search-plus-slots flow, and only use restaurant_book_or_handoff for an approved booking or manual handoff step. "
+                "For read-only availability checks, stay on the structured restaurant tools. "
+                "If the structured path cannot verify live availability, return the structured result plus a clean handoff path instead of drifting into browser automation."
+            )
+        if any(token in lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "car rental", "car rentals")):
+            return (
+                "This is a structured travel booking task. Complete it with direct travel tools first. "
+                "Do not open aggregator or airline websites unless the direct travel tools are unavailable."
+            )
+    if routing_profile_name == "itinerary_maps":
+        return (
+            "This is a structured travel/maps task. Prefer direct travel and maps tools, plus deterministic research/fetch. "
+            "Do not browse map or travel UIs unless a direct tool cannot support the needed step."
+        )
+    return ""
+
+
+def _is_structured_restaurant_task(query: str, routing_profile_name: str) -> bool:
+    if routing_profile_name != "booking_commerce":
+        return False
+    lowered = query.lower()
+    return any(token in lowered for token in ("restaurant", "reservation", "reservations", "resy", "opentable", "table"))
+
+
 def _select_model(query: str, settings: Settings) -> str:
     lowered = query.lower()
     if any(token in lowered for token in ("think deeply", "reason", "plan carefully", "complex")):
@@ -37,9 +142,118 @@ def _select_model(query: str, settings: Settings) -> str:
     return settings.agent_model
 
 
+async def _run_travel_browser_fallback(
+    *,
+    settings: Settings,
+    workspace: Optional[Workspace],
+    task: str,
+    max_pages: int = 2,
+    max_steps: int = 8,
+) -> str:
+    scoped_task = (
+        "Travel fallback mode. The structured travel tools were unavailable or rate-limited. "
+        "Use Google Travel / Google Flights / Google Hotels, Kayak, or another mainstream travel source only as needed. "
+        "Stay tightly scoped and summarize the best options clearly.\n\n"
+        + task
+    )
+    public_web_result = await run_browser_task(
+        scoped_task,
+        max_pages=max_pages,
+        max_steps=max_steps,
+    )
+    if not _browser_fallback_failed(public_web_result):
+        return public_web_result
+    if workspace is None or not settings.browser_use_enabled:
+        raise RuntimeError(public_web_result)
+    interaction_result = await run_browser_use_task(
+        (
+            "Last-resort travel interaction mode. The direct travel tools were unavailable or rate-limited, "
+            "and the lightweight public-web pass could not gather enough data. "
+            "Use at most one or two mainstream travel sites, keep steps bounded, avoid loops, "
+            "and return the best live options you can find.\n\n"
+            + task
+        ),
+        max_pages=max(1, min(max_pages, 2)),
+        max_steps=max(10, min(max_steps * 2, 16)),
+        settings=settings,
+        workspace=workspace,
+        enable_optional_mcps=False,
+    )
+    if _browser_fallback_failed(interaction_result):
+        raise RuntimeError(
+            "public-web fallback failed and last-resort browser interaction also failed. "
+            f"Public-web result: {public_web_result}. "
+            f"Interaction result: {interaction_result}."
+        )
+    return interaction_result
+
+
+def _browser_fallback_failed(result: str) -> bool:
+    normalized = (result or "").strip().lower()
+    if not normalized:
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "browser task could not read any public pages",
+            "browser task failed",
+            "browser fallback also failed",
+            "public-web fallback failed",
+            "no public pages could be read",
+            "browser task unavailable",
+        )
+    )
+
+
+async def _run_general_browser_task(
+    *,
+    settings: Settings,
+    workspace: Optional[Workspace],
+    task: str,
+    max_pages: int,
+    max_steps: int,
+) -> str:
+    public_web_result = await run_browser_task(
+        task,
+        max_pages=max_pages,
+        max_steps=max_steps,
+    )
+    if not _browser_fallback_failed(public_web_result):
+        return public_web_result
+    if workspace is None or not settings.browser_use_enabled:
+        return public_web_result
+    return await run_browser_use_task(
+        (
+            "Interactive browser escalation mode. The lightweight public-web pass could not gather enough information. "
+            "Use browser automation only as needed, keep the steps bounded, and finish with a concise summary.\n\n"
+            + task
+        ),
+        max_pages=max_pages,
+        max_steps=max_steps,
+        settings=settings,
+        workspace=workspace,
+        enable_optional_mcps=False,
+    )
+
+
+def _current_local_datetime_text(settings: Settings) -> str:
+    timezone_name = settings.restaurant_cli_timezone or os.environ.get("TZ", "America/New_York")
+    try:
+        current = datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        timezone_name = "UTC"
+        current = datetime.now(timezone.utc)
+    rendered = current.strftime("%A, %B %d, %Y at %I:%M %p").replace(" 0", " ")
+    return (
+        f"Current local date/time: {rendered} ({timezone_name}). "
+        "Resolve relative dates like today, tomorrow, this Friday, and next week against this timestamp."
+    )
+
+
 def _render_user_query(
     query: str,
     *,
+    settings: Settings,
     agent_name: str,
     persona_summary: str,
     context_summary: str,
@@ -50,6 +264,8 @@ def _render_user_query(
     resume_checkpoint: Optional[CheckpointPayload],
 ) -> str:
     parts = []
+    routing_profile = task_routing_profile(query)
+    parts.append(_current_local_datetime_text(settings))
     if persona_summary.strip():
         parts.append(f"{agent_name} persona:\n{persona_summary.strip()[:1200]}")
     if durable_memories:
@@ -80,10 +296,17 @@ def _render_user_query(
             "You are running inside the dedicated hands worker. "
             "Prefer deterministic search/fetch tools for research first. "
             "Use browser tools only when a site actually requires interaction or the deterministic tools are insufficient. "
+            "If you cannot continue without a missing user answer, choice, or attachment, use pause_for_input instead of finishing with a plain question. "
             "If one public source blocks you or fails, skip it, note the warning, and continue with other sources. "
             "Do not fail the whole task just because one site returns 403/404/timeout. "
             "Keep actions bounded and leave clear intermediate state."
         )
+        parts.append(f"Task routing profile: {routing_profile.name}\n{routing_profile.summary}")
+        if routing_profile.instructions:
+            parts.append("Task-specific routing guidance:\n" + "\n".join(f"- {line}" for line in routing_profile.instructions))
+        direct_tool_mode = _direct_tool_mode_summary(query, routing_profile.name)
+        if direct_tool_mode:
+            parts.append("Direct-tool operating mode:\n" + direct_tool_mode)
     parts.append("User request:\n" + query)
     return "\n\n".join(parts)
 
@@ -119,8 +342,13 @@ async def run_agent(
     memories = durable_memories or []
     attachments = attachment_names or []
     effective_config = config or AgentConfig()
+    routing_profile = task_routing_profile(query)
+    allow_browser_tools = _should_expose_browser_tools(query, routing_profile.name)
+    allow_travel_browser_fallback = _should_expose_travel_browser_fallback(query, routing_profile.name)
+    structured_restaurant_task = _is_structured_restaurant_task(query, routing_profile.name)
     effective_query = _render_user_query(
         query,
+        settings=settings,
         agent_name=effective_config.agent_name,
         persona_summary=effective_config.persona_summary,
         context_summary=context_summary,
@@ -145,8 +373,10 @@ async def run_agent(
 
     if mode == "heavy":
         effective_query += (
-            "\n\nIf the user asks for a deliverable file such as a PDF, create it in the workspace before you finish. "
-            "Prefer concise, useful files over large raw dumps."
+            "\n\nDo not create PDF, TXT, CSV, spreadsheet, or other deliverable files unless the user explicitly asked for a file, report, export, or document. "
+            "If the user explicitly asks for a deliverable file such as a PDF, create it in the workspace before you finish. "
+            "Prefer concise, useful files over large raw dumps. "
+            "If you need the user to answer something before continuing, call pause_for_input."
         )
 
         def _browser_tool_warning(action: str, exc: Exception) -> str:
@@ -156,153 +386,689 @@ async def run_agent(
                 "Try another selector, another source, or continue with the information already gathered."
             )
 
-        @agent.tool
-        async def web_search(ctx: RunContext[AgentDependencies], task: str, max_results: int = 5) -> str:
-            """Use deterministic web search results before escalating to full browser automation."""
-            try:
-                result = await search_web(task, settings=ctx.deps.settings, max_results=max_results)
-            except Exception as exc:
-                logger.warning("web_search degraded task=%s error=%s", task, exc)
-                return sanitize_tool_output(
-                    f"DETERMINISTIC_SEARCH_UNAVAILABLE: search failed for '{task}' due to {exc}. "
-                    "Try another query or use the browser only if needed."
-                )
-            return sanitize_tool_output(result)
+        if not structured_restaurant_task:
+
+            @agent.tool
+            async def web_search(ctx: RunContext[AgentDependencies], task: str, max_results: int = 5) -> str:
+                """Use deterministic web search results before escalating to full browser automation."""
+                try:
+                    result = await search_web(task, settings=ctx.deps.settings, max_results=max_results)
+                except Exception as exc:
+                    logger.warning("web_search degraded task=%s error=%s", task, exc)
+                    return sanitize_tool_output(
+                        f"DETERMINISTIC_SEARCH_UNAVAILABLE: search failed for '{task}' due to {exc}. "
+                        "Try another query or use the browser only if needed."
+                    )
+                return sanitize_tool_output(result)
+
+            @agent.tool
+            async def fetch_web_page(ctx: RunContext[AgentDependencies], url: str, max_chars: int = 6000) -> str:
+                """Fetch and clean a public web page without opening a full browser."""
+                try:
+                    result = await fetch_page_content(url, max_chars=max_chars)
+                except Exception as exc:
+                    logger.warning("fetch_web_page degraded url=%s error=%s", url, exc)
+                    return sanitize_tool_output(
+                        f"PUBLIC_PAGE_FETCH_BLOCKED: could not fetch {url} due to {exc}. "
+                        "Skip this source, try another public source, or use browser tools only if interaction is truly needed.",
+                        limit=max_chars,
+                    )
+                return sanitize_tool_output(result, limit=max_chars)
+
+        if settings.skiplagged_mcp_enabled:
+
+            @agent.tool
+            async def travel_resolve_iata(ctx: RunContext[AgentDependencies], place: str) -> str:
+                """Resolve a city or airport phrase into an IATA code using Skiplagged. Prefer this before flight or car searches when the code is uncertain."""
+                try:
+                    result = await call_skiplagged_tool(
+                        ctx.deps.settings,
+                        tool_name="sk_resolve_iata",
+                        arguments={
+                            "input": place,
+                            "renderMode": "text",
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning("travel_resolve_iata degraded place=%s error=%s", place, exc)
+                    return sanitize_tool_output(
+                        f"TRAVEL_TOOL_UNAVAILABLE: could not resolve '{place}' to an IATA code because {exc}."
+                    )
+                return sanitize_tool_output(result)
+
+            @agent.tool
+            async def travel_search_flights(
+                ctx: RunContext[AgentDependencies],
+                origin: str,
+                destination: str,
+                departure_date: str,
+                return_date: str = "",
+                adults: int = 1,
+                fare_class: str = "economy",
+                max_results: int = 12,
+                sort: str = "value",
+            ) -> str:
+                """Search flights using Skiplagged MCP. Prefer this over opening flight websites directly."""
+                arguments: dict[str, object] = {
+                    "origin": origin,
+                    "destination": destination,
+                    "departureDate": departure_date,
+                    "adults": max(1, adults),
+                    "fareClass": fare_class,
+                    "limit": max(1, min(max_results, 25)),
+                    "sort": sort,
+                    "renderMode": "text",
+                }
+                if return_date.strip():
+                    arguments["returnDate"] = return_date
+                try:
+                    result = await call_skiplagged_tool(
+                        ctx.deps.settings,
+                        tool_name="sk_flights_search",
+                        arguments=arguments,
+                    )
+                except Exception as exc:
+                    logger.warning("travel_search_flights degraded origin=%s destination=%s error=%s", origin, destination, exc)
+                    try:
+                        fallback = await _run_travel_browser_fallback(
+                            settings=ctx.deps.settings,
+                            workspace=ctx.deps.workspace,
+                            task=(
+                                f"Find round-trip flights from {origin} to {destination} departing {departure_date} "
+                                + (f"and returning {return_date} " if return_date.strip() else "")
+                                + f"for {max(1, adults)} adult(s) in {fare_class}. "
+                                "Prefer nonstop or low-stop options when they are clearly better value. "
+                                "Summarize the best options with airline, times, duration, and price."
+                            ),
+                        )
+                    except Exception as fallback_exc:
+                        logger.warning(
+                            "travel_search_flights fallback degraded origin=%s destination=%s error=%s",
+                            origin,
+                            destination,
+                            fallback_exc,
+                        )
+                        return sanitize_tool_output(
+                            "TRAVEL_TOOL_UNAVAILABLE: Skiplagged flight search failed due to "
+                            f"{exc}. Browser fallback also failed due to {fallback_exc}."
+                        )
+                    return sanitize_tool_output(
+                        "TRAVEL_TOOL_UNAVAILABLE: Skiplagged flight search was unavailable, so browser fallback was used.\n\n"
+                        + fallback
+                    )
+                return sanitize_tool_output(result)
+
+            @agent.tool
+            async def travel_search_flexible_departures(
+                ctx: RunContext[AgentDependencies],
+                origin: str,
+                destination: str,
+                departure_date: str,
+                return_date: str = "",
+                sort: str = "date",
+            ) -> str:
+                """Check nearby departure dates using Skiplagged flex calendar data."""
+                arguments: dict[str, object] = {
+                    "origin": origin,
+                    "destination": destination,
+                    "departureDate": departure_date,
+                    "sort": sort,
+                    "renderMode": "text",
+                }
+                if return_date.strip():
+                    arguments["returnDate"] = return_date
+                try:
+                    result = await call_skiplagged_tool(
+                        ctx.deps.settings,
+                        tool_name="sk_flex_departure_calendar",
+                        arguments=arguments,
+                    )
+                except Exception as exc:
+                    logger.warning("travel_search_flexible_departures degraded origin=%s destination=%s error=%s", origin, destination, exc)
+                    return sanitize_tool_output(
+                        f"TRAVEL_TOOL_UNAVAILABLE: flexible departure search failed because {exc}."
+                    )
+                return sanitize_tool_output(result)
+
+            @agent.tool
+            async def travel_search_hotels(
+                ctx: RunContext[AgentDependencies],
+                city: str,
+                checkin: str,
+                checkout: str,
+                adults: int = 2,
+                rooms: int = 1,
+                max_results: int = 12,
+                sort: str = "value",
+            ) -> str:
+                """Search hotels using Skiplagged MCP. Prefer this over browsing hotel aggregators when a structured result is enough."""
+                try:
+                    result = await call_skiplagged_tool(
+                        ctx.deps.settings,
+                        tool_name="sk_hotels_search",
+                        arguments={
+                            "city": city,
+                            "checkin": checkin,
+                            "checkout": checkout,
+                            "numAdults": max(1, adults),
+                            "numRooms": max(1, rooms),
+                            "limit": max(1, min(max_results, 25)),
+                            "sort": sort,
+                            "renderMode": "text",
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning("travel_search_hotels degraded city=%s error=%s", city, exc)
+                    try:
+                        fallback = await _run_travel_browser_fallback(
+                            settings=ctx.deps.settings,
+                            workspace=ctx.deps.workspace,
+                            task=(
+                                f"Find hotels in {city} for check-in {checkin} and checkout {checkout} "
+                                f"for {max(1, adults)} adult(s) and {max(1, rooms)} room(s). "
+                                "Use Google Travel / Google Hotels first and summarize strong options with nightly price, total price, rating, and neighborhood."
+                            ),
+                        )
+                    except Exception as fallback_exc:
+                        logger.warning("travel_search_hotels fallback degraded city=%s error=%s", city, fallback_exc)
+                        return sanitize_tool_output(
+                            f"TRAVEL_TOOL_UNAVAILABLE: hotel search failed because {exc}. Browser fallback also failed because {fallback_exc}."
+                        )
+                    return sanitize_tool_output(
+                        "TRAVEL_TOOL_UNAVAILABLE: direct hotel search was unavailable, so browser fallback was used.\n\n"
+                        + fallback
+                    )
+                return sanitize_tool_output(result)
+
+            @agent.tool
+            async def travel_search_cars(
+                ctx: RunContext[AgentDependencies],
+                pickup_location: str,
+                pickup_date: str,
+                dropoff_date: str,
+                pickup_time: str = "10:00",
+                dropoff_time: str = "10:00",
+                dropoff_location: str = "",
+                max_results: int = 12,
+            ) -> str:
+                """Search rental cars using Skiplagged MCP."""
+                arguments: dict[str, object] = {
+                    "pickupLocation": pickup_location,
+                    "pickupDate": pickup_date,
+                    "pickupTime": pickup_time,
+                    "dropoffDate": dropoff_date,
+                    "dropoffTime": dropoff_time,
+                    "limit": max(1, min(max_results, 25)),
+                    "renderMode": "text",
+                }
+                if dropoff_location.strip():
+                    arguments["dropoffLocation"] = dropoff_location
+                try:
+                    result = await call_skiplagged_tool(
+                        ctx.deps.settings,
+                        tool_name="sk_cars_search",
+                        arguments=arguments,
+                    )
+                except Exception as exc:
+                    logger.warning("travel_search_cars degraded pickup_location=%s error=%s", pickup_location, exc)
+                    try:
+                        fallback = await _run_travel_browser_fallback(
+                            settings=ctx.deps.settings,
+                            workspace=ctx.deps.workspace,
+                            task=(
+                                f"Find rental cars for pickup in {pickup_location} on {pickup_date} at {pickup_time} "
+                                f"and dropoff on {dropoff_date} at {dropoff_time}"
+                                + (f" in {dropoff_location}" if dropoff_location.strip() else "")
+                                + ". Summarize strong options with company, vehicle class, cancellation terms if shown, and total price."
+                            ),
+                        )
+                    except Exception as fallback_exc:
+                        logger.warning("travel_search_cars fallback degraded pickup_location=%s error=%s", pickup_location, fallback_exc)
+                        return sanitize_tool_output(
+                            f"TRAVEL_TOOL_UNAVAILABLE: car rental search failed because {exc}. Browser fallback also failed because {fallback_exc}."
+                        )
+                    return sanitize_tool_output(
+                        "TRAVEL_TOOL_UNAVAILABLE: direct car-rental search was unavailable, so browser fallback was used.\n\n"
+                        + fallback
+                    )
+                return sanitize_tool_output(result)
+
+            if allow_travel_browser_fallback:
+
+                @agent.tool
+                async def travel_browser_fallback(
+                    ctx: RunContext[AgentDependencies],
+                    task: str,
+                    max_pages: int = 2,
+                    max_steps: int = 8,
+                ) -> str:
+                    """Use browser automation only after the direct travel tools fail or are unavailable. Keep the scope tight to flights, hotels, or rental cars."""
+                    try:
+                        result = await run_browser_task(
+                            (
+                                "Travel fallback mode. Use travel websites only because the direct travel tools were unavailable. "
+                                "Stay tightly scoped to the user's travel search, avoid wandering, and summarize the best options clearly.\n\n"
+                                + task
+                            ),
+                            max_pages=max_pages,
+                            max_steps=max_steps,
+                        )
+                    except Exception as exc:
+                        logger.warning("travel_browser_fallback degraded task=%s error=%s", task, exc)
+                        return sanitize_tool_output(
+                            f"TRAVEL_BROWSER_FALLBACK_UNAVAILABLE: browser fallback failed because {exc}."
+                        )
+                    return sanitize_tool_output(result)
+
+        if settings.restaurant_cli_enabled and workspace is not None:
+
+            @agent.tool
+            async def restaurant_find_availability(
+                ctx: RunContext[AgentDependencies],
+                query: str,
+                date: str,
+                party_size: int = 2,
+                provider: str = "resy",
+                city: str = "",
+                limit: int = 8,
+            ) -> str:
+                """Search for a restaurant venue and then fetch live availability for the best match in one step. Prefer this for restaurant reservation research."""
+                assert ctx.deps.workspace is not None
+                normalized_provider = normalize_restaurant_provider(provider)
+                search_args = [
+                    "search",
+                    query,
+                    "--limit",
+                    str(max(1, min(limit, 25))),
+                    "--provider",
+                    normalized_provider,
+                    "--agent",
+                ]
+                if city.strip():
+                    search_args.extend(["--city", city.strip()])
+                try:
+                    search_payload = await run_restaurant_cli_json(
+                        ctx.deps.settings,
+                        ctx.deps.workspace,
+                        *search_args,
+                        timeout_seconds=25,
+                    )
+                except Exception as exc:
+                    logger.warning("restaurant_find_availability search degraded query=%s provider=%s error=%s", query, provider, exc)
+                    return sanitize_tool_output(
+                        f"RESTAURANT_TOOL_UNAVAILABLE: restaurant search failed because {exc}."
+                    )
+                results = list(search_payload.get("results") or []) if isinstance(search_payload, dict) else []
+                failures = list(search_payload.get("failures") or []) if isinstance(search_payload, dict) else []
+                best_match = choose_best_restaurant_result(query, results)
+                if best_match is None:
+                    return sanitize_tool_output(
+                        f"I could not find a matching {normalized_provider.title()} venue for {query}."
+                    )
+                venue_id = str(best_match.get("id") or "").strip()
+                venue_name = str(best_match.get("name") or query).strip() or query
+                venue_city = str(best_match.get("city") or "").strip()
+                venue_url = str(best_match.get("url") or "").strip()
+                if not venue_id:
+                    return sanitize_tool_output(
+                        f"I found a likely match for {venue_name}, but I could not resolve a usable venue id for live availability."
+                    )
+                availability_args = [
+                    "availability",
+                    "--venue",
+                    venue_id,
+                    "--date",
+                    date,
+                    "--party",
+                    str(max(1, party_size)),
+                    "--provider",
+                    normalized_provider,
+                    "--agent",
+                ]
+                try:
+                    slots_payload = await run_restaurant_cli_json(
+                        ctx.deps.settings,
+                        ctx.deps.workspace,
+                        *availability_args,
+                        timeout_seconds=35,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "restaurant_find_availability availability degraded query=%s venue_id=%s provider=%s error=%s",
+                        query,
+                        venue_id,
+                        provider,
+                        exc,
+                    )
+                    return sanitize_tool_output(
+                        (
+                            f"I matched {venue_name}"
+                            + (f" in {venue_city}" if venue_city else "")
+                            + f" on {normalized_provider.title()}, but I could not verify live availability for {date}."
+                            + (f"\nBooking page: {venue_url}" if venue_url else "")
+                        )
+                    )
+                slots = slots_payload if isinstance(slots_payload, list) else []
+                lines = [
+                    f"Matched venue: {venue_name}"
+                    + (f" ({venue_city})" if venue_city else "")
+                    + f" on {normalized_provider.title()}",
+                ]
+                if venue_url:
+                    lines.append(f"Booking page: {venue_url}")
+                if slots:
+                    lines.append(f"Live availability for {date} for {max(1, party_size)} people:")
+                    for slot in slots[:12]:
+                        slot_time = str(slot.get('time') or '').strip()
+                        slot_type = str(slot.get('type') or '').strip()
+                        if slot_time:
+                            lines.append(f"- {slot_time}" + (f" ({slot_type})" if slot_type else ""))
+                else:
+                    lines.append(f"No live slots were returned for {date} for {max(1, party_size)} people.")
+                if failures:
+                    provider_labels = ", ".join(str(item.get("provider") or "provider") for item in failures[:3])
+                    lines.append(f"Other provider lookups also had issues: {provider_labels}.")
+                return sanitize_tool_output("\n".join(lines))
+
+            if not structured_restaurant_task:
+
+                @agent.tool
+                async def restaurant_search(
+                    ctx: RunContext[AgentDependencies],
+                    query: str,
+                    provider: str = "resy",
+                    city: str = "",
+                    limit: int = 10,
+                ) -> str:
+                    """Search restaurant venues with Resy by default. Use OpenTable only when explicitly requested."""
+                    assert ctx.deps.workspace is not None
+                    normalized_provider = normalize_restaurant_provider(provider)
+                    args = ["search", query, "--limit", str(max(1, min(limit, 25))), "--agent"]
+                    args.extend(["--provider", normalized_provider])
+                    if city.strip():
+                        args.extend(["--city", city.strip()])
+                    try:
+                        result = await run_restaurant_cli(
+                            ctx.deps.settings,
+                            ctx.deps.workspace,
+                            *args,
+                            timeout_seconds=25,
+                        )
+                    except Exception as exc:
+                        logger.warning("restaurant_search degraded query=%s provider=%s error=%s", query, provider, exc)
+                        return sanitize_tool_output(
+                            f"RESTAURANT_TOOL_UNAVAILABLE: restaurant search failed because {exc}."
+                        )
+                    return sanitize_tool_output(result)
+
+                @agent.tool
+                async def restaurant_availability(
+                    ctx: RunContext[AgentDependencies],
+                    venue_id: str,
+                    date: str,
+                    party_size: int = 2,
+                    provider: str = "resy",
+                ) -> str:
+                    """Look up restaurant reservation availability for a venue and date using restaurant-cli."""
+                    assert ctx.deps.workspace is not None
+                    normalized_provider = normalize_restaurant_provider(provider)
+                    args = [
+                        "availability",
+                        "--venue",
+                        venue_id,
+                        "--date",
+                        date,
+                        "--party",
+                        str(max(1, party_size)),
+                        "--provider",
+                        normalized_provider,
+                        "--agent",
+                    ]
+                    try:
+                        result = await run_restaurant_cli(
+                            ctx.deps.settings,
+                            ctx.deps.workspace,
+                            *args,
+                            timeout_seconds=35,
+                        )
+                    except Exception as exc:
+                        logger.warning("restaurant_availability degraded venue_id=%s provider=%s error=%s", venue_id, provider, exc)
+                        return sanitize_tool_output(
+                            f"RESTAURANT_TOOL_UNAVAILABLE: availability lookup failed because {exc}."
+                        )
+                    return sanitize_tool_output(result)
+
+            @agent.tool
+            async def restaurant_book_or_handoff(
+                ctx: RunContext[AgentDependencies],
+                venue_id: str,
+                date: str,
+                time: str,
+                party_size: int = 2,
+                provider: str = "resy",
+                slot_token: str = "",
+                notes: str = "",
+            ) -> str:
+                """Book a Resy reservation or return a manual OpenTable handoff URL. Use only after explicit user approval."""
+                assert ctx.deps.workspace is not None
+                normalized_provider = normalize_restaurant_provider(provider)
+                if normalized_provider == "opentable":
+                    return sanitize_tool_output(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "provider": "opentable",
+                                "handoff": True,
+                                "message": "OpenTable booking must be completed manually by the user.",
+                                "url": build_opentable_booking_url(
+                                    restaurant_id=venue_id,
+                                    date=date,
+                                    time=time,
+                                    party_size=max(1, party_size),
+                                ),
+                            }
+                        )
+                    )
+                args = [
+                    "book",
+                    "--venue",
+                    venue_id,
+                    "--date",
+                    date,
+                    "--time",
+                    time,
+                    "--party",
+                    str(max(1, party_size)),
+                    "--provider",
+                    normalized_provider,
+                    "--agent",
+                    "--idempotent",
+                ]
+                if slot_token.strip():
+                    args.extend(["--slot-token", slot_token.strip()])
+                if notes.strip():
+                    args.extend(["--notes", notes.strip()])
+                try:
+                    result = await run_restaurant_cli(
+                        ctx.deps.settings,
+                        ctx.deps.workspace,
+                        *args,
+                        timeout_seconds=45,
+                    )
+                except Exception as exc:
+                    logger.warning("restaurant_book_or_handoff degraded venue_id=%s provider=%s error=%s", venue_id, provider, exc)
+                    return sanitize_tool_output(
+                        f"RESTAURANT_TOOL_UNAVAILABLE: booking failed because {exc}."
+                    )
+                return sanitize_tool_output(result)
+
+            @agent.tool
+            async def restaurant_list_reservations(
+                ctx: RunContext[AgentDependencies],
+                provider: str = "resy",
+                upcoming_only: bool = True,
+            ) -> str:
+                """List existing reservations for the configured restaurant account. Currently most useful for Resy."""
+                assert ctx.deps.workspace is not None
+                args = ["list", "--provider", normalize_restaurant_provider(provider), "--agent"]
+                if upcoming_only:
+                    args.append("--upcoming")
+                try:
+                    result = await run_restaurant_cli(
+                        ctx.deps.settings,
+                        ctx.deps.workspace,
+                        *args,
+                        timeout_seconds=30,
+                    )
+                except Exception as exc:
+                    logger.warning("restaurant_list_reservations degraded provider=%s error=%s", provider, exc)
+                    return sanitize_tool_output(
+                        f"RESTAURANT_TOOL_UNAVAILABLE: reservation list failed because {exc}."
+                    )
+                return sanitize_tool_output(result)
+
+        if allow_browser_tools:
+
+            @agent.tool
+            async def web_browser_task(ctx: RunContext[AgentDependencies], task: str, max_pages: int = 3, max_steps: int = 12) -> str:
+                """Read live web pages when deterministic search/fetch is insufficient or browser interaction is required."""
+                bounded_pages = min(max(max_pages, 1), ctx.deps.settings.max_browser_pages)
+                bounded_steps = min(max(max_steps, 1), ctx.deps.settings.max_browser_steps)
+                try:
+                    return await _run_general_browser_task(
+                        settings=ctx.deps.settings,
+                        workspace=ctx.deps.workspace,
+                        task=task,
+                        max_pages=bounded_pages,
+                        max_steps=bounded_steps,
+                    )
+                except Exception as exc:
+                    logger.warning("web_browser_task degraded task=%s error=%s", task, exc)
+                    return sanitize_tool_output(
+                        "BROWSER_TASK_UNAVAILABLE: live browser reading failed for this step due to "
+                        f"{exc}. Try another source or finish with the information already gathered."
+                    )
 
         @agent.tool
-        async def fetch_web_page(ctx: RunContext[AgentDependencies], url: str, max_chars: int = 6000) -> str:
-            """Fetch and clean a public web page without opening a full browser."""
-            try:
-                result = await fetch_page_content(url, max_chars=max_chars)
-            except Exception as exc:
-                logger.warning("fetch_web_page degraded url=%s error=%s", url, exc)
-                return sanitize_tool_output(
-                    f"PUBLIC_PAGE_FETCH_BLOCKED: could not fetch {url} due to {exc}. "
-                    "Skip this source, try another public source, or use browser tools only if interaction is truly needed.",
-                    limit=max_chars,
-                )
-            return sanitize_tool_output(result, limit=max_chars)
+        async def pause_for_input(
+            ctx: RunContext[AgentDependencies],
+            question: str,
+            details: str = "",
+            summary: str = "",
+            current_step: str = "waiting_for_user_input",
+            resume_instructions: str = "",
+        ) -> str:
+            """Pause the heavy task when a missing user answer, choice, or attachment is required before you can continue."""
+            raise PauseForInputRequested(
+                question=question,
+                details=details,
+                summary=summary,
+                current_step=current_step,
+                resume_instructions=resume_instructions,
+            )
 
-        @agent.tool
-        async def web_browser_task(ctx: RunContext[AgentDependencies], task: str, max_pages: int = 3, max_steps: int = 12) -> str:
-            """Read live web pages when deterministic search/fetch is insufficient or browser interaction is required."""
-            bounded_pages = min(max(max_pages, 1), ctx.deps.settings.max_browser_pages)
-            bounded_steps = min(max(max_steps, 1), ctx.deps.settings.max_browser_steps)
-            try:
-                return await run_browser_use_task(
-                    task,
-                    max_pages=bounded_pages,
-                    max_steps=bounded_steps,
-                    settings=ctx.deps.settings,
-                    workspace=ctx.deps.workspace,
-                )
-            except Exception as exc:
-                logger.warning("web_browser_task degraded task=%s error=%s", task, exc)
-                return sanitize_tool_output(
-                    "BROWSER_TASK_UNAVAILABLE: live browser reading failed for this step due to "
-                    f"{exc}. Try another source or finish with the information already gathered."
-                )
+        if allow_browser_tools:
 
-        @agent.tool
-        async def browser_start(ctx: RunContext[AgentDependencies], start_url: str = "") -> str:
-            """Start a persistent browser session for multi-step website actions."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.start(start_url)
-            except Exception as exc:
-                return _browser_tool_warning("browser_start", exc)
+            @agent.tool
+            async def browser_start(ctx: RunContext[AgentDependencies], start_url: str = "") -> str:
+                """Start a persistent browser session for multi-step website actions."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.start(start_url)
+                except Exception as exc:
+                    return _browser_tool_warning("browser_start", exc)
 
-        @agent.tool
-        async def browser_navigate(ctx: RunContext[AgentDependencies], url: str) -> str:
-            """Navigate the persistent browser session to a URL."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.goto(url)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_navigate({url})", exc)
+            @agent.tool
+            async def browser_navigate(ctx: RunContext[AgentDependencies], url: str) -> str:
+                """Navigate the persistent browser session to a URL."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.goto(url)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_navigate({url})", exc)
 
-        @agent.tool
-        async def browser_click(ctx: RunContext[AgentDependencies], selector: str) -> str:
-            """Click an element in the persistent browser session using a CSS selector."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.click(selector)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_click({selector})", exc)
+            @agent.tool
+            async def browser_click(ctx: RunContext[AgentDependencies], selector: str) -> str:
+                """Click an element in the persistent browser session using a CSS selector."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.click(selector)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_click({selector})", exc)
 
-        @agent.tool
-        async def browser_type(ctx: RunContext[AgentDependencies], selector: str, text: str, submit: bool = False) -> str:
-            """Fill an input in the persistent browser session."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.type_text(selector, text, submit=submit)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_type({selector})", exc)
+            @agent.tool
+            async def browser_type(ctx: RunContext[AgentDependencies], selector: str, text: str, submit: bool = False) -> str:
+                """Fill an input in the persistent browser session."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.type_text(selector, text, submit=submit)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_type({selector})", exc)
 
-        @agent.tool
-        async def browser_press(ctx: RunContext[AgentDependencies], selector: str, key: str) -> str:
-            """Press a keyboard key on an element in the persistent browser session."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.press(selector, key)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_press({selector}, {key})", exc)
+            @agent.tool
+            async def browser_press(ctx: RunContext[AgentDependencies], selector: str, key: str) -> str:
+                """Press a keyboard key on an element in the persistent browser session."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.press(selector, key)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_press({selector}, {key})", exc)
 
-        @agent.tool
-        async def browser_read(ctx: RunContext[AgentDependencies], selector: str = "body", limit: int = 3500) -> str:
-            """Read visible text from the current page or a selector in the persistent browser session."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.read(selector=selector, limit=limit)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_read({selector})", exc)
+            @agent.tool
+            async def browser_read(ctx: RunContext[AgentDependencies], selector: str = "body", limit: int = 3500) -> str:
+                """Read visible text from the current page or a selector in the persistent browser session."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.read(selector=selector, limit=limit)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_read({selector})", exc)
 
-        @agent.tool
-        async def browser_wait_for_text(ctx: RunContext[AgentDependencies], text: str, timeout_seconds: int = 10) -> str:
-            """Wait for specific text to appear on the current page."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.wait_for_text(text=text, timeout_seconds=timeout_seconds)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_wait_for_text({text[:60]})", exc)
+            @agent.tool
+            async def browser_wait_for_text(ctx: RunContext[AgentDependencies], text: str, timeout_seconds: int = 10) -> str:
+                """Wait for specific text to appear on the current page."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.wait_for_text(text=text, timeout_seconds=timeout_seconds)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_wait_for_text({text[:60]})", exc)
 
-        @agent.tool
-        async def browser_upload_file(ctx: RunContext[AgentDependencies], selector: str, relative_path: str) -> str:
-            """Upload a workspace file through a file input selector."""
-            assert ctx.deps.browser is not None
-            assert ctx.deps.workspace is not None
-            try:
-                return await ctx.deps.browser.upload_file(selector, str(ctx.deps.workspace.resolve(relative_path)))
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_upload_file({selector}, {relative_path})", exc)
+            @agent.tool
+            async def browser_upload_file(ctx: RunContext[AgentDependencies], selector: str, relative_path: str) -> str:
+                """Upload a workspace file through a file input selector."""
+                assert ctx.deps.browser is not None
+                assert ctx.deps.workspace is not None
+                try:
+                    return await ctx.deps.browser.upload_file(selector, str(ctx.deps.workspace.resolve(relative_path)))
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_upload_file({selector}, {relative_path})", exc)
 
-        @agent.tool
-        async def browser_list_links(ctx: RunContext[AgentDependencies], limit: int = 20) -> str:
-            """List visible links on the current page."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.list_links(limit=limit)
-            except Exception as exc:
-                return _browser_tool_warning("browser_list_links", exc)
+            @agent.tool
+            async def browser_list_links(ctx: RunContext[AgentDependencies], limit: int = 20) -> str:
+                """List visible links on the current page."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.list_links(limit=limit)
+                except Exception as exc:
+                    return _browser_tool_warning("browser_list_links", exc)
 
-        @agent.tool
-        async def browser_screenshot(ctx: RunContext[AgentDependencies], relative_path: str = "browser/current-page.png", full_page: bool = True) -> str:
-            """Save a screenshot of the current page into the workspace."""
-            assert ctx.deps.browser is not None
-            try:
-                return await ctx.deps.browser.screenshot(relative_path=relative_path, full_page=full_page)
-            except Exception as exc:
-                return _browser_tool_warning(f"browser_screenshot({relative_path})", exc)
+            @agent.tool
+            async def browser_screenshot(ctx: RunContext[AgentDependencies], relative_path: str = "browser/current-page.png", full_page: bool = True) -> str:
+                """Save a screenshot of the current page into the workspace."""
+                assert ctx.deps.browser is not None
+                try:
+                    return await ctx.deps.browser.screenshot(relative_path=relative_path, full_page=full_page)
+                except Exception as exc:
+                    return _browser_tool_warning(f"browser_screenshot({relative_path})", exc)
 
-        @agent.tool
-        async def browser_close(ctx: RunContext[AgentDependencies]) -> str:
-            """Close the persistent browser session."""
-            assert ctx.deps.browser is not None
-            try:
-                await ctx.deps.browser.close()
-                return "Browser session closed."
-            except Exception as exc:
-                return _browser_tool_warning("browser_close", exc)
+            @agent.tool
+            async def browser_close(ctx: RunContext[AgentDependencies]) -> str:
+                """Close the persistent browser session."""
+                assert ctx.deps.browser is not None
+                try:
+                    await ctx.deps.browser.close()
+                    return "Browser session closed."
+                except Exception as exc:
+                    return _browser_tool_warning("browser_close", exc)
 
         if workspace is not None:
 
@@ -316,13 +1082,25 @@ async def run_agent(
             async def workspace_read_file(ctx: RunContext[AgentDependencies], relative_path: str, limit: int = 6000) -> str:
                 """Read a text-like workspace file."""
                 assert ctx.deps.workspace is not None
-                return ctx.deps.workspace.read_text(relative_path, limit=limit)
+                try:
+                    return ctx.deps.workspace.read_text(relative_path, limit=limit)
+                except FileNotFoundError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_FILE_NOT_FOUND: {relative_path} does not exist yet. "
+                        "List workspace files first, or write the file before reading it."
+                    )
 
             @agent.tool
             async def workspace_preview_file(ctx: RunContext[AgentDependencies], relative_path: str, rows: int = 10) -> str:
                 """Preview CSV, XLSX, PDF, JSON, or text content from the workspace."""
                 assert ctx.deps.workspace is not None
-                return ctx.deps.workspace.preview_table(relative_path, rows=rows)
+                try:
+                    return ctx.deps.workspace.preview_table(relative_path, rows=rows)
+                except FileNotFoundError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_FILE_NOT_FOUND: {relative_path} does not exist yet. "
+                        "List workspace files first, or write the file before previewing it."
+                    )
 
             @agent.tool
             async def workspace_convert_to_markdown(

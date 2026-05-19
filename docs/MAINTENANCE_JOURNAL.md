@@ -1,7 +1,81 @@
 # Maintenance Journal
 
+## 2026-05-18
+
+- Pulled the exact operator Telegram thread and converted the observed issues into a dedicated repo report:
+  - `docs/FRIDAY_MANUAL_VERIFICATION_REPORT_2026-05-18.md`
+- Captured the main operator-visible failures that still block a “stable” handoff:
+  - false spend/send confirmation prompts on harmless research/planning queries
+  - natural-language stop/cancel/reveal-findings UX still unreliable
+  - long-running tasks that appear to keep working without a satisfying finish
+  - confident restaurant identity mistakes before reservation search
+  - overconfident / weakly grounded answers on some research and architecture questions
+  - remaining internal/meta wording leaks in user-facing responses
+- Updated:
+  - `docs/FRIDAY_OPERATOR_BOARD.md`
+  - `docs/HANDOFF.md`
+  so future sessions treat those manual-verification findings as current P0/P1 work instead of drifting back into lower-level tool work alone.
+
+## 2026-05-17
+
+- Restored the intended Friday heavy-task topology after the shared-host detour:
+  - cleaned up the broken `friday-hands-worker` stack state after the IAM policy fix
+  - recreated the proper dedicated on-demand Friday worker
+  - confirmed the worker now runs as a separate `t3a.small` with `40 GiB` root disk instead of leaning on the shared Iris/VPN host
+- Added `docs/FRIDAY_AWS_SYSTEM_DESIGN.md` and wired it into the normal session read path so future AWS decisions stay aligned with the intended system design.
+- Updated `docs/AWS_COST_MODEL.md` to reflect the actual dedicated-worker architecture and the current raw monthly scenarios.
+- Fixed the worker image/runtime for the newer MCP stack:
+  - moved the worker to Node 22 so `mcp-remote` / Skiplagged no longer fail under the older Node 18 runtime
+  - kept Gmail disabled in live deployment because the dedicated Friday mailbox was blocked by Google
+  - continued with Firecrawl, Google Maps, and Skiplagged while leaving restaurant/account-verification flows on pause/resume fallback
+- Added a direct structured Skiplagged client in `agent/app/skiplagged.py` and wired typed travel tools into `agent/app/agent_core.py` for:
+  - `travel_resolve_iata`
+  - `travel_search_flights`
+  - `travel_search_flexible_departures`
+  - `travel_search_hotels`
+  - `travel_search_cars`
+- Added Skiplagged outage/rate-limit handling:
+  - detect `429`, `1015`, `retry_after`, and related upstream-rate-limit failures
+  - set a temporary outage window instead of hammering the upstream MCP/service repeatedly
+- Fixed worker/control-plane bookkeeping for exited heavy jobs:
+  - added a new internal worker job-status endpoint
+  - updated the broker to verify that a container exit produced a real terminal job state
+  - if the worker exits without reporting a terminal state, the broker now fails the job instead of leaving it silently stuck in `running`
+- Fixed worker workspace-read ergonomics so missing files degrade cleanly instead of crashing the travel flow when an agent checks for an output before writing it.
+- Deployed a new Lambda image with the paused-input/status UX cleanup and the worker-status verification endpoint:
+  - image tag: `20260517-lambda-ux-skiplagged-bg-181948`
+- Live-proved the direct Skiplagged travel stack through the Siri/worker path:
+  - flights: completed with `skiplagged-nyc-sfo-flights.txt`
+  - hotels: completed with `skiplagged-sfo-hotels.txt`
+  - rental cars: completed with `skiplagged-sfo-rental-cars.txt`
+- Live-proved the improved paused-input UX:
+  - paused tasks now render with readable sections (`What I need`, `Details`, `Status`)
+  - step names are humanized
+  - the reply instruction now explicitly says `Reply with 'answer: ...' to continue` and clarifies that a normal new request can start something else
+- Cleaned several stale validation jobs out of the control plane after earlier worker/runtime failures so task/status views are less misleading.
+- Current accepted live state at end of day:
+  - `Firecrawl`: proven
+  - `cablate` Google Maps path: proven
+  - `Skiplagged` flights / hotels / rental cars: proven
+  - `Gmail`: intentionally disabled
+  - `OpenTable` / `Resy`: not current production paths
+  - restaurant/account-gated work still depends on pause/resume rather than a finished connector-backed identity flow
+
 ## 2026-05-15
 
+- Replaced the intended Gmail mailbox direction:
+  - stopped treating the OAuth-style `@cablate/mcp-gmail` path as the target
+  - switched the repo to a headless IMAP/SMTP Gmail MCP plan using the dedicated Friday mailbox plus Gmail App Password authentication
+  - added `GMAIL_ACCOUNT_EMAIL` / `GMAIL_APP_PASSWORD` plumbing, kept the older Google OAuth fields only as legacy compatibility for now
+- Tightened the MCP security posture for the mailbox path:
+  - Gmail MCP registration now exposes inbox-read/search tools only
+  - send-email stays out of the default Friday tool surface until approval gating is implemented
+- Fixed the worker-runtime propagation gap so dedicated-worker containers can receive either direct MCP secrets or SSM parameter names for the newer MCP stack.
+- Fixed a real argument-order bug in `scripts/deploy-hands-worker.sh` where Browser-use settings were being shifted into the wrong installer parameters.
+- Added a new explicit backlog item for reminder management:
+  - Friday should eventually manage its own operational reminders
+  - later support normal user reminders like `remind me tomorrow about this`
+  - treat this as P3 after dashboard work, not current P1
 - Shifted the primary heavy-task browser substrate toward Browser-use instead of continuing to deepen the custom selector-driven Playwright layer.
 - Added a Friday-owned local workspace MCP server and registered it into Browser-use so file operations can go through a narrower tool surface than Browser-use's default file actions.
 - Added MarkItDown-backed workspace document conversion and wired it into the new workspace MCP/file flow.
@@ -14,6 +88,77 @@
 - Fixed the bad light-path DSML/tool-call leak by:
   - classifying reservation/availability/restaurant queries as heavy
   - auto-upgrading light-path internal-tool-markup leaks to heavy instead of returning garbage to Telegram/Siri
+- Added a first durable pause-for-input / human-in-the-loop resume path in repo:
+  - heavy jobs can now enter `paused_for_input`
+  - the worker preserves a checkpoint and asks only for the missing answer
+  - resume currently uses an explicit `answer: ...` reply or the requested attachment
+- Changed heavy-task artifact delivery defaults:
+  - Browser-use step screenshots are no longer uploaded/sent as default user-facing outputs
+  - explicit screenshot/image requests still allow screenshot delivery
+  - multiple requested screenshots are bundled into one zip for Telegram delivery
+- Added `docs/FRIDAY_OPERATOR_BOARD.md` as the operator-editable current-work/backlog/completed view for future Codex sessions.
+- Added a dedicated spec/backlog doc for future account identity and sign-up gating work:
+  - `docs/FRIDAY_ACCOUNT_IDENTITY_FLOW.md`
+  - captures the intended cached-email vs new-email choice
+  - records that password entry should go through a secure operator/dashboard surface backed by SSM, not through model-visible prompts
+- Realigned the operator board, handoff, security model, and auto-compact prompts around the next P1 execution order:
+  - finish operator validation of the shipped pause/resume and screenshot-delivery work
+  - build the hybrid common-use routing layer for spreadsheets, itinerary/maps, and booking/reservations
+  - review real connectors/MCPs only where they materially beat deterministic tools
+  - keep Browser-use as the interaction fallback rather than the default reader
+  - add login-wall and sign-up gating on top of the existing pause-for-input substrate
+- Added a first code pass for the hybrid routing layer:
+  - introduced task-routing profiles for spreadsheet/data, itinerary/maps, booking/commerce, and login/account tasks
+  - those profiles now influence heavy/light classification and heavy-task prompt guidance
+  - this is a routing/intention layer only, not yet the full connector-backed implementation
+- Added `docs/FRIDAY_CAPABILITIES_MATRIX.md` as the operator-visible capability contract, proof standard, and editable backlog for what Friday may actually promise.
+- Recorded the new file-surface direction:
+  - migrate from the narrow custom-only workspace MCP shape toward the official filesystem MCP server
+  - keep it scoped to allowed worker roots instead of exposing the full host filesystem
+- Implemented the first repo-side official filesystem MCP migration:
+  - the worker image now installs the official Node-based filesystem MCP server
+  - Browser-use now mounts the official filesystem MCP for broad file/directory tools
+  - the Friday helper MCP remains for preview, markdown conversion, and PDF generation
+  - the filesystem MCP is scoped to the task workspace root
+  - the Browser-use path falls back cleanly if either MCP server is unavailable
+- Added a dedicated MCP stack-plan doc and first isolation harness scaffold:
+  - `docs/FRIDAY_MCP_STACK_PLAN.md`
+  - `ops/mcp/docker-compose.trust-tiers.yml`
+  - records L1/L2/L3/L4 trust tiers
+  - records the full MCP/connector candidate set discussed so far
+  - records that Browser-use, filesystem, read-only network MCPs, and sensitive booking/identity MCPs should not remain a flat shared trust boundary
+- Recorded the currently selected next evaluation set:
+  - Resy
+  - OpenTable
+  - cablate Google Maps MCP
+  - Google Maps / Places / Routes via OpenAPI MCP
+  - dedicated Friday mailbox via Gmail/email MCP
+- Recorded the dedicated Friday mailbox direction:
+  - use a separate mailbox owned by the agent, not the operator's primary inbox
+  - operator can still monitor it directly from normal mail clients
+  - use it for verification emails, OTP fallback, and account-gated workflows
+  - exact Gmail/email MCP server choice still needs implementation verification
+- Added the first repo-side selected-candidate MCP wiring:
+  - Firecrawl MCP registration path
+  - cablate Google Maps MCP registration path
+  - Gmail MCP candidate registration path for a dedicated Friday mailbox
+  - worker image now includes the relevant npm packages for these candidates
+- Extended the repo-side selected-candidate MCP wiring from "candidate hooks" to concrete travel/booking runtime paths:
+  - added Google Maps / Places / Routes via OpenAPI MCP runtime settings and env shaping
+  - added Resy MCP runtime settings plus worker-image build of `Jpc54066/resy-mcp`
+  - added OpenTable MCP runtime settings using `@striderlabs/mcp-opentable`
+  - updated the trust-tier compose harness so maps-openapi, Resy, and OpenTable are concrete services instead of generic placeholders
+- Deployed the new Lambda image and refreshed the dedicated worker runtime in the live `iris` account.
+- Proved the new paused-input path end to end on the live dedicated-worker stack:
+  - Siri queued an underspecified reservation task
+  - the task entered `paused_for_input`
+  - the checkpoint stored a structured missing-input prompt
+  - a follow-up `answer: ...` request created a new heavy job with `resume_from_job_id`
+  - the resumed job claimed the worker and entered `running`
+- Confirmed the deployment fallback still matters:
+  - local Docker CLI was present but the local Docker daemon was unavailable
+  - Lambda deployment used a remote Docker build on the dedicated worker host, then a CloudFormation stack update with the new ECR image URI
+  - the worker runtime refresh needed a manual Docker restart and manual image rebuild after the scripted install path stalled in `docker build`
 - Proved the text-driven stop path end to end against a synthetic heavy task:
   - Siri created a heavy task
   - a text `stop 1` control request was accepted
@@ -22,6 +167,264 @@
   - Cloudflare / human-verification pages
   - heavy retail sites that crash or render blank result regions
   - good final synthesized reports paired with ugly intermediate screenshots from blocked pages
+
+### Change: durable pause-for-input state added to the heavy-task path
+
+- Goal:
+  - Stop long-running tasks from failing terminally when the agent genuinely needs one more user answer or attachment to continue.
+- Change:
+  - Added a first-class `paused_for_input` job status plus worker pause API handling.
+  - Added a heavy-mode `pause_for_input` tool so the agent can explicitly checkpoint and stop when it is blocked on missing user input.
+  - Updated Telegram and Siri routing so paused jobs return a clear prompt and resume from checkpoint/workspace state when the user replies with `answer: ...` or sends the requested attachment.
+  - Updated task/status handling so paused jobs show up in task listings and can be stopped cleanly without waiting on a live worker.
+  - Documented the new repo behavior in `docs/FRIDAY_AGENT.md`, `docs/FRIDAY_TOOL_SECURITY.md`, and `docs/HANDOFF.md`.
+- Result:
+  - The repo now has a durable HITL pause/resume path aligned with the current dedicated-worker architecture instead of another light-path prompt workaround.
+  - The first shipped resume UX is intentionally explicit and conservative:
+    - text reply: `answer: ...`
+    - file reply: send the requested attachment
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests` passed with `30 passed`.
+- Not yet validated live:
+  - real Telegram/Siri pause and resume behavior after deploy
+  - whether the explicit `answer: ...` contract should later be relaxed into a more automatic reply heuristic
+
+### Change: browser screenshot spam suppressed and operator board added
+
+- Goal:
+  - Reduce noisy Telegram artifact delivery and give the operator a simple repo-visible place to edit active work and backlog state.
+- Change:
+  - Added artifact filtering so Browser-use step screenshots are excluded from uploaded outputs unless the original request explicitly asks for screenshots/images.
+  - Updated Telegram completion delivery so explicitly requested multiple screenshots are sent as one zip instead of many separate documents.
+  - Stopped Browser-use from advertising saved screenshot paths in its synthesized result unless screenshots were explicitly requested.
+  - Added `docs/FRIDAY_OPERATOR_BOARD.md` and updated the handoff/session read order to include it.
+- Result:
+  - Default long-task completions should now send only the real deliverables such as PDFs, CSVs, and text reports.
+  - Operator-visible backlog/current/completed state is now editable in one markdown file instead of living only in handoff prose and journal entries.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests` passed with the new artifact tests included.
+- Not yet validated live:
+  - real Telegram delivery behavior for explicit screenshot requests versus default research/report tasks
+
+### Change: account identity / sign-up gating spec recorded
+
+- Goal:
+  - Preserve the intended future booking/account flow so later sessions do not improvise a weaker credential or sign-up pattern.
+- Change:
+  - Added `docs/FRIDAY_ACCOUNT_IDENTITY_FLOW.md` to capture the desired behavior for:
+    - pausing at sign-in/sign-up gates
+    - asking for cached identity vs new email
+    - supporting operator-provided `Hide My Email`
+    - keeping password entry in a secure operator/dashboard path backed by SSM
+    - requiring explicit approval before account creation submits
+  - Added the item to `docs/FRIDAY_OPERATOR_BOARD.md`, `docs/HANDOFF.md`, and `docs/FRIDAY_TOOL_SECURITY.md`.
+- Result:
+  - The repo now has a durable source of truth for this account-identity feature even though the supporting CRUD/dashboard/secret-entry implementation does not exist yet.
+- Validation:
+  - documentation-only change
+
+### Change: backlog and auto-compact prompts aligned to hybrid hands plan
+
+- Goal:
+  - Preserve the intended next-stage Friday execution order so future Codex sessions do not regress into browser-first work or treat unreviewed MCP suggestions as already-approved architecture.
+- Change:
+  - Updated `docs/FRIDAY_OPERATOR_BOARD.md` so current focus explicitly targets the hybrid common-use routing layer:
+    - spreadsheets / data outputs via workspace/file tools
+    - itinerary/maps via deterministic tools or vetted connectors
+    - reservations/commerce via vetted connectors when available, otherwise deterministic fetch first and Browser-use only for interaction
+    - login/sign-up walls must pause and ask
+  - Updated `docs/HANDOFF.md`, `docs/FRIDAY_AGENT.md`, and `docs/FRIDAY_TOOL_SECURITY.md` to reflect the same routing hierarchy and to record that named third-party MCPs are candidates, not approvals.
+  - Updated `SAY_THIS_WHEN_AUTO_COMPACT.md` and `docs/NEXT_CODEX_PROMPT.md` so future re-entry prompts carry the same P1 work order.
+- Result:
+  - The repo now has a durable operator-visible and auto-compact-visible statement of what "agent readiness" still means before final acceptance testing:
+    - validate shipped pause/resume and screenshot delivery
+    - build hybrid hands routing
+    - selectively add vetted connectors
+    - add login-wall/sign-up gating
+    - improve hostile-site browser handling only where still necessary
+- Validation:
+  - documentation-only change
+
+### Change: first task-routing-profile layer added for hybrid hands work
+
+- Goal:
+  - Start turning the hybrid-hands plan into runtime behavior by teaching Friday to distinguish common-use task types before it decides how to work.
+- Change:
+  - Added `TaskRoutingProfile` detection in `agent/app/routing.py` for:
+    - spreadsheet/data tasks
+    - itinerary/maps tasks
+    - booking/commerce tasks
+    - login/account-gated tasks
+  - Updated heavy/light classification so those task classes route to the heavy worker instead of being treated like generic light queries.
+  - Updated heavy-task prompt construction in `agent/app/agent_core.py` so the worker receives explicit task-specific routing guidance instead of only generic deterministic-first instructions.
+  - Added routing tests covering the new profiles and classifications.
+- Result:
+  - Friday now has a first explicit intent/routing layer for the hybrid tool strategy, which should reduce default browser drift on common-use tasks even before connector-specific work lands.
+  - The implementation is still intentionally shallow:
+    - it does not yet mount new connectors
+    - it does not yet add login-wall pausing logic automatically
+    - it does not yet encode per-profile execution metrics or observability
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests/test_routing.py agent/tests/test_status_requests.py` passed with `14 passed`.
+
+### Change: capability matrix and filesystem-MCP direction recorded
+
+- Goal:
+  - Make Friday's promised capabilities explicit and operator-editable, and avoid getting trapped later by an unnecessarily narrow file-tool decision.
+- Change:
+  - Added `docs/FRIDAY_CAPABILITIES_MATRIX.md` with:
+    - `Promised` / `Caveated` / `Backlog` / `Blocked` states
+    - proof standards for moving a capability into `Promised`
+    - the current matrix for research, files, spreadsheets, itinerary/maps, booking, commerce, and account-gated workflows
+    - an operator-editable backlog section
+  - Updated `docs/FRIDAY_OPERATOR_BOARD.md`, `docs/HANDOFF.md`, `docs/FRIDAY_AGENT.md`, `docs/FRIDAY_TOOL_SECURITY.md`, `SAY_THIS_WHEN_AUTO_COMPACT.md`, and `docs/NEXT_CODEX_PROMPT.md` to treat the matrix as part of the core session context.
+  - Recorded the explicit direction to adopt the official filesystem MCP server, but only within allowed worker roots rather than exposing the whole host.
+- Result:
+  - Friday now has a capability contract instead of only scattered handoff notes.
+  - Future sessions should treat broad filesystem capability inside the worker workspace as the intended direction and should validate it on real file/spreadsheet tasks before retiring the current narrow-only path.
+- Validation:
+  - documentation-only change
+
+### Change: official filesystem MCP mounted in repo worker path
+
+- Goal:
+  - Replace the narrow custom-only file surface with the official filesystem MCP server while keeping file access bounded to the isolated task workspace.
+- Change:
+  - Updated `hands/worker/Dockerfile` to install `nodejs`, `npm`, and the official `@modelcontextprotocol/server-filesystem` package in the worker image.
+  - Updated `agent/app/browser_use_runner.py` so Browser-use now mounts:
+    - the official filesystem MCP server for broad file and directory operations within the workspace root
+    - the Friday helper MCP for preview, markdown conversion, and PDF generation
+  - Added a small regression test for the filesystem MCP argument scoping in `agent/tests/test_browser_use_runner.py`.
+  - Updated the capability matrix, handoff docs, agent docs, security model, and re-entry prompts so they reflect that the repo now has the filesystem MCP path in code, but still needs deployment/live validation.
+- Result:
+  - Friday now has a repo-level path to use a production-grade filesystem MCP surface instead of relying only on the earlier narrow helper server.
+  - The scope remains bounded to the task workspace root, not the full host filesystem.
+  - MarkItDown and PDF/report helpers remain available through the helper MCP instead of being dropped during the migration.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests/test_browser_use_runner.py agent/tests/test_routing.py agent/tests/test_status_requests.py` passed with `15 passed`.
+- Not yet validated live:
+  - worker image rebuild and deployment with the new Node/npm filesystem MCP dependency
+  - real Browser-use task using the official filesystem MCP end to end in AWS
+
+### Change: MCP trust-tier stack plan and harness scaffold added
+
+- Goal:
+  - Turn the high-level "layered isolated MCPs" guidance into durable repo architecture so future work does not collapse all MCPs into one flat execution boundary.
+- Change:
+  - Added `docs/FRIDAY_MCP_STACK_PLAN.md` with:
+    - L1/L2/L3/L4 trust tiers
+    - the current MCP/connector inventory
+    - Gemini-discussed MCPs and Friday status
+    - the isolation harness plan
+    - the phased MCP program
+  - Added `ops/mcp/docker-compose.trust-tiers.yml` as the first compose-level harness scaffold for:
+    - filesystem MCP
+    - workspace helper MCP
+    - Firecrawl MCP
+    - maps OpenAPI MCP placeholder
+    - reservation MCP placeholder
+    - identity MCP placeholder
+  - Updated `docs/FRIDAY_TOOL_SECURITY.md`, `docs/FRIDAY_OPERATOR_BOARD.md`, `docs/HANDOFF.md`, `SAY_THIS_WHEN_AUTO_COMPACT.md`, and `docs/NEXT_CODEX_PROMPT.md` so the stack plan and trust-tier isolation are now part of normal session context.
+- Result:
+  - Friday now has an explicit MCP program with multiple candidates and a first isolation-harness artifact instead of only a generic "add some MCPs later" backlog note.
+  - The harness is still a scaffold, not a deployed production runtime:
+    - filesystem and Firecrawl entries are concrete
+    - maps, reservation, and identity entries are placeholders pending final server selection
+- Validation:
+  - `docker compose -f ops/mcp/docker-compose.trust-tiers.yml config` passed.
+- Not yet validated live:
+  - actual multi-container MCP runtime wiring into the dedicated worker path
+  - live output-quality comparison across Firecrawl, maps/travel, and reservation candidates
+
+### Change: dedicated Friday mailbox and selected travel/booking candidate set recorded
+
+- Goal:
+  - Turn the operator's preferred travel, booking, and mailbox directions into durable architecture choices instead of leaving them implicit in chat history.
+- Change:
+  - Updated `docs/FRIDAY_MCP_STACK_PLAN.md` so the selected next evaluation set explicitly includes:
+    - Resy
+    - OpenTable
+    - cablate Google Maps MCP
+    - Google Maps / Places / Routes via OpenAPI MCP
+    - a dedicated Friday mailbox via Gmail/email MCP
+  - Updated `docs/FRIDAY_ACCOUNT_IDENTITY_FLOW.md` so a dedicated Friday-owned mailbox is now a first-class identity option for account-gated workflows and verification handling.
+  - Updated `docs/FRIDAY_OPERATOR_BOARD.md` to reflect the selected evaluation set and the dedicated-mailbox requirement.
+  - Recorded one important verification caveat:
+    - the dedicated Gmail/mailbox architecture is accepted
+    - the exact Gmail/email MCP implementation still needs a concrete server choice and verification
+    - an "official Gmail MCP in the MCP reference repo" was not verified from primary sources in this session
+- Result:
+  - Future sessions now have a durable statement that Friday should grow toward:
+    - NYC-focused restaurant booking via Resy/OpenTable comparison
+    - maps/travel via Google Maps MCP/API comparison
+    - a dedicated agent-owned mailbox that both Friday and the operator can access
+- Validation:
+  - documentation-only change
+
+### Change: selected Firecrawl, maps, and mailbox MCP candidates wired into repo
+
+- Goal:
+  - Move the chosen read-only and mailbox candidates from "selected in docs" to "mountable in code" so the next deploy can validate them instead of starting from scratch.
+- Change:
+  - Expanded `agent/app/settings.py` with feature flags and secret parameters for:
+    - Firecrawl MCP
+    - Google Maps MCP
+    - Gmail MCP
+  - Refactored `agent/app/browser_use_runner.py` so Browser-use can now register optional MCP candidates for:
+    - Firecrawl
+    - cablate Google Maps
+    - Gmail mailbox access
+    in addition to the filesystem and helper MCPs.
+  - Updated `hands/worker/Dockerfile` to include npm installs for:
+    - `firecrawl-mcp`
+    - `@cablate/mcp-google-map`
+    - `@cablate/mcp-gmail`
+  - Updated `ops/mcp/docker-compose.trust-tiers.yml` so the trust-tier harness now contains concrete `google-maps-mcp` and `gmail-mcp` services instead of only placeholders.
+  - Added focused tests for the new MCP env-building helpers in `agent/tests/test_browser_use_runner.py`.
+- Result:
+  - The repo can now mount Firecrawl, Google Maps, and Gmail candidate MCPs through explicit settings/secrets rather than requiring another design round first.
+  - Resy/OpenTable are still selected targets but remain unwired until a concrete implementation choice is made.
+- Validation:
+  - `python3 -m py_compile agent/app/*.py hands/worker/runner.py` passed.
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests/test_browser_use_runner.py agent/tests/test_routing.py agent/tests/test_status_requests.py` passed with `18 passed`.
+  - `docker compose -f ops/mcp/docker-compose.trust-tiers.yml config` passed.
+- Not yet validated live:
+  - AWS deployment of the new worker image and settings
+  - real Firecrawl task quality
+  - real Google Maps itinerary task quality
+  - real dedicated-mailbox Gmail MCP behavior
+
+### Change: live deploy + resumable validation completed on `iris`
+
+- Goal:
+  - Move the new pause/resume and screenshot-delivery changes from repo-only to deployed/live-tested state.
+- Change:
+  - Built and pushed a new Lambda image remotely on the dedicated worker host because the local Docker daemon was unavailable.
+  - Updated the live `friday-agent` CloudFormation stack to image `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260515-pause-resume-remote-162800`.
+  - Refreshed the dedicated worker runtime on instance `i-0ba8310cd02e1c847` and manually rebuilt/restarted `friday-hands-broker` after the scripted install path stalled in `docker build`.
+- Result:
+  - `GET /health` returns `{"status":"ok"}` on the live Function URL after deploy.
+  - Live Siri validation proved:
+    - an underspecified reservation task enters `paused_for_input`
+    - the checkpoint contains a structured missing-input prompt
+    - an `answer: ...` follow-up creates a resumed heavy job linked by `resume_from_job_id`
+    - the resumed job claims the worker and enters `running`
+  - Explicit stop still works on the new runtime:
+    - an in-flight browser-heavy job was interrupted by control signal
+    - the resumed reservation job then claimed the worker as expected
+- Validation details:
+  - live pause job: `01714970-8a39-4c6d-a283-040dee3f98f9`
+  - live resumed job: `49573959-9feb-4e93-a5a8-b6b792485ae3`
+  - interrupted browser-heavy validation job: `8c20cc69-72fb-4832-b9c7-4c8d1f6098fc`
+- Remaining caveat:
+  - the new screenshot-suppression default is deployed, but this session did not capture a fully completed browser-heavy job proving the exact final Telegram file-delivery behavior end to end.
+- Backup note:
+  - `scripts/backup-agent-state.sh` hit the known IAM gap on `s3:GetBucketLocation`
+  - a manual metadata backup was still written under `backup/aws-agent/20260515-162622-manual`
 
 ### Change: dedicated worker path proved with resumable heavy-task execution
 

@@ -31,22 +31,58 @@ This is the current highest-priority work and should stay the focus until valida
    - `what's the status?`
    - `stop 1`
    - `stop <job id>`
-4. The next substantive P1 upgrade is durable pause-for-input, not more light-path prompt tricks.
-5. Continue runtime optimizations as real limitations are discovered, with special focus on browser anti-bot and challenge-heavy sites.
+4. Durable pause-for-input is now live and must be preserved as the base HITL substrate for the next stages.
+5. The next substantive P1 upgrade is an explicit hybrid tool-routing layer for common-use tasks, not deeper browser-first mechanics.
+6. Continue runtime optimizations as real limitations are discovered, with special focus on browser anti-bot and challenge-heavy sites only where deterministic tools and connectors are insufficient.
+7. Treat MCP/connectors as a layered isolated tool estate, not a flat set of equally trusted tools.
 
 ### P1 Remaining Work
 
-1. Add `paused_for_input` / human-in-the-loop resume instead of treating missing user input as terminal failure.
-2. Review and selectively add real MCP/app connectors for common use cases where they materially outperform browser automation:
-   - restaurant reservations / booking if a vetted connector is found
-   - any future commerce/travel/common-use connector only after security review
-3. Improve browser reliability on hostile domains:
+1. Finish operator validation of the now-live `paused_for_input` / human-in-the-loop resume UX before treating it as accepted production behavior.
+2. Build the explicit common-use routing hierarchy so Friday does not browse for work that should be deterministic:
+   - spreadsheets / data outputs -> filesystem MCP + local file/spreadsheet tools + MarkItDown where needed
+   - maps / itinerary / general fact gathering -> deterministic APIs, connectors, or deterministic search/fetch first
+   - booking / reservation / commerce tasks -> vetted connector if one is actually installed and approved, otherwise deterministic fetch first and Browser-use only for the interaction step
+3. Deploy and validate the current selected MCP/app comparison set for common use cases:
+   - Firecrawl MCP
+   - Skiplagged MCP for flights/hotels/rental cars
+   - cablate Google Maps MCP
+   - Google Maps / Places / Routes via OpenAPI MCP
+   - dedicated Friday mailbox via Gmail/email MCP
+   - later expand to other commerce/travel/common-use connectors after the same review/test loop
+4. Build tiered MCP isolation harnesses so:
+   - browser runtime
+   - filesystem/file-helper runtime
+   - read-only network MCPs
+   - sensitive booking/identity MCPs
+   do not all share the same blast radius
+5. Improve browser reliability on hostile domains:
    - Cloudflare / challenge pages
    - heavy retail SPAs
    - blank result bodies after JS load
    - screenshot quality / step artifact selection
-4. Decide whether to enable Browser Use Cloud, CAPTCHA support, or both for difficult sites.
-5. Move higher-risk MCP/tool classes toward per-tool container isolation instead of only the shared worker container boundary.
+6. Decide whether to enable Browser Use Cloud, CAPTCHA support, or both for difficult sites, but only after exhausting deterministic/API routes first.
+7. Move higher-risk MCP/tool classes toward per-tool container isolation instead of only the shared worker container boundary.
+8. Add a safe account identity / sign-up gating flow for booking and commerce tasks:
+   - pause at sign-in/sign-up gates
+   - let the operator choose cached identity vs new email
+   - keep password entry in a secure dashboard/operator surface, not the model prompt path
+   - require explicit approval before account creation submits
+9. Add login-wall pause/resume handling so account-gated sites stop at the correct decision point instead of failing or improvising.
+10. Replace the current OAuth-style Gmail MCP path with a headless IMAP/SMTP Gmail MCP using the dedicated Friday mailbox plus Gmail App Password authentication, then validate inbox/OTP reads live.
+11. Treat `Temporal + Stagehand + keep current Friday interfaces` as the current preferred v2 direction:
+   - keep Telegram and Siri as the interfaces
+   - keep Friday's current stop/pause/approval/status product semantics
+   - add durable execution for retries, waiting, reminders, and HITL pauses
+   - add a stronger browser interaction substrate for dynamic/hostile sites
+   - borrow resilience patterns from OpenClaw/Nanoclaw-style runtimes without replacing Friday with a monolithic always-on agent platform
+12. Close the manual-verification gaps in `docs/FRIDAY_MANUAL_VERIFICATION_REPORT_2026-05-18.md` before claiming Friday is stable enough for operator handoff:
+   - false approval prompts on harmless research/planning
+   - natural stop/cancel/reveal-findings UX
+   - long-running tasks that appear hung and then fail vaguely
+   - wrong restaurant identity resolution
+   - overconfident or weakly grounded research/architecture answers
+   - remaining internal/meta user-facing wording
 
 ### P2: Dashboard
 
@@ -77,6 +113,14 @@ This is intentionally deferred until the agent is working well and the dashboard
    - Iris backend
    - future FBA harness components that run on the same AWS footprint
 5. Do not do this reorg until P1 is validated and P2 is materially underway.
+
+### P3: Reminders
+
+After dashboard work is underway, Friday should grow a real reminder system:
+
+1. Friday should manage reminders about its own setup, expiring sessions, and operator follow-ups.
+2. Later, Friday should support user-facing reminders such as `remind me tomorrow about this`.
+3. Keep this behind P1/P2 work; do not let reminders preempt the current agent-readiness path.
 
 ## Current Defaults
 
@@ -111,7 +155,16 @@ This is intentionally deferred until the agent is working well and the dashboard
   - Cloudflare verification / anti-bot pages
   - retail site “page crashed” or blank result regions
   - successful final reports paired with ugly intermediate screenshots from blocked pages
+- For common-use tasks, Friday should follow this routing order:
+  - real connector or deterministic API when one exists and is vetted
+  - workspace MCP / MarkItDown / local structured file tools for files and spreadsheets
+  - deterministic search/fetch and page conversion for general web reading
+  - Browser-use only for interaction, login, form fill, confirmation, or unsupported flows
 - The current restaurant-reservation path does not yet have a vetted installed connector. Friday must use deterministic search/fetch first and browser fallback only when necessary.
+- The current active travel connector direction is Skiplagged for flights/hotels/rental cars; the old Google Flights browser path is not good enough.
+- Do not rely on the current LobeHub listing for `musemen-resy-mcp-server` as an install source. The listing points to a GitHub repo that currently 404s, so it is metadata only until a real source artifact appears.
+- Do not assume that named third-party MCP servers from external recommendations are production-worthy by default. Treat them as candidates that still need security review, maintenance review, and real-task validation in this stack.
+- The MCP/connector program should add multiple candidates where necessary, but they should be separated by trust tier and secret scope instead of all running as one flat tool surface.
 - Local Docker is not reliably available on this Mac session, so remote Docker builds on the dedicated worker have been used as the practical deployment path for recent Lambda image pushes.
 
 ## Current Working Sources
@@ -124,10 +177,14 @@ This is intentionally deferred until the agent is working well and the dashboard
 ## Immediate Next Steps
 
 1. Keep the Friday control-plane + dedicated-worker deployment path healthy.
-2. Prioritize pause-for-input / HITL resume for long-running tasks.
-3. Evaluate and review real reservation connectors before adding them.
-4. Improve hostile-site browser behavior instead of assuming Browser-use solved anti-bot completely.
-5. Only after the agent is stable enough, move to dashboard/P2 work.
+2. Work directly from `docs/FRIDAY_MANUAL_VERIFICATION_REPORT_2026-05-18.md` until the current manual-verification failures are closed.
+3. Finish live validation of the new screenshot-delivery defaults and zip behavior on a completed browser-heavy task.
+4. Implement the explicit hybrid tool-routing layer for common-use tasks so Friday stays deterministic-first.
+5. Deploy and validate the new official filesystem MCP worker path on real file/spreadsheet tasks.
+6. Build the first tiered MCP isolation harnesses for filesystem, helper, and read-only network MCPs.
+7. Deploy and validate the now-wired travel/maps candidates, with Skiplagged first, before narrowing any primary path.
+8. Improve hostile-site browser behavior instead of assuming Browser-use solved anti-bot completely.
+9. Only after the agent is stable enough, move to dashboard/P2 work.
 
 ## Backlog
 
@@ -136,16 +193,21 @@ This is intentionally deferred until the agent is working well and the dashboard
 3. Add a redacted shared-host inventory export so fresh agents can inspect the topology without touching secrets.
 4. Turn the Friday local stack into a preflighted, mostly one-command bootstrap with env-driven settings instead of hardcoded host-specific values in tracked files.
 5. After P1/P2, decide whether to consolidate the shared AWS systems into a monorepo and define the migration path for Git history, issues, and CI.
+6. Add reminder primitives only after dashboard/P2 surfaces exist for visibility and editability.
 
 ## Resume Checklist
 
 When returning to this repo in a future session:
 
 1. Read `SAY_THIS_WHEN_AUTO_COMPACT.md`
-2. Read `docs/CODEX_MAINTENANCE_LOOP.md`
-3. Read `docs/MAINTENANCE_JOURNAL.md`
-4. Read `docs/FRIDAY_AGENT.md`
-5. Read `docs/FRIDAY_TOOL_SECURITY.md`
-6. Read `docs/NEXT_CODEX_PROMPT.md`
-7. Run `./scripts/check-stack.sh`
-8. Read the logs before making claims
+2. Read `docs/FRIDAY_OPERATOR_BOARD.md`
+3. Read `docs/FRIDAY_CAPABILITIES_MATRIX.md`
+4. Read `docs/FRIDAY_MCP_STACK_PLAN.md`
+5. Read `docs/CODEX_MAINTENANCE_LOOP.md`
+6. Read `docs/MAINTENANCE_JOURNAL.md`
+7. Read `docs/FRIDAY_AGENT.md`
+8. Read `docs/FRIDAY_AWS_SYSTEM_DESIGN.md`
+9. Read `docs/FRIDAY_TOOL_SECURITY.md`
+10. Read `docs/NEXT_CODEX_PROMPT.md`
+11. Run `./scripts/check-stack.sh`
+12. Read the logs before making claims

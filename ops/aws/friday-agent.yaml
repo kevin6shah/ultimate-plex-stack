@@ -58,6 +58,45 @@ Parameters:
   BrowserUseApiKeyParam:
     Type: String
     Default: /friday/agent/browser-use-api-key
+  FirecrawlApiKeyParam:
+    Type: String
+    Default: /friday/agent/firecrawl-api-key
+  GoogleMapsApiKeyParam:
+    Type: String
+    Default: /friday/agent/google-maps-api-key
+  MapsOpenApiHeadersParam:
+    Type: String
+    Default: /friday/agent/maps-openapi-headers
+  MapsOpenApiAuthTokenParam:
+    Type: String
+    Default: /friday/agent/maps-openapi-auth-token
+  ResyApiKeyParam:
+    Type: String
+    Default: /friday/agent/resy-api-key
+  ResyAuthTokenParam:
+    Type: String
+    Default: /friday/agent/resy-auth-token
+  OpenTableEmailParam:
+    Type: String
+    Default: /friday/agent/opentable-email
+  OpenTablePasswordParam:
+    Type: String
+    Default: /friday/agent/opentable-password
+  GmailAccountEmailParam:
+    Type: String
+    Default: /friday/agent/gmail-account-email
+  GmailAppPasswordParam:
+    Type: String
+    Default: /friday/agent/gmail-app-password
+  GmailClientIdParam:
+    Type: String
+    Default: /friday/agent/gmail-client-id
+  GmailClientSecretParam:
+    Type: String
+    Default: /friday/agent/gmail-client-secret
+  GmailRefreshTokenParam:
+    Type: String
+    Default: /friday/agent/gmail-refresh-token
   TelegramBotTokenParam:
     Type: String
     Default: /friday/agent/telegram-bot-token
@@ -101,6 +140,49 @@ Parameters:
   BrowserUseCloudProxyCountryCode:
     Type: String
     Default: us
+  FirecrawlMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  SkiplaggedMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  SkiplaggedMcpCommand:
+    Type: String
+    Default: npx
+  SkiplaggedMcpArgs:
+    Type: String
+    Default: -y mcp-remote https://mcp.skiplagged.com/mcp
+  GoogleMapsMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  GoogleMapsEnabledTools:
+    Type: String
+    Default: ''
+  MapsOpenApiMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  MapsOpenApiSpecUrl:
+    Type: String
+    Default: ''
+  MapsOpenApiBaseUrl:
+    Type: String
+    Default: ''
+  ResyMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  OpenTableMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  GmailMcpEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
 
 Conditions:
   CreateRuntime: !Equals [!Ref BootstrapOnly, 'false']
@@ -276,6 +358,17 @@ Resources:
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DeepSeekApiKeyParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BraveSearchApiKeyParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${BrowserUseApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${FirecrawlApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleMapsApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MapsOpenApiHeadersParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MapsOpenApiAuthTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ResyApiKeyParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ResyAuthTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenTableEmailParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenTablePasswordParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailClientIdParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailClientSecretParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailRefreshTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramAllowedChatIdParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramWebhookSecretParam}'
@@ -341,11 +434,36 @@ Resources:
           DEEPSEEK_API_KEY_PARAM: !Ref DeepSeekApiKeyParam
           BRAVE_SEARCH_API_KEY_PARAM: !Ref BraveSearchApiKeyParam
           BROWSER_USE_API_KEY_PARAM: !Ref BrowserUseApiKeyParam
+          FIRECRAWL_API_KEY_PARAM: !Ref FirecrawlApiKeyParam
+          GOOGLE_MAPS_API_KEY_PARAM: !Ref GoogleMapsApiKeyParam
+          MAPS_OPENAPI_HEADERS_PARAM: !Ref MapsOpenApiHeadersParam
+          MAPS_OPENAPI_AUTH_TOKEN_PARAM: !Ref MapsOpenApiAuthTokenParam
+          RESY_API_KEY_PARAM: !Ref ResyApiKeyParam
+          RESY_AUTH_TOKEN_PARAM: !Ref ResyAuthTokenParam
+          OPENTABLE_EMAIL_PARAM: !Ref OpenTableEmailParam
+          OPENTABLE_PASSWORD_PARAM: !Ref OpenTablePasswordParam
+          GMAIL_ACCOUNT_EMAIL_PARAM: !Ref GmailAccountEmailParam
+          GMAIL_APP_PASSWORD_PARAM: !Ref GmailAppPasswordParam
+          GMAIL_CLIENT_ID_PARAM: !Ref GmailClientIdParam
+          GMAIL_CLIENT_SECRET_PARAM: !Ref GmailClientSecretParam
+          GMAIL_REFRESH_TOKEN_PARAM: !Ref GmailRefreshTokenParam
           BROWSER_USE_ENABLED: !Ref BrowserUseEnabled
           BROWSER_USE_CLOUD_ENABLED: !Ref BrowserUseCloudEnabled
           BROWSER_USE_MODEL: !Ref BrowserUseModel
           BROWSER_USE_CLOUD_MODEL: !Ref BrowserUseCloudModel
           BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE: !Ref BrowserUseCloudProxyCountryCode
+          FIRECRAWL_MCP_ENABLED: !Ref FirecrawlMcpEnabled
+          SKIPLAGGED_MCP_ENABLED: !Ref SkiplaggedMcpEnabled
+          SKIPLAGGED_MCP_COMMAND: !Ref SkiplaggedMcpCommand
+          SKIPLAGGED_MCP_ARGS: !Ref SkiplaggedMcpArgs
+          GOOGLE_MAPS_MCP_ENABLED: !Ref GoogleMapsMcpEnabled
+          GOOGLE_MAPS_ENABLED_TOOLS: !Ref GoogleMapsEnabledTools
+          MAPS_OPENAPI_MCP_ENABLED: !Ref MapsOpenApiMcpEnabled
+          MAPS_OPENAPI_SPEC_URL: !Ref MapsOpenApiSpecUrl
+          MAPS_OPENAPI_BASE_URL: !Ref MapsOpenApiBaseUrl
+          RESY_MCP_ENABLED: !Ref ResyMcpEnabled
+          OPENTABLE_MCP_ENABLED: !Ref OpenTableMcpEnabled
+          GMAIL_MCP_ENABLED: !Ref GmailMcpEnabled
           LOGFIRE_TOKEN_PARAM: !Ref LogfireTokenParam
           LOGFIRE_ENABLED: !Ref LogfireEnabled
           LOGFIRE_FULL_CONTENT: !Ref LogfireFullContent

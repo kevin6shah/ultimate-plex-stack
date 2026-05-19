@@ -20,7 +20,8 @@ class Workspace:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def resolve(self, relative_path: str) -> Path:
-        candidate = (self.root / relative_path).resolve()
+        raw_path = Path(relative_path)
+        candidate = raw_path.resolve() if raw_path.is_absolute() else (self.root / raw_path).resolve()
         if self.root not in candidate.parents and candidate != self.root:
             raise ValueError("path escapes workspace")
         return candidate

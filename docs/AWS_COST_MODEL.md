@@ -1,6 +1,6 @@
 # AWS Cost Model
 
-Last updated: `2026-05-15`
+Last updated: `2026-05-17`
 
 ## Purpose
 
@@ -17,15 +17,21 @@ Rules:
 
 ## Current Live Inventory
 
-Verified from the repo and the live AWS account on `2026-05-15`:
+Verified from the repo and the live AWS account on `2026-05-17`:
 
 - Shared host stack: `friday-shared-host`
 - Agent stack: `friday-agent`
+- Dedicated hands worker stack: `friday-hands-worker`
 - Region: `us-east-1`
 - AWS account: `301142908919`
 - Shared host instance type: `t3.micro`
 - Shared host root disk: `8 GiB gp3`
 - Shared host public IPv4: `1`
+- Dedicated hands worker instance type: `t3a.small`
+- Dedicated hands worker root disk: `40 GiB gp3`
+- Dedicated hands worker public IPv4: ephemeral, attached only while running
+- Dedicated hands worker current state: `running`
+- Dedicated hands worker instance ID: `i-0cb9e56a9479b1e6c`
 - Agent Lambda: `1`
 - Agent Lambda memory: `2048 MB`
 - Agent ECR repository: `friday-agent`
@@ -161,9 +167,11 @@ deepseek_task_cost =
 deepseek_monthly_cost = tasks_per_month * deepseek_task_cost
 ```
 
-## Current Architecture Cost
+## Current Baseline Architecture Cost
 
-This is the current live architecture as of `2026-05-15`, using the fixed 720-hour month and current live ECR storage.
+This is the current always-on baseline architecture as of `2026-05-17`, using the fixed 720-hour month and current live ECR storage.
+
+It intentionally excludes the dedicated on-demand worker runtime because that worker is meant to be modeled separately by running hours, not as always-on baseline spend.
 
 | Item | Formula | Monthly raw cost |
 |---|---|---:|
@@ -181,19 +189,19 @@ This is the current live architecture as of `2026-05-15`, using the fixed 720-ho
 | AWS Budgets monitoring | free | `$0.000` |
 | Internet egress | current modeled usage below first `100 GB/month` | `$0.000` |
 
-### Current raw monthly AWS cost
+### Current baseline raw monthly AWS cost
 
 ```text
 $12.566/month
 ```
 
-### Current paid-account monthly AWS cost after monthly always-free deductions
+### Current baseline paid-account monthly AWS cost after monthly always-free deductions
 
 ```text
 $12.566/month
 ```
 
-Reason: the monthly always-free deductions already reduce the variable serverless lines to zero. The remaining nonzero lines are the shared EC2 host, public IPv4, EBS, and current ECR image storage.
+Reason: the monthly always-free deductions already reduce the variable serverless lines to zero. The remaining nonzero baseline lines are the shared EC2 host, public IPv4, EBS, and current ECR image storage.
 
 ## Current Free-Plan Out-Of-Pocket View
 
@@ -225,7 +233,7 @@ $0.000/month
 
 What still matters operationally:
 
-- the raw architecture is consuming about `$12.566/month` of AWS value
+- the baseline always-on architecture is consuming about `$12.566/month` of AWS value
 - the migration before the free-plan expiry is mandatory if you want to preserve the `$0` out-of-pocket strategy
 - durable state must migrate with the account
 
@@ -239,7 +247,7 @@ AWS documents:
 
 ### Current credit-adjusted answer
 
-Given the live credit balance of `$120.00` and the current raw AWS burn estimate of `$12.566/month`:
+Given the live credit balance of `$120.00` and the current baseline raw AWS burn estimate of `$12.566/month`:
 
 ```text
 estimated credit runway = 120.000 / 12.566 = 9.55 months
@@ -247,7 +255,7 @@ estimated credit runway = 120.000 / 12.566 = 9.55 months
 
 That means:
 
-- if the current architecture stayed flat and all current AWS charges remained credit-eligible, the current credit balance is more than enough to cover the present raw AWS cost
+- if the current baseline architecture stayed flat and all current AWS charges remained credit-eligible, the current credit balance is more than enough to cover the present raw AWS cost
 - the expected out-of-pocket AWS cost right now is still:
 
 ```text
@@ -285,9 +293,11 @@ Reason:
 - current 6-month window ends: `2026-11-10`
 - the agent stack now includes a one-time Telegram reminder rule for `2026-10-26`
 
-## POC On Shared `t3.micro`
+## Shared-Host Only Comparison
 
-The current POC strategy keeps the hands on the shared `t3.micro` host. That adds functionality, but it does not add a second EC2 bill.
+This is the older shared-host-only comparison case.
+
+It is no longer the preferred Friday heavy-task architecture, but it remains useful as a cost baseline.
 
 If artifacts grow, add:
 
@@ -309,38 +319,55 @@ So a realistic shared-host POC with `5 GiB` of artifacts is:
 $12.566 + $0.115 = $12.681/month raw
 ```
 
-## Future Dedicated On-Demand Worker
+## Dedicated On-Demand Worker
 
-This is the likely next step if the shared-host hands prove useful.
+This is now the intended Friday heavy-task architecture.
 
 Assumptions:
 
 - keep the existing shared host
 - add one dedicated worker instance
 - worker type: `t3a.small`
-- worker disk: `20 GiB gp3`
+- worker disk: `40 GiB gp3`
 - public IPv4 only while the worker is running
 - worker runtime is measured in total running hours per month
 
 ### Worker incremental formula
 
 ```text
-worker_increment = (worker_hours * (0.0188 + 0.005)) + (20 * 0.08)
+worker_increment = (worker_hours * (0.0188 + 0.005)) + (40 * 0.08)
 ```
 
 ### Worker scenario table
 
 | Worker runtime | Incremental worker cost | Total monthly raw AWS cost |
 |---|---:|---:|
-| `30 h/month` | `$2.314` | `$14.880` |
-| `60 h/month` | `$3.028` | `$15.594` |
-| `120 h/month` | `$4.456` | `$17.022` |
-| `240 h/month` | `$7.312` | `$19.878` |
+| `30 h/month` | `$3.914` | `$16.480` |
+| `60 h/month` | `$4.628` | `$17.194` |
+| `120 h/month` | `$6.056` | `$18.622` |
+| `240 h/month` | `$8.912` | `$21.478` |
+
+### Worker always-on upper bound
+
+If the dedicated worker were left running all month with this `40 GiB` disk:
+
+```text
+(720 * (0.0188 + 0.005)) + (40 * 0.08) = $20.336/month worker-only
+```
+
+That would produce:
+
+```text
+$12.566 + $20.336 = $32.902/month raw total
+```
+
+This is intentionally not the target operating model.
 
 Interpretation:
 
 - if the worker is only used intermittently, this is cheaper than permanently upgrading the shared host
 - if the worker is running most of the month, the economics converge toward a bigger always-on instance
+- the `40 GiB` disk was chosen to support the real Playwright/MCP worker image build reliably, not to minimize pennies at the expense of repeated infra failure
 
 ## Future Horizontal Scaling
 
@@ -348,14 +375,14 @@ These examples assume:
 
 - current architecture stays in place
 - each additional worker is `t3a.small`
-- each worker has `20 GiB gp3`
+- each worker has `40 GiB gp3`
 - each worker runs `60 hours/month`
 
 | Worker count | Total monthly raw AWS cost |
 |---|---:|
-| `1` worker | `$15.594` |
-| `2` workers | `$18.622` |
-| `3` workers | `$21.650` |
+| `1` worker | `$17.194` |
+| `2` workers | `$21.822` |
+| `3` workers | `$26.450` |
 
 This is why the current plan is:
 
@@ -419,12 +446,12 @@ This section combines the current raw AWS cost with the DeepSeek scenarios above
 
 ## Full Project Cost: Dedicated On-Demand Worker + DeepSeek
 
-One `t3a.small` worker, `60 h/month`:
+One `t3a.small` worker with `40 GiB` disk, `60 h/month`:
 
 | Usage pattern | AWS raw with worker | DeepSeek baseline | DeepSeek conservative | Full total baseline | Full total conservative |
 |---|---:|---:|---:|---:|---:|
-| `5` heavy tasks/day | `$15.594` | `$9.765` | `$19.530` | `$25.359` | `$35.124` |
-| `10` heavy tasks/day | `$15.594` | `$19.530` | `$39.060` | `$35.124` | `$54.654` |
+| `5` heavy tasks/day | `$17.194` | `$9.765` | `$19.530` | `$26.959` | `$36.724` |
+| `10` heavy tasks/day | `$17.194` | `$19.530` | `$39.060` | `$36.724` | `$56.254` |
 
 ## Recommended DeepSeek Balance / Cap
 
@@ -497,26 +524,26 @@ credit_runway_months = remaining_credits_usd / monthly_raw_cost
 |---|---:|---:|
 | Current shared-host architecture | `$12.566` | `9.55 months` |
 | Shared host + `5 GiB` artifacts | `$12.681` | `9.46 months` |
-| Dedicated worker `30 h/month` | `$14.880` | `8.06 months` |
-| Dedicated worker `60 h/month` | `$15.594` | `7.70 months` |
-| Dedicated worker `120 h/month` | `$17.022` | `7.05 months` |
-| Dedicated worker `240 h/month` | `$19.878` | `6.04 months` |
-| Two workers, `60 h/month` each | `$18.622` | `6.44 months` |
-| Three workers, `60 h/month` each | `$21.650` | `5.54 months` |
+| Dedicated worker `30 h/month` | `$16.480` | `7.28 months` |
+| Dedicated worker `60 h/month` | `$17.194` | `6.98 months` |
+| Dedicated worker `120 h/month` | `$18.622` | `6.44 months` |
+| Dedicated worker `240 h/month` | `$21.478` | `5.59 months` |
+| Two workers, `60 h/month` each | `$21.822` | `5.50 months` |
+| Three workers, `60 h/month` each | `$26.450` | `4.54 months` |
 
 ### Runway interpretation
 
 - if runway is `> 6 months`, the current credit balance is enough to cover the current architecture beyond the next planned migration window
 - if runway falls below `6 months`, the current architecture can burn credits faster than the current six-month migration cadence
-- this is why a dedicated worker at `240 h/month` is the practical upper edge for staying near the six-month window on the current `$120` credit pool
+- this is why a dedicated worker with a realistic `40 GiB` disk should stay well below always-on use if the goal is to preserve the current six-month migration cushion
 
 ### Current conclusion
 
-With the current shared-host architecture and your reported `$120.00` remaining credits:
+With the current shared-host baseline architecture and your reported `$120.00` remaining credits:
 
 - yes, you are still in a good position
 - yes, the reported `$1.39` month-to-date usage is consistent with the model
-- yes, even the one-worker `t3a.small` path should still leave you with runway close to or above the current six-month migration cadence, as long as worker runtime stays well below always-on use
+- yes, the one-worker `t3a.small` path with a real `40 GiB` disk still fits within the current credit strategy if runtime stays meaningfully on-demand rather than always-on
 
 ## Migration Implications
 

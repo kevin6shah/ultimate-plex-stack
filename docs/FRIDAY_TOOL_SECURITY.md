@@ -61,31 +61,48 @@ The dedicated hands worker currently enforces:
 
 This is the baseline security posture for all future MCP-style tool servers too.
 
+The target tiered-MCP architecture is documented in `docs/FRIDAY_MCP_STACK_PLAN.md`, with the first harness scaffold in `ops/mcp/docker-compose.trust-tiers.yml`.
+
 ## Current MCP Usage
 
-Friday now uses a Friday-owned local workspace MCP server for browser/file handoff instead of exposing broad file-writing directly to the model.
+Friday now uses:
+- the official filesystem MCP server for broad file and directory operations inside allowed worker roots
+- a Friday-owned helper MCP server for preview, markdown conversion, and PDF generation
+
+Constraint:
+- broad file capability is allowed only inside explicit worker roots, not the full host filesystem.
 
 Current pattern:
 - Browser-use remains the primary browser/computer-use loop
 - Browser-use built-in file actions are excluded where Friday has safer equivalents
-- a Friday-owned stdio MCP server exposes only:
-  - list workspace files
-  - read workspace file
+- the official filesystem MCP handles broad file/directory operations
+- a Friday-owned stdio helper MCP exposes:
   - preview workspace file
-  - write workspace text file
   - convert workspace file to markdown
   - write workspace PDF report
 
-This keeps file operations inside a narrower, auditable surface while still letting Browser-use finish multi-step workflows.
+This keeps file operations inside a bounded worker-root scope while still giving Friday a broader, production-grade filesystem surface.
 
 Common-use MCP/app policy:
 - prefer real connectors for categories that have first-class tool support, such as flights and hotels
 - do not treat generic browser automation as equivalent to a reservation/booking connector when none is installed
 - if no production-worthy connector exists for a common use case, Friday should use deterministic search/fetch first and only escalate to browser interaction when needed
+- treat named third-party MCP servers from external recommendations as candidates, not approvals; they still need maintenance, security, and real-task review in this stack
+
+Current repo-wired candidate classes behind settings/secrets:
+- L2:
+  - Firecrawl MCP
+  - cablate Google Maps MCP
+  - Google Maps / Places / Routes via OpenAPI MCP
+- L4:
+  - Resy MCP path with session-token secrets
+  - OpenTable MCP path with credential secrets
+  - Gmail IMAP/SMTP MCP candidate for the dedicated Friday mailbox
 
 Current limitation:
 - these MCP tools currently run inside the already-isolated worker container, not yet in separate per-tool containers
 - per-tool container isolation remains the next hardening step for higher-risk tool classes
+- the long-term target should not leave the broad filesystem MCP in the same effective trust boundary as the browser runtime
 
 ## Deterministic-First Rule
 
@@ -101,6 +118,21 @@ Why:
 - cheaper
 - easier to retry deterministically
 - easier to sanitize before prompt exposure
+
+Common-use routing targets:
+
+- spreadsheets / data export:
+  - prefer local structured file tools and workspace MCP
+  - do not use a browser unless the source itself is browser-only
+- itinerary / maps / travel lookup:
+  - prefer deterministic APIs/connectors first
+  - use browser interaction only for unsupported flows or final confirmation steps
+- reservations / commerce:
+  - prefer a vetted connector only if one is actually installed and approved
+  - otherwise use deterministic fetch/search for availability research and reserve Browser-use for the interaction step
+- sign-in / sign-up walls:
+  - do not improvise autonomous account creation
+  - pause for input and/or approval at the decision point
 
 ## Secrets Firewall
 
@@ -135,6 +167,22 @@ The correct execution pattern is:
 2. send Telegram approval prompt
 3. resume only after explicit approval
 
+For non-destructive heavy tasks that are blocked on missing user input, the correct pattern is:
+1. write `PAUSED_FOR_INPUT` state with a checkpoint and resume instructions
+2. ask only for the missing answer/attachment
+3. resume from the saved checkpoint only after that input arrives
+
+For account creation / sign-up gates:
+1. pause at the sign-in/sign-up decision point
+2. ask whether to use a cached identity or a new operator-provided email
+3. require explicit approval before the account-creation submit step
+4. keep password entry outside the model prompt path and inside a secure operator surface backed by SSM or equivalent
+
+For mailbox tools specifically:
+1. prefer a headless IMAP/SMTP MCP plus Gmail App Password over desktop-browser OAuth flows inside the worker
+2. use the dedicated Friday mailbox only, not the operator's primary inbox
+3. keep outbound send-email capability disabled or approval-gated by default
+
 ## MCP Usage Rules
 
 If MCP servers are added later:
@@ -146,6 +194,11 @@ If MCP servers are added later:
 - wrap them behind Friday-owned adapters instead of exposing them directly to the model
 
 Official MCP reference servers should be treated as reference-quality components, not automatically as production-safe defaults.
+
+Connector/MCP evaluation policy:
+- add multiple candidates where the ecosystem is still unsettled
+- compare output quality, failure modes, and fallback behavior before choosing a primary
+- keep trust-tier isolation in place instead of giving all candidates identical access
 
 ## Logging Rules
 

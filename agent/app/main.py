@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import re
+import zipfile
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib.parse import quote
 from uuid import uuid4
@@ -14,6 +17,12 @@ from mangum import Mangum
 from pydantic import BaseModel
 
 from .agent_core import run_agent
+from .artifacts import (
+    is_browser_step_screenshot,
+    query_requests_browser_images,
+    query_requests_output_files,
+    visible_output_files,
+)
 from .jobs import (
     AgentConfig,
     AgentJob,
@@ -31,14 +40,19 @@ from .jobs import (
     WorkerCompleteRequest,
     WorkerFailureRequest,
     WorkerHeartbeat,
+    WorkerPauseRequest,
 )
-from .routing import classify_task, is_long_task
+from .routing import classify_task, is_long_task, task_routing_profile
 from .settings import settings
 from .storage import StateStore
 from .telegram import TelegramClient, parse_telegram_update
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+RUNNING_JOB_STALE_AFTER = timedelta(minutes=10)
+WAITING_JOB_STALE_AFTER = timedelta(minutes=15)
+ATTACHMENTS_READY_STALE_AFTER = timedelta(minutes=3)
 
 
 app = FastAPI(title="Friday Personal Agent")
@@ -143,6 +157,196 @@ def _is_resume_request(query: str) -> bool:
     return any(token in lowered for token in ("continue that task", "resume that task", "resume the task", "continue the task"))
 
 
+def _is_input_reply(query: str) -> bool:
+    normalized = query.strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith(("answer:", "answer ", "continue with ", "resume with "))
+
+
+def _strip_input_reply_prefix(query: str) -> str:
+    normalized = query.strip()
+    if not normalized:
+        return ""
+    return re.sub(r"^(answer\s*:?\s*|continue with\s+|resume with\s+)", "", normalized, flags=re.IGNORECASE).strip()
+
+
+def _plain_text_message(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\*\*(.*?)\*\*", r"\1", normalized)
+    normalized = re.sub(r"__(.*?)__", r"\1", normalized)
+    normalized = re.sub(r"`([^`]*)`", r"\1", normalized)
+    return normalized.strip()
+
+
+def _clean_user_facing_result(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+    cleaned = normalized
+    cleaned = re.sub(
+        r"(?is)^\s*(?:the page is dynamic/js rendered.*?|google flights requires javascript.*?|the site requires javascript.*?|the live price search tools and web sources aren't returning results right now.*?|ok,\s*search is currently unavailable.*?|let me be upfront about what i've found and present the best option from the structured data i already have\..*?)(?:\n\s*\n|$)",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?is)^\s*let me (?:work with what i already have.*?|compile the best info from what i have.*?|pull together what i know.*?|use what i've already gathered.*?)(?:\n\s*\n|$)",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?im)^\s*(?:based on my research,\s*)?(?:here(?:'s| is)\s+)(?:a clear summary(?: of)?|what i can tell you(?: so far)?|my summary(?: of)?|the full analysis(?: based on the data i've gathered)?|the analysis)[:\s-]*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?im)^\s*now i have a clear picture\.\s*let me summarize the findings against your criteria\.?\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?im)^\s*ok,\s*", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*>?\s*file saved:.*$", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*---\s*$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned or normalized
+
+
+def _parse_job_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _stale_active_job_error(job: AgentJob) -> str:
+    if job.status == JobStatus.RUNNING:
+        return "This task stopped making progress before it finished."
+    return "This task never started cleanly and was cleaned up after it stopped making progress."
+
+
+def _active_job_is_stale(job: AgentJob, *, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    if job.status == JobStatus.RUNNING:
+        reference = _parse_job_timestamp(job.last_heartbeat_at) or _parse_job_timestamp(job.created_at)
+        if reference is None:
+            return False
+        if (job.current_step or "") == "attachments_ready":
+            return now - reference > ATTACHMENTS_READY_STALE_AFTER
+        return now - reference > RUNNING_JOB_STALE_AFTER
+    if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
+        reference = _parse_job_timestamp(job.created_at)
+        if reference is None:
+            return False
+        return now - reference > WAITING_JOB_STALE_AFTER
+    return False
+
+
+def _refresh_stale_active_jobs(state: StateStore, jobs: list[AgentJob]) -> list[AgentJob]:
+    if not jobs:
+        return jobs
+    now = datetime.now(timezone.utc)
+    refreshed: list[AgentJob] = []
+    for job in jobs:
+        if _active_job_is_stale(job, now=now):
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped after losing progress",
+                error_message=_stale_active_job_error(job),
+            )
+            refreshed_job = state.get_job(job.job_id)
+            if refreshed_job is not None:
+                job = refreshed_job
+        refreshed.append(job)
+    return refreshed
+
+
+def _humanize_worker_failure(query: str, error_message: str, status: JobStatus) -> str:
+    normalized = _plain_text_message(error_message)
+    lowered = normalized.lower()
+    query_lowered = query.lower()
+
+    if status == JobStatus.INTERRUPTED and "stopped by user" in lowered:
+        return "I stopped that task."
+    if status == JobStatus.TIMED_OUT:
+        return "This task took too long and timed out before it finished."
+    if "request_limit of 50" in lowered or "would exceed the request_limit" in lowered:
+        if any(token in query_lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "google flights", "google travel")):
+            return "I hit an internal step limit while working through the travel search, so this run did not finish cleanly."
+        if any(token in query_lowered for token in ("restaurant", "reservation", "resy", "opentable", "booking")):
+            return "I hit an internal step limit while working through the reservation search, so this run did not finish cleanly."
+        return "I hit an internal step limit, so this run did not finish cleanly."
+    if "worker exited without reporting a terminal state" in lowered:
+        return "I hit an internal worker problem before the task finished."
+    if any(token in lowered for token in ("429", "1015", "rate limit", "rate-limited", "rate limited", "captcha", "access denied", "forbidden", "403")):
+        if any(token in query_lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "google flights", "google travel")):
+            return "Some live travel sources temporarily blocked or rate-limited access during this run, and the fallback paths still did not fully complete."
+        if any(token in query_lowered for token in ("restaurant", "reservation", "resy", "opentable", "booking")):
+            return "Some live booking sources temporarily blocked or rate-limited access during this run, and the fallback paths still did not fully complete."
+        return "Live web sources temporarily blocked or rate-limited access during this run."
+    if "timed out" in lowered:
+        return "This task timed out before it finished."
+    if "restaurant-cli timed out" in lowered:
+        return "The restaurant source took too long to respond, so this run did not finish cleanly."
+    if normalized:
+        return normalized
+    return "I hit an internal error before the task finished."
+
+
+def _humanize_step(step: str) -> str:
+    normalized = (step or "").strip()
+    if not normalized:
+        return ""
+    known = {
+        "waiting_for_user_input": "waiting for your reply",
+        "stopped by user": "stopped by you",
+        "approval received": "approval received",
+        "waiting_worker": "waiting for the worker",
+    }
+    if normalized in known:
+        return known[normalized]
+    return normalized.replace("_", " ").strip()
+
+
+def _humanize_status(status: JobStatus) -> str:
+    known = {
+        JobStatus.QUEUED: "queued",
+        JobStatus.WAITING_WORKER: "waiting for the worker",
+        JobStatus.RUNNING: "running",
+        JobStatus.WAITING_APPROVAL: "waiting for approval",
+        JobStatus.PAUSED_FOR_INPUT: "paused for your input",
+        JobStatus.CHECKPOINTED: "checkpointed",
+        JobStatus.INTERRUPTED: "interrupted",
+        JobStatus.TIMED_OUT: "timed out",
+        JobStatus.PAUSED_BUDGET: "paused for budget limits",
+        JobStatus.COMPLETED: "completed",
+        JobStatus.FAILED: "failed",
+    }
+    return known.get(status, status.value.replace("_", " "))
+
+
+def _looks_like_natural_input_reply(query: str) -> bool:
+    normalized = query.strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if _is_status_request(normalized) or _is_list_tasks_request(normalized) or _is_stop_request(normalized) or _is_resume_request(normalized):
+        return False
+    if any(lowered.startswith(prefix) for prefix in ("what ", "why ", "how ", "when ", "where ", "who ")):
+        return False
+    if normalized.endswith("?"):
+        return False
+    if classify_task(normalized) == TaskClass.HEAVY:
+        return False
+    if task_routing_profile(normalized).name != "general":
+        return False
+    return len(normalized) <= 220
+
+
 def _is_status_request(query: str) -> bool:
     normalized = query.strip().lower()
     if not normalized:
@@ -174,7 +378,66 @@ def _is_stop_request(query: str) -> bool:
     normalized = query.strip().lower()
     if not normalized:
         return False
-    return any(re.search(pattern, normalized) for pattern in (r"^\s*(stop|cancel|abort)\b", r"\b(stop|cancel|abort)\b.{0,20}\b(task|job)\b"))
+    patterns = (
+        r"^\s*(stop|cancel|abort)\b",
+        r"\b(stop|cancel|abort)\b.{0,20}\b(task|job|agent)\b",
+        r"\b(stop|cancel|abort)\b.{0,20}\b(this|that|it)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _is_stop_all_request(query: str) -> bool:
+    normalized = query.strip().lower()
+    if not normalized:
+        return False
+    patterns = (
+        r"\b(stop|cancel|abort)\b.{0,20}\b(all|everything)\b",
+        r"\b(stop|cancel|abort)\s+all\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _wants_findings_after_stop(query: str) -> bool:
+    normalized = query.strip().lower()
+    if not normalized:
+        return False
+    patterns = (
+        r"\b(any findings|what did it find|what did you find|show (?:me )?(?:the )?findings)\b",
+        r"\breveal\b.{0,30}\b(findings|results|what it found)\b",
+        r"\bstop\b.{0,30}\b(show|share|reveal)\b.{0,30}\b(findings|results|what it found)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _has_useful_partial_findings(summary: str) -> bool:
+    normalized = _plain_text_message(summary or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    generic_markers = (
+        "attachments downloaded",
+        "working through website steps",
+        "working through the task",
+        "running agent",
+        "workspace prepared",
+        "agent completed",
+        "interrupted: working through",
+    )
+    return not any(marker in lowered for marker in generic_markers)
+
+
+def _partial_findings_text(state: StateStore, job: AgentJob) -> str:
+    checkpoint = state.get_latest_checkpoint(job.job_id)
+    candidates = [
+        job.result_preview or "",
+        job.latest_checkpoint_summary or "",
+        checkpoint.summary if checkpoint else "",
+    ]
+    for candidate in candidates:
+        cleaned = _clean_user_facing_result(candidate)
+        if _has_useful_partial_findings(cleaned):
+            return cleaned[:1200]
+    return ""
 
 
 def _resume_query_text(query: str, resumable: Optional[AgentJob]) -> str:
@@ -190,6 +453,10 @@ def _resume_query_text(query: str, resumable: Optional[AgentJob]) -> str:
     if normalized in exact_resume_requests and resumable.query.strip():
         return resumable.query
     return query
+
+
+def _job_accepts_live_worker_updates(job: AgentJob) -> bool:
+    return job.status == JobStatus.RUNNING
 
 
 def _remember_if_tagged(state: StateStore, *, user_id: str, query: str) -> bool:
@@ -220,14 +487,19 @@ def _latest_status_job_for_user(state: StateStore, *, source: JobSource, user_id
         JobStatus.WAITING_WORKER,
         JobStatus.QUEUED,
         JobStatus.WAITING_APPROVAL,
+        JobStatus.PAUSED_FOR_INPUT,
         JobStatus.CHECKPOINTED,
         JobStatus.INTERRUPTED,
         JobStatus.PAUSED_BUDGET,
         JobStatus.TIMED_OUT,
     )
-    active = state.get_latest_job_for_user(source=source.value, user_id=user_id, statuses=active_statuses)
-    if active is not None:
-        return active
+    active = _refresh_stale_active_jobs(
+        state,
+        state.list_jobs_for_user(source=source.value, user_id=user_id, statuses=active_statuses, limit=10),
+    )
+    for job in active:
+        if job.status in active_statuses:
+            return job
     recent_statuses = (
         JobStatus.COMPLETED,
         JobStatus.FAILED,
@@ -236,7 +508,7 @@ def _latest_status_job_for_user(state: StateStore, *, source: JobSource, user_id
 
 
 def _active_jobs_for_user(state: StateStore, *, source: JobSource, user_id: str) -> list[AgentJob]:
-    return state.list_jobs_for_user(
+    jobs = state.list_jobs_for_user(
         source=source.value,
         user_id=user_id,
         statuses=(
@@ -244,9 +516,83 @@ def _active_jobs_for_user(state: StateStore, *, source: JobSource, user_id: str)
             JobStatus.WAITING_WORKER,
             JobStatus.QUEUED,
             JobStatus.WAITING_APPROVAL,
+            JobStatus.PAUSED_FOR_INPUT,
         ),
         limit=10,
     )
+    refreshed = _refresh_stale_active_jobs(state, jobs)
+    return [
+        job
+        for job in refreshed
+        if job.status in {JobStatus.RUNNING, JobStatus.WAITING_WORKER, JobStatus.QUEUED, JobStatus.WAITING_APPROVAL, JobStatus.PAUSED_FOR_INPUT}
+    ]
+
+
+def _latest_paused_input_job_for_user(state: StateStore, *, source: JobSource, user_id: str) -> Optional[AgentJob]:
+    return state.get_latest_job_for_user(
+        source=source.value,
+        user_id=user_id,
+        statuses=(JobStatus.PAUSED_FOR_INPUT,),
+    )
+
+
+def _checkpoint_input_prompt(checkpoint: Optional[CheckpointPayload]) -> tuple[str, str]:
+    if checkpoint is None:
+        return "", ""
+    metadata = checkpoint.metadata or {}
+    question = str(metadata.get("input_question", "")).strip()
+    details = str(metadata.get("input_details", "")).strip()
+    return question, details
+
+
+def _paused_input_reply_text(state: StateStore, job: AgentJob) -> str:
+    checkpoint = state.get_latest_checkpoint(job.job_id)
+    question, details = _checkpoint_input_prompt(checkpoint)
+    summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
+    step = _humanize_step(job.current_step or (checkpoint.current_step if checkpoint else "") or "")
+    question = _plain_text_message(question)
+    details = _plain_text_message(details)
+
+    lines = ["Your latest task is paused and waiting for your input."]
+    if question:
+        lines.extend(["", "What I need:", question])
+    if details:
+        lines.extend(["", "Details:", details])
+    status_lines: list[str] = []
+    if step:
+        status_lines.append(f"Current step: {step}")
+    if summary:
+        status_lines.append(f"Latest update: {summary}")
+    if status_lines:
+        lines.extend(["", "Status:"])
+        lines.extend(status_lines)
+    lines.extend(
+        [
+            "",
+            "Reply with 'answer: ...' to continue.",
+            "If you want to start something new instead, just ask normally.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_paused_input_resume_query(
+    paused_job: AgentJob,
+    checkpoint: Optional[CheckpointPayload],
+    reply_text: str,
+    *,
+    has_attachment: bool = False,
+) -> str:
+    parts = [paused_job.query.strip(), "Resume the task from the prior paused-for-input checkpoint."]
+    if checkpoint is not None and checkpoint.resume_instructions.strip():
+        parts.append("Previous resume instructions:\n" + checkpoint.resume_instructions[:3000])
+    normalized_reply = reply_text.strip()
+    if normalized_reply:
+        parts.append("New user input:\n" + normalized_reply[:3000])
+    if has_attachment:
+        parts.append("The user also provided the requested attachment in this resumed run.")
+    parts.append("Continue from the saved workspace state. Do not ask the same question again unless the new input is still insufficient.")
+    return "\n\n".join(part for part in parts if part)
 
 
 def _format_tasks_list(state: StateStore, jobs: list[AgentJob]) -> str:
@@ -254,9 +600,9 @@ def _format_tasks_list(state: StateStore, jobs: list[AgentJob]) -> str:
         return "I do not see any active long-running tasks right now."
     lines = ["Here are your current long-running tasks:"]
     for index, job in enumerate(jobs, start=1):
-        summary = (job.latest_checkpoint_summary or "").strip()
-        step = (job.current_step or "").strip()
-        line = f"{index}. {job.job_id[:8]} - {job.status.value}"
+        summary = _plain_text_message(job.latest_checkpoint_summary or "")
+        step = _humanize_step(job.current_step or "")
+        line = f"{index}. {job.job_id[:8]} - {_humanize_status(job.status)}"
         if step:
             line += f" - {step}"
         elif summary:
@@ -281,17 +627,75 @@ def _resolve_stop_target(query: str, jobs: list[AgentJob]) -> Optional[AgentJob]
         index = int(ordinal_match.group(1)) - 1
         if 0 <= index < len(jobs):
             return jobs[index]
-    if any(token in lowered for token in ("latest", "last", "that")):
+    running_or_pending = [
+        job
+        for job in jobs
+        if job.status in {JobStatus.RUNNING, JobStatus.WAITING_WORKER, JobStatus.QUEUED, JobStatus.WAITING_APPROVAL}
+    ]
+    non_paused = [job for job in jobs if job.status != JobStatus.PAUSED_FOR_INPUT]
+    if any(
+        phrase in lowered
+        for phrase in (
+            "latest",
+            "last",
+            "that",
+            "this task",
+            "this job",
+            "cancel this",
+            "stop this",
+            "abort this",
+        )
+    ):
+        if running_or_pending:
+            return running_or_pending[0]
         return jobs[0]
+    if len(running_or_pending) == 1:
+        return running_or_pending[0]
+    if len(non_paused) == 1:
+        return non_paused[0]
     return jobs[0] if len(jobs) == 1 else None
+
+
+def _stop_jobs(state: StateStore, jobs: list[AgentJob]) -> tuple[int, int]:
+    stopped_now = 0
+    signaled = 0
+    for job in jobs:
+        if _active_job_is_stale(job):
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped after losing progress",
+                error_message=_stale_active_job_error(job),
+            )
+            stopped_now += 1
+            continue
+        if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER, JobStatus.WAITING_APPROVAL, JobStatus.PAUSED_FOR_INPUT}:
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped by user",
+                error_message="stopped by user",
+            )
+            stopped_now += 1
+        elif job.status == JobStatus.RUNNING:
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped by user",
+                error_message="stopped by user",
+            )
+            state.record_control_signal(job.job_id, command=ControlCommand.STOP, note="stopped by user")
+            stopped_now += 1
+            signaled += 1
+    return stopped_now, signaled
 
 
 def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
     if job is None:
         return "I do not see a recent long-running task to report on."
     checkpoint = state.get_latest_checkpoint(job.job_id)
-    summary = (job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "").strip()
-    step = (job.current_step or (checkpoint.current_step if checkpoint else "") or "").strip()
+    summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
+    step = _humanize_step(job.current_step or (checkpoint.current_step if checkpoint else "") or "")
     step_line = f"\nCurrent step: {step}" if step else ""
     summary_line = f"\nLatest update: {summary}" if summary else ""
     if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
@@ -300,9 +704,11 @@ def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
         return f"Still working on your latest task.{step_line}{summary_line}".strip()
     if job.status == JobStatus.WAITING_APPROVAL:
         return f"Your latest task is waiting for approval.{step_line}{summary_line}".strip()
+    if job.status == JobStatus.PAUSED_FOR_INPUT:
+        return _paused_input_reply_text(state, job)
     if job.status in {JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT}:
         tail = " Say 'resume that task' when you want me to continue."
-        return f"Your latest task is {job.status.value}.{step_line}{summary_line}{tail}".strip()
+        return f"Your latest task is {_humanize_status(job.status)}.{step_line}{summary_line}{tail}".strip()
     if job.status == JobStatus.PAUSED_BUDGET:
         return f"Your latest task is paused because of budget limits.{step_line}{summary_line}".strip()
     if job.status == JobStatus.COMPLETED:
@@ -313,7 +719,7 @@ def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
     if job.status == JobStatus.FAILED:
         error = (job.error_message or "no error details were recorded").strip()
         return f"Your latest task failed. Error: {error[:800]}".strip()
-    return f"Your latest task is {job.status.value}.{step_line}{summary_line}".strip()
+    return f"Your latest task is {_humanize_status(job.status)}.{step_line}{summary_line}".strip()
 
 
 def _artifacts_prefix(job_id: str) -> str:
@@ -323,6 +729,18 @@ def _artifacts_prefix(job_id: str) -> str:
 def _artifact_key(job_id: str, kind: str, file_name: str) -> str:
     safe_name = quote(file_name, safe="._-() ").replace("%20", "_")
     return f"{_artifacts_prefix(job_id)}/{kind}/{safe_name}"
+
+
+def _zip_artifact_bundle_name(job: AgentJob) -> str:
+    return f"{job.job_id[:8]}-browser-screenshots.zip"
+
+
+def _build_zip_bytes(files: list[tuple[str, bytes]]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_name, content in files:
+            archive.writestr(file_name, content)
+    return buffer.getvalue()
 
 
 def _auth_owner_key_from_siri() -> str:
@@ -558,7 +976,32 @@ async def recent_context(x_friday_siri_key: Optional[str] = Header(default=None)
 async def worker_health(x_friday_siri_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
     expected_key = settings.secret(settings.siri_api_key_param)
     _auth_or_401(expected_key, x_friday_siri_key)
-    active = store().list_jobs(statuses=(JobStatus.RUNNING, JobStatus.WAITING_WORKER, JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED), limit=10)
+    state = store()
+    active = _refresh_stale_active_jobs(
+        state,
+        state.list_jobs(
+            statuses=(
+                JobStatus.RUNNING,
+                JobStatus.WAITING_WORKER,
+                JobStatus.QUEUED,
+                JobStatus.WAITING_APPROVAL,
+                JobStatus.PAUSED_FOR_INPUT,
+            ),
+            limit=10,
+        ),
+    )
+    active = [
+        job
+        for job in active
+        if job.status
+        in {
+            JobStatus.RUNNING,
+            JobStatus.WAITING_WORKER,
+            JobStatus.QUEUED,
+            JobStatus.WAITING_APPROVAL,
+            JobStatus.PAUSED_FOR_INPUT,
+        }
+    ]
     return {"active_jobs": [job.model_dump() for job in active]}
 
 
@@ -592,7 +1035,7 @@ async def stop_job(job_id: str, x_friday_siri_key: Optional[str] = Header(defaul
     job = state.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
+    if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER, JobStatus.WAITING_APPROVAL, JobStatus.PAUSED_FOR_INPUT}:
         state.update_job_status(job_id, status=JobStatus.INTERRUPTED, current_step="stopped by user", error_message="stopped by user")
         return {"status": "ok"}
     state.record_control_signal(job_id, command=ControlCommand.STOP, note="stopped by user")
@@ -688,15 +1131,39 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             task_class=TaskClass.LIGHT,
         )
         jobs = _active_jobs_for_user(state, source=JobSource.TELEGRAM, user_id=user_id)
-        target = _resolve_stop_target(query, jobs)
-        if target is None:
-            reply = "I could not tell which running task to stop. Ask me to list your tasks, then say something like 'stop 1' or 'stop <job id>'."
-        elif target.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
-            state.update_job_status(target.job_id, status=JobStatus.INTERRUPTED, current_step="stopped by user", error_message="stopped by user")
-            reply = f"Stopped task {target.job_id[:8]} before it started running."
+        if _is_stop_all_request(query):
+            stopped_now, signaled = _stop_jobs(state, jobs)
+            total = stopped_now + signaled
+            if total == 0:
+                reply = "I do not see any active long-running tasks to stop right now."
+            elif signaled and stopped_now:
+                reply = f"Stopping {total} tasks now. {stopped_now} were stopped immediately and {signaled} running task{'s were' if signaled != 1 else ' was'} asked to stop."
+            elif signaled:
+                reply = f"Stopping {signaled} running task{'s' if signaled != 1 else ''} now."
+            else:
+                reply = f"Stopped {stopped_now} task{'s' if stopped_now != 1 else ''}."
         else:
-            state.record_control_signal(target.job_id, command=ControlCommand.STOP, note="stopped by user")
-            reply = f"I asked the worker to stop task {target.job_id[:8]}. I will update you when it is interrupted."
+            target = _resolve_stop_target(query, jobs)
+            if target is None:
+                reply = "I could not tell which task to stop. Ask me to list your tasks, then say something like 'stop 1' or 'stop <job id>'."
+            else:
+                stopped_now, signaled = _stop_jobs(state, [target])
+                findings = _partial_findings_text(state, target) if _wants_findings_after_stop(query) else ""
+                if stopped_now:
+                    reply = f"Stopped task {target.job_id[:8]}."
+                    if findings:
+                        reply += f"\n\nWhat it found so far:\n{findings}"
+                elif signaled:
+                    reply = f"I asked the worker to stop task {target.job_id[:8]}."
+                    if _wants_findings_after_stop(query):
+                        if findings:
+                            reply += f"\n\nWhat it found so far:\n{findings}"
+                        else:
+                            reply += "\n\nI do not have usable findings to show yet, but I will stop it."
+                    else:
+                        reply += " I will update you when it is interrupted."
+                else:
+                    reply = "I do not see an active task to stop right now."
         state.record_turn(
             channel="telegram",
             user_id=user_id,
@@ -708,27 +1175,62 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
         await TelegramClient(settings).send_message(chat_id, reply)
         return {"status": "stop_requested"}
 
-    task_class = classify_task(query or "file task", has_attachment=message.document is not None)
-    if query:
-        state.record_turn(
-            channel="telegram",
-            user_id=user_id,
-            conversation_id=conversation_id,
-            role=ThreadTurnRole.USER,
-            text=query,
-            task_class=task_class,
-        )
-    resume_from_job_id = None
-    effective_query = query
-    if query and _is_resume_request(query):
-        resumable = state.get_latest_job_for_user(
-            source=JobSource.TELEGRAM.value,
-            user_id=user_id,
-            statuses=(JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT, JobStatus.FAILED),
-        )
-        if resumable is not None:
-            resume_from_job_id = resumable.job_id
-            effective_query = _resume_query_text(query, resumable)
+    paused_job = _latest_paused_input_job_for_user(state, source=JobSource.TELEGRAM, user_id=user_id)
+    paused_checkpoint = state.get_latest_checkpoint(paused_job.job_id) if paused_job is not None else None
+    if paused_job is not None:
+        if message.document is not None or (query and (_is_input_reply(query) or _looks_like_natural_input_reply(query))):
+            effective_query = _build_paused_input_resume_query(
+                paused_job,
+                paused_checkpoint,
+                _strip_input_reply_prefix(query or ""),
+                has_attachment=message.document is not None,
+            )
+            resume_from_job_id = paused_job.job_id
+            task_class = TaskClass.HEAVY
+            if query:
+                state.record_turn(
+                    channel="telegram",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role=ThreadTurnRole.USER,
+                    text=query,
+                    task_class=task_class,
+                )
+        else:
+            task_class = classify_task(query or "file task", has_attachment=message.document is not None)
+            if query:
+                state.record_turn(
+                    channel="telegram",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    role=ThreadTurnRole.USER,
+                    text=query,
+                    task_class=task_class,
+                )
+            resume_from_job_id = None
+            effective_query = query
+    else:
+        task_class = classify_task(query or "file task", has_attachment=message.document is not None)
+        if query:
+            state.record_turn(
+                channel="telegram",
+                user_id=user_id,
+                conversation_id=conversation_id,
+                role=ThreadTurnRole.USER,
+                text=query,
+                task_class=task_class,
+            )
+        resume_from_job_id = None
+        effective_query = query
+        if query and _is_resume_request(query):
+            resumable = state.get_latest_job_for_user(
+                source=JobSource.TELEGRAM.value,
+                user_id=user_id,
+                statuses=(JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT, JobStatus.FAILED),
+            )
+            if resumable is not None:
+                resume_from_job_id = resumable.job_id
+                effective_query = _resume_query_text(query, resumable)
 
     attachments: list[AttachmentRef] = []
     if message.document is not None:
@@ -847,15 +1349,37 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             task_class=TaskClass.LIGHT,
         )
         jobs = _active_jobs_for_user(state, source=JobSource.SIRI, user_id="siri")
-        target = _resolve_stop_target(query, jobs)
-        if target is None:
-            reply = "I could not tell which running task to stop. Ask me to list your tasks, then say something like stop 1."
-        elif target.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
-            state.update_job_status(target.job_id, status=JobStatus.INTERRUPTED, current_step="stopped by user", error_message="stopped by user")
-            reply = f"Stopped task {target.job_id[:8]} before it started running."
+        if _is_stop_all_request(query):
+            stopped_now, signaled = _stop_jobs(state, jobs)
+            total = stopped_now + signaled
+            if total == 0:
+                reply = "I do not see any active long-running tasks to stop right now."
+            elif signaled and stopped_now:
+                reply = f"Stopping {total} tasks now. {stopped_now} were stopped immediately and {signaled} running task{'s were' if signaled != 1 else ' was'} asked to stop."
+            elif signaled:
+                reply = f"Stopping {signaled} running task{'s' if signaled != 1 else ''} now."
+            else:
+                reply = f"Stopped {stopped_now} task{'s' if stopped_now != 1 else ''}."
         else:
-            state.record_control_signal(target.job_id, command=ControlCommand.STOP, note="stopped by user")
-            reply = f"I asked the worker to stop task {target.job_id[:8]}."
+            target = _resolve_stop_target(query, jobs)
+            if target is None:
+                reply = "I could not tell which task to stop. Ask me to list your tasks, then say something like stop 1."
+            else:
+                stopped_now, signaled = _stop_jobs(state, [target])
+                findings = _partial_findings_text(state, target) if _wants_findings_after_stop(query) else ""
+                if stopped_now:
+                    reply = f"Stopped task {target.job_id[:8]}."
+                    if findings:
+                        reply += f"\n\nWhat it found so far:\n{findings}"
+                elif signaled:
+                    reply = f"I asked the worker to stop task {target.job_id[:8]}."
+                    if _wants_findings_after_stop(query):
+                        if findings:
+                            reply += f"\n\nWhat it found so far:\n{findings}"
+                        else:
+                            reply += "\n\nI do not have usable findings to show yet, but I will stop it."
+                else:
+                    reply = "I do not see an active task to stop right now."
         state.record_turn(
             channel="siri",
             user_id="siri",
@@ -868,19 +1392,35 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
 
     allowed_chat_id = settings.secret(settings.telegram_allowed_chat_id_param)
     conversation_id = "siri"
-    task_class = classify_task(query)
-    resume_from_job_id = None
-    effective_query = query
-    if _is_resume_request(query):
-        resumable = state.get_latest_job_for_user(
-            source=JobSource.SIRI.value,
-            user_id="siri",
-            statuses=(JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT, JobStatus.FAILED),
-        )
-        if resumable is not None:
-            resume_from_job_id = resumable.job_id
+    paused_job = _latest_paused_input_job_for_user(state, source=JobSource.SIRI, user_id="siri")
+    paused_checkpoint = state.get_latest_checkpoint(paused_job.job_id) if paused_job is not None else None
+    if paused_job is not None:
+        if _is_input_reply(query) or _looks_like_natural_input_reply(query):
             task_class = TaskClass.HEAVY
-            effective_query = _resume_query_text(query, resumable)
+            resume_from_job_id = paused_job.job_id
+            effective_query = _build_paused_input_resume_query(
+                paused_job,
+                paused_checkpoint,
+                _strip_input_reply_prefix(query),
+            )
+        else:
+            task_class = classify_task(query)
+            resume_from_job_id = None
+            effective_query = query
+    else:
+        task_class = classify_task(query)
+        resume_from_job_id = None
+        effective_query = query
+        if _is_resume_request(query):
+            resumable = state.get_latest_job_for_user(
+                source=JobSource.SIRI.value,
+                user_id="siri",
+                statuses=(JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT, JobStatus.FAILED),
+            )
+            if resumable is not None:
+                resume_from_job_id = resumable.job_id
+                task_class = TaskClass.HEAVY
+                effective_query = _resume_query_text(query, resumable)
 
     if task_class == TaskClass.HEAVY:
         logger.info("siri request queued as heavy task")
@@ -1077,6 +1617,8 @@ async def worker_heartbeat(body: WorkerHeartbeat, x_friday_worker_key: Optional[
     job = state.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if not _job_accepts_live_worker_updates(job):
+        return {"status": "ignored"}
     state.update_job_heartbeat(body.job_id, current_step=body.current_step, summary=body.summary)
     if body.notify and job.chat_id:
         config = state.get_config()
@@ -1098,15 +1640,57 @@ async def worker_control(job_id: str, x_friday_worker_key: Optional[str] = Heade
     return {"control": signal.model_dump()}
 
 
+@app.get("/internal/worker/job-status/{job_id}")
+async def worker_job_status(job_id: str, x_friday_worker_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    expected_key = settings.secret(settings.worker_api_key_param)
+    if expected_key and x_friday_worker_key != expected_key:
+        raise HTTPException(status_code=401, detail="invalid worker key")
+    job = store().get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"status": job.status.value}
+
+
 @app.post("/internal/worker/checkpoint")
 async def worker_checkpoint(body: WorkerCheckpointRequest, x_friday_worker_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
     expected_key = settings.secret(settings.worker_api_key_param)
     if expected_key and x_friday_worker_key != expected_key:
         raise HTTPException(status_code=401, detail="invalid worker key")
     state = store()
-    if state.get_job(body.job_id) is None:
+    job = state.get_job(body.job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if not _job_accepts_live_worker_updates(job):
+        return {"status": "ignored", "checkpoint_seq": 0}
     seq = state.save_checkpoint(body.job_id, body.checkpoint)
+    return {"status": "ok", "checkpoint_seq": seq}
+
+
+@app.post("/internal/worker/pause")
+async def worker_pause(body: WorkerPauseRequest, x_friday_worker_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    expected_key = settings.secret(settings.worker_api_key_param)
+    if expected_key and x_friday_worker_key != expected_key:
+        raise HTTPException(status_code=401, detail="invalid worker key")
+    state = store()
+    job = state.get_job(body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if not _job_accepts_live_worker_updates(job):
+        return {"status": "ignored", "checkpoint_seq": 0}
+    seq = state.save_checkpoint(body.job_id, body.checkpoint)
+    state.update_job_status(body.job_id, status=JobStatus.PAUSED_FOR_INPUT, current_step=body.checkpoint.current_step or "waiting_for_user_input")
+    message = _paused_input_reply_text(state, state.get_job(body.job_id) or job)
+    state.record_turn(
+        channel=job.source.value,
+        user_id=job.user_id or "unknown",
+        conversation_id=job.conversation_id or "default",
+        role=ThreadTurnRole.ASSISTANT,
+        text=message,
+        task_class=TaskClass.HEAVY,
+    )
+    if job.chat_id:
+        await TelegramClient(settings).send_message(job.chat_id, message)
+    _maybe_stop_dedicated_worker_if_idle(state)
     return {"status": "ok", "checkpoint_seq": seq}
 
 
@@ -1135,11 +1719,14 @@ async def worker_complete(body: WorkerCompleteRequest, x_friday_worker_key: Opti
     job = state.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if not _job_accepts_live_worker_updates(job):
+        return {"status": "ignored"}
+    cleaned_result = _clean_user_facing_result(body.result_text)
     state.update_job_status(
         body.job_id,
         status=JobStatus.COMPLETED,
         current_step="completed",
-        result_preview=body.result_text,
+        result_preview=cleaned_result,
         output_files=body.output_files,
         artifact_keys=body.artifact_keys,
     )
@@ -1148,19 +1735,42 @@ async def worker_complete(body: WorkerCompleteRequest, x_friday_worker_key: Opti
         user_id=job.user_id or "unknown",
         conversation_id=job.conversation_id or "default",
         role=ThreadTurnRole.ASSISTANT,
-        text=body.result_text,
+        text=cleaned_result,
         task_class=TaskClass.HEAVY,
     )
     if job.chat_id:
-        message = body.result_text
-        if body.output_files:
-            message += "\n\nOutput files:\n" + "\n".join(f"- {name}" for name in body.output_files[:20])
+        include_browser_step_screenshots = query_requests_browser_images(job.query)
+        include_requested_output_files = query_requests_output_files(job.query)
+        visible_files = visible_output_files(
+            body.output_files,
+            include_browser_step_screenshots=include_browser_step_screenshots,
+            include_other_output_files=include_requested_output_files,
+        )
+        message = cleaned_result
+        if visible_files:
+            message += "\n\nOutput files:\n" + "\n".join(f"- {name}" for name in visible_files[:20])
         telegram = TelegramClient(settings)
         await telegram.send_message(job.chat_id, message)
+        zipped_screenshots: list[tuple[str, bytes]] = []
         for file_name, object_key in zip(body.output_files[:10], body.artifact_keys[:10]):
+            if is_browser_step_screenshot(file_name):
+                if not include_browser_step_screenshots:
+                    continue
+                response = s3_client().get_object(Bucket=settings.artifacts_bucket, Key=object_key)
+                zipped_screenshots.append((file_name.rsplit("/", 1)[-1], response["Body"].read()))
+                continue
+            if not include_requested_output_files:
+                continue
             response = s3_client().get_object(Bucket=settings.artifacts_bucket, Key=object_key)
             content = response["Body"].read()
             await telegram.send_document_bytes(job.chat_id, file_name, content, caption=file_name)
+        if len(zipped_screenshots) == 1:
+            screenshot_name, screenshot_bytes = zipped_screenshots[0]
+            await telegram.send_document_bytes(job.chat_id, screenshot_name, screenshot_bytes, caption=screenshot_name)
+        elif zipped_screenshots:
+            zip_name = _zip_artifact_bundle_name(job)
+            zip_bytes = _build_zip_bytes(zipped_screenshots)
+            await telegram.send_document_bytes(job.chat_id, zip_name, zip_bytes, caption=zip_name)
     _maybe_stop_dedicated_worker_if_idle(state)
     return {"status": "ok"}
 
@@ -1174,22 +1784,25 @@ async def worker_fail(body: WorkerFailureRequest, x_friday_worker_key: Optional[
     job = state.get_job(body.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if not _job_accepts_live_worker_updates(job):
+        return {"status": "ignored"}
     status = JobStatus.FAILED
     if body.interrupted:
         status = JobStatus.INTERRUPTED
     elif body.timed_out:
         status = JobStatus.TIMED_OUT
-    state.update_job_status(body.job_id, status=status, current_step="failed", error_message=body.error_message)
+    user_error = _humanize_worker_failure(job.query, body.error_message, status)
+    state.update_job_status(body.job_id, status=status, current_step="failed", error_message=user_error)
     state.record_turn(
         channel=job.source.value,
         user_id=job.user_id or "unknown",
         conversation_id=job.conversation_id or "default",
         role=ThreadTurnRole.ASSISTANT,
-        text=f"Task {status.value}: {body.error_message}",
+        text=user_error,
         task_class=TaskClass.HEAVY,
     )
     if job.chat_id:
-        await TelegramClient(settings).send_message(job.chat_id, f"Task {status.value}: {body.error_message}")
+        await TelegramClient(settings).send_message(job.chat_id, user_error)
     _maybe_stop_dedicated_worker_if_idle(state)
     return {"status": "ok"}
 

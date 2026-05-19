@@ -1,5 +1,7 @@
 from app.jobs import TaskClass
-from app.routing import classify_task, is_long_task, needs_confirmation, should_offer_browser_tool
+from app.agent_core import _current_local_datetime_text, _direct_tool_mode_summary, _should_expose_browser_tools, _should_expose_travel_browser_fallback
+from app.routing import classify_task, is_long_task, needs_confirmation, should_offer_browser_tool, task_routing_profile
+from app.settings import Settings
 
 
 def test_siri_short_task_can_be_spoken() -> None:
@@ -25,7 +27,66 @@ def test_browser_tool_is_only_offered_for_live_web_queries() -> None:
 def test_heavy_task_classification() -> None:
     assert classify_task("fill out this website form for me") == TaskClass.HEAVY
     assert classify_task("process this attachment", has_attachment=True) == TaskClass.HEAVY
+    assert classify_task("plan me a Chicago weekend itinerary and map out the route") == TaskClass.HEAVY
+    assert classify_task("build me a spreadsheet of ramen spots in Austin") == TaskClass.HEAVY
     assert classify_task("what time is it in Tokyo?") == TaskClass.LIGHT
+
+
+def test_task_routing_profile_detection() -> None:
+    assert task_routing_profile("build me a spreadsheet of flight prices").name == "spreadsheet_data"
+    assert task_routing_profile("plan a two day itinerary in Montreal").name == "itinerary_maps"
+    assert task_routing_profile("find me a dinner reservation for Friday").name == "booking_commerce"
+    assert task_routing_profile("find hotels in Chicago for June 5 to June 7").name == "itinerary_maps"
+    assert task_routing_profile("find rental cars in Chicago for next weekend").name == "itinerary_maps"
+    assert task_routing_profile("sign up for the site with a new account").name == "login_account"
+    assert task_routing_profile("summarize this article for me").name == "general"
+
+
+def test_browser_tools_hidden_for_structured_travel_and_booking() -> None:
+    assert not _should_expose_browser_tools(
+        "Find me a nonstop flight from NYC to Chicago under $300 on June 5 and return June 7",
+        "booking_commerce",
+    )
+    assert not _should_expose_browser_tools(
+        "Find me a dinner reservation in the West Village for 2 tonight",
+        "booking_commerce",
+    )
+    assert not _should_expose_browser_tools(
+        "Plan me a hotel and flight itinerary for Montreal next weekend",
+        "itinerary_maps",
+    )
+
+
+def test_direct_tool_mode_summary_is_explicit_for_travel_and_restaurants() -> None:
+    travel_summary = _direct_tool_mode_summary(
+        "Find me a flight from NYC to Chicago next Friday",
+        "booking_commerce",
+    )
+    restaurant_summary = _direct_tool_mode_summary(
+        "Book me a table at Carbone tomorrow",
+        "booking_commerce",
+    )
+    assert "direct travel tools first" in travel_summary.lower()
+    assert "structured reservation task" in restaurant_summary.lower()
+
+
+def test_travel_browser_fallback_only_exposed_for_structured_travel() -> None:
+    assert _should_expose_travel_browser_fallback(
+        "Find me a flight from NYC to Chicago next Friday",
+        "booking_commerce",
+    )
+    assert _should_expose_travel_browser_fallback(
+        "Plan me hotels and flights for Montreal next weekend",
+        "itinerary_maps",
+    )
+    assert not _should_expose_travel_browser_fallback(
+        "Find me a dinner reservation in the West Village",
+        "booking_commerce",
+    )
+    assert not _should_expose_travel_browser_fallback(
+        "Summarize this article for me",
+        "general",
+    )
 
 
 def test_risky_actions_require_confirmation() -> None:
@@ -39,3 +100,21 @@ def test_read_only_question_does_not_require_confirmation() -> None:
     assert not needs_confirmation("summarize what this article says")
     assert not needs_confirmation("research good cameras for travel and compare reviews")
     assert not needs_confirmation("draft a recommendation table for me")
+    assert not needs_confirmation("Need to find hotels for Ibiza Friday check in 3rd July - 5th checkout for 4 people")
+
+
+def test_travel_checkout_date_does_not_trigger_commerce_confirmation() -> None:
+    assert not needs_confirmation("Find hotels in Ibiza with check-in July 3 and checkout July 5")
+    assert needs_confirmation("Go to checkout and pay for the order")
+
+
+def test_informational_questions_about_costs_and_architecture_do_not_require_confirmation() -> None:
+    assert not needs_confirmation("Is Temporal free to use?")
+    assert not needs_confirmation("For AWS infra where I have an on demand ec2 instance with docker a better system for temporal or lang graph?")
+    assert not needs_confirmation("For most of these things is it better to just pay the cost for certain tools?")
+
+
+def test_current_local_datetime_text_includes_relative_date_guidance() -> None:
+    rendered = _current_local_datetime_text(Settings())
+    assert "Current local date/time:" in rendered
+    assert "Resolve relative dates like today, tomorrow" in rendered

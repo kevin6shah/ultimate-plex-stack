@@ -21,6 +21,11 @@ WORKER_MEMORY = os.environ.get("FRIDAY_WORKER_MEMORY", "512m")
 WORKER_PIDS_LIMIT = os.environ.get("FRIDAY_WORKER_PIDS_LIMIT", "512")
 STOP_ON_IDLE = os.environ.get("FRIDAY_STOP_ON_IDLE", "0") == "1"
 IDLE_STOP_SECONDS = int(os.environ.get("FRIDAY_IDLE_STOP_SECONDS", "600"))
+WORKER_CODE_ROOT = Path(os.environ.get("FRIDAY_WORKER_CODE_ROOT", "/opt/friday-hands"))
+
+
+def _container_env_var(name: str) -> list[str]:
+    return ["-e", f"{name}={os.environ.get(name, '')}"]
 
 
 class WorkerRunError(RuntimeError):
@@ -45,6 +50,19 @@ def post_json(path: str, payload: dict) -> dict:
         return json.loads(data.decode("utf-8")) if data else {}
 
 
+def get_json(path: str) -> dict:
+    req = request.Request(
+        f"{API_BASE_URL}{path}",
+        headers={
+            "x-friday-worker-key": WORKER_KEY,
+        },
+        method="GET",
+    )
+    with request.urlopen(req, timeout=60) as response:
+        data = response.read()
+        return json.loads(data.decode("utf-8")) if data else {}
+
+
 def report_failure(job_id: str, error_message: str, *, interrupted: bool = False, timed_out: bool = False) -> None:
     try:
         post_json(
@@ -58,6 +76,22 @@ def report_failure(job_id: str, error_message: str, *, interrupted: bool = False
         )
     except Exception as exc:  # pragma: no cover - best-effort reporting on the host
         print(f"worker broker could not report failure for {job_id}: {exc}", flush=True)
+
+
+def verify_terminal_job_state(job_id: str) -> None:
+    try:
+        payload = get_json(f"/internal/worker/job-status/{job_id}")
+    except Exception as exc:  # pragma: no cover - best-effort host-side verification
+        print(f"worker broker could not verify terminal state for {job_id}: {exc}", flush=True)
+        return
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"completed", "failed", "timed_out", "interrupted", "paused_for_input"}:
+        return
+    report_failure(job_id, f"worker exited without reporting a terminal state (last status: {status or 'unknown'})")
+    print(
+        f"worker broker repaired non-terminal exit for {job_id}: last status={status or 'unknown'}",
+        flush=True,
+    )
 
 
 def ensure_workspace(job_id: str, *, resume_from_job_id: str | None = None) -> Path:
@@ -108,27 +142,87 @@ def run_worker(claim: dict) -> None:
         "-e",
         f"DEEPSEEK_API_KEY={os.environ['DEEPSEEK_API_KEY']}",
         "-e",
-        f"BROWSER_USE_API_KEY={os.environ.get('BROWSER_USE_API_KEY', '')}",
-        "-e",
-        f"BROWSER_USE_ENABLED={os.environ.get('BROWSER_USE_ENABLED', 'true')}",
-        "-e",
-        f"BROWSER_USE_CLOUD_ENABLED={os.environ.get('BROWSER_USE_CLOUD_ENABLED', 'false')}",
-        "-e",
-        f"BROWSER_USE_MODEL={os.environ.get('BROWSER_USE_MODEL', 'deepseek-chat')}",
-        "-e",
-        f"BROWSER_USE_CLOUD_MODEL={os.environ.get('BROWSER_USE_CLOUD_MODEL', 'bu-latest')}",
-        "-e",
-        f"BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE={os.environ.get('BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE', 'us')}",
-        "-e",
-        f"BROWSER_USE_STEP_TIMEOUT_SECONDS={os.environ.get('BROWSER_USE_STEP_TIMEOUT_SECONDS', '120')}",
-        "-e",
-        f"BROWSER_USE_MAX_FAILURES={os.environ.get('BROWSER_USE_MAX_FAILURES', '3')}",
-        "-e",
         "HOME=/workspace",
         "--mount",
         f"type=bind,src={workspace},dst=/workspace",
-        WORKER_IMAGE,
     ]
+    host_app_dir = WORKER_CODE_ROOT / "agent" / "app"
+    host_runner_path = WORKER_CODE_ROOT / "hands" / "worker" / "runner.py"
+    if host_app_dir.is_dir():
+        run_cmd.extend(
+            [
+                "--mount",
+                f"type=bind,src={host_app_dir},dst=/opt/friday/app,readonly",
+            ]
+        )
+    if host_runner_path.is_file():
+        run_cmd.extend(
+            [
+                "--mount",
+                f"type=bind,src={host_runner_path},dst=/opt/friday/runner.py,readonly",
+            ]
+        )
+    for env_name in (
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "BRAVE_SEARCH_API_KEY_PARAM",
+        "BRAVE_SEARCH_API_KEY",
+        "BROWSER_USE_API_KEY_PARAM",
+        "BROWSER_USE_API_KEY",
+        "BROWSER_USE_ENABLED",
+        "BROWSER_USE_CLOUD_ENABLED",
+        "BROWSER_USE_MODEL",
+        "BROWSER_USE_CLOUD_MODEL",
+        "BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE",
+        "BROWSER_USE_STEP_TIMEOUT_SECONDS",
+        "BROWSER_USE_MAX_FAILURES",
+        "BROWSER_USE_TASK_TIMEOUT_SECONDS",
+        "MCP_REGISTRATION_TIMEOUT_SECONDS",
+        "FIRECRAWL_MCP_ENABLED",
+        "FIRECRAWL_API_KEY_PARAM",
+        "FIRECRAWL_API_KEY",
+        "SKIPLAGGED_MCP_ENABLED",
+        "SKIPLAGGED_MCP_COMMAND",
+        "SKIPLAGGED_MCP_ARGS",
+        "RESTAURANT_CLI_ENABLED",
+        "RESTAURANT_CLI_COMMAND",
+        "RESTAURANT_CLI_OT_MODE",
+        "RESTAURANT_CLI_TIMEZONE",
+        "GOOGLE_MAPS_MCP_ENABLED",
+        "GOOGLE_MAPS_API_KEY_PARAM",
+        "GOOGLE_MAPS_API_KEY",
+        "GOOGLE_MAPS_ENABLED_TOOLS",
+        "MAPS_OPENAPI_MCP_ENABLED",
+        "MAPS_OPENAPI_SPEC_URL",
+        "MAPS_OPENAPI_BASE_URL",
+        "MAPS_OPENAPI_HEADERS_PARAM",
+        "MAPS_OPENAPI_HEADERS_JSON",
+        "MAPS_OPENAPI_AUTH_TOKEN_PARAM",
+        "MAPS_OPENAPI_AUTH_TOKEN",
+        "RESY_MCP_ENABLED",
+        "RESY_API_KEY_PARAM",
+        "RESY_API_KEY",
+        "RESY_AUTH_TOKEN_PARAM",
+        "RESY_AUTH_TOKEN",
+        "OPENTABLE_MCP_ENABLED",
+        "OPENTABLE_EMAIL_PARAM",
+        "OPENTABLE_EMAIL",
+        "OPENTABLE_PASSWORD_PARAM",
+        "OPENTABLE_PASSWORD",
+        "GMAIL_MCP_ENABLED",
+        "GMAIL_ACCOUNT_EMAIL_PARAM",
+        "GMAIL_ACCOUNT_EMAIL",
+        "GMAIL_APP_PASSWORD_PARAM",
+        "GMAIL_APP_PASSWORD",
+        "GMAIL_CLIENT_ID",
+        "GMAIL_CLIENT_ID_PARAM",
+        "GMAIL_CLIENT_SECRET",
+        "GMAIL_CLIENT_SECRET_PARAM",
+        "GMAIL_REFRESH_TOKEN",
+        "GMAIL_REFRESH_TOKEN_PARAM",
+    ):
+        run_cmd.extend(_container_env_var(env_name))
+    run_cmd.append(WORKER_IMAGE)
     result = subprocess.run(
         run_cmd,
         check=False,
@@ -141,6 +235,7 @@ def run_worker(claim: dict) -> None:
         if not details:
             details = f"worker container exited with status {result.returncode}"
         raise WorkerRunError(details, returncode=result.returncode)
+    verify_terminal_job_state(job_id)
 
 
 def stop_instance_if_idle() -> None:
