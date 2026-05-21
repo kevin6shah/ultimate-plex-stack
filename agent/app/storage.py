@@ -428,7 +428,8 @@ class StateStore:
         job = self.get_job(job_id)
         if job is None or job.loop_stop_requested_at:
             return False
-        if int(job.heartbeat_repeat_count or 0) < 8:
+        repeat_threshold = max(3, int(self.settings.worker_stall_repeat_heartbeats))
+        if int(job.heartbeat_repeat_count or 0) < repeat_threshold:
             return False
         raw_timestamp = job.last_progress_at or job.heartbeat_repeat_since
         if not raw_timestamp:
@@ -438,7 +439,12 @@ class StateStore:
         except ValueError:
             return False
         stale_seconds = (utc_now() - last_progress).total_seconds()
-        return stale_seconds >= max(interval_seconds * 6, 600)
+        current_step = (job.current_step or "").strip().lower()
+        if current_step == "running_agent":
+            stale_threshold = max(120, int(self.settings.worker_running_stall_seconds))
+        else:
+            stale_threshold = max(60, int(self.settings.worker_preflight_stall_seconds))
+        return stale_seconds >= max(stale_threshold, interval_seconds)
 
     def mark_loop_stop_requested(self, job_id: str) -> None:
         timestamp = utc_now().isoformat()

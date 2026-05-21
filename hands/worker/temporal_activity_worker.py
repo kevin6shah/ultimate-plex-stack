@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ if str(AGENT_ROOT) not in sys.path:
 
 from app.agent_core import PauseForInputRequested, run_agent
 from app.artifacts import is_browser_step_screenshot, query_requests_browser_images
-from app.heavy_job_runtime import artifact_key, status_summary_for_query
+from app.heavy_job_runtime import artifact_key, progress_notification_text, progress_summary_for_step, status_summary_for_query
 from app.jobs import AgentConfig, AgentJob, CheckpointPayload, ThreadTurn
 from app.settings import Settings
 from app.storage import StateStore
@@ -98,7 +99,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
     attachment_names = [attachment["file_name"] for attachment in claim.get("attachments", [])]
     status_interval = max(10, settings.temporal_activity_heartbeat_seconds)
     current_step = "starting worker"
-    current_summary = "worker picked up job"
+    current_step_started_at = time.monotonic()
+    current_summary = progress_summary_for_step(job.query, current_step=current_step, attachments=bool(attachment_names), summary="worker picked up job")
     task_summary = status_summary_for_query(job.query, attachments=bool(attachment_names))
     interrupted = asyncio.Event()
     main_task = asyncio.current_task()
@@ -114,14 +116,23 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             loop.add_signal_handler(signum, _signal_handler)
 
     async def report_status(*, notify: bool = False) -> None:
-        state.update_job_heartbeat(job.job_id, current_step=current_step, summary=current_summary)
+        elapsed_seconds = max(0.0, time.monotonic() - current_step_started_at)
+        heartbeat_summary = progress_summary_for_step(
+            job.query,
+            current_step=current_step,
+            attachments=bool(attachment_names),
+            summary=current_summary,
+            elapsed_seconds=elapsed_seconds,
+        )
+        state.update_job_heartbeat(job.job_id, current_step=current_step, summary=heartbeat_summary)
         if notify and job.chat_id:
             config = state.get_config()
-            message = f"Still working: {current_summary[:1000]}"
+            live_job = state.get_job(job.job_id) or job
+            message = progress_notification_text(live_job, current_step=current_step, summary=heartbeat_summary)
             if state.should_send_status_update(job.job_id, interval_seconds=config.status_update_interval_seconds, text=message):
                 await TelegramClient(settings).send_message(job.chat_id, message)
                 state.mark_status_update_sent(job.job_id, text=message)
-        activity.heartbeat({"job_id": job.job_id, "current_step": current_step, "summary": current_summary})
+        activity.heartbeat({"job_id": job.job_id, "current_step": current_step, "summary": heartbeat_summary})
 
     async def periodic_status() -> None:
         while True:
@@ -143,7 +154,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
         await report_status()
         await _download_attachments(settings, claim, workspace)
         current_step = "attachments_ready"
-        current_summary = "workspace prepared"
+        current_step_started_at = time.monotonic()
+        current_summary = progress_summary_for_step(job.query, current_step=current_step, attachments=bool(attachment_names), summary="workspace prepared")
         state.save_checkpoint(
             job.job_id,
             CheckpointPayload(summary="attachments downloaded", current_step="attachments_ready", workspace_files=workspace.list_files()),
@@ -152,7 +164,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
         if interrupted.is_set():
             raise asyncio.CancelledError("worker interrupted after attachment download")
         current_step = "running_agent"
-        current_summary = task_summary
+        current_step_started_at = time.monotonic()
+        current_summary = progress_summary_for_step(job.query, current_step=current_step, attachments=bool(attachment_names), summary=task_summary)
         result = await run_agent(
             job.query,
             settings=settings,
@@ -167,7 +180,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             resume_checkpoint=resume_checkpoint,
         )
         current_step = "uploading_outputs"
-        current_summary = "preparing final files and upload"
+        current_step_started_at = time.monotonic()
+        current_summary = progress_summary_for_step(job.query, current_step=current_step, attachments=bool(attachment_names), summary="preparing final files and upload")
         state.save_checkpoint(
             job.job_id,
             CheckpointPayload(summary="agent completed", current_step="uploading_outputs", workspace_files=workspace.list_files()),

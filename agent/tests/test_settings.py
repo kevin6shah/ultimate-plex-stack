@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from datetime import datetime
 
 import app.settings as settings_module
 from app.storage import StateStore
@@ -103,6 +104,19 @@ def test_hands_worker_idle_grace_default_is_ten_minutes(monkeypatch):
     assert settings.hands_worker_idle_grace_seconds == 600
 
 
+def test_worker_stall_defaults_are_tighter_than_old_status_timer(monkeypatch):
+    monkeypatch.delenv("WORKER_STALL_REPEAT_HEARTBEATS", raising=False)
+    monkeypatch.delenv("WORKER_RUNNING_STALL_SECONDS", raising=False)
+    monkeypatch.delenv("WORKER_PREFLIGHT_STALL_SECONDS", raising=False)
+
+    reloaded = importlib.reload(settings_module)
+    settings = reloaded.Settings()
+
+    assert settings.worker_stall_repeat_heartbeats == 18
+    assert settings.worker_running_stall_seconds == 900
+    assert settings.worker_preflight_stall_seconds == 300
+
+
 def test_claim_telegram_update_is_idempotent(monkeypatch):
     class FakeTable:
         def __init__(self):
@@ -151,3 +165,25 @@ def test_should_send_status_update_suppresses_identical_message(monkeypatch):
     )
     monkeypatch.setattr(state, "get_job", lambda _job_id: job)
     assert state.should_send_status_update("job-1", interval_seconds=60, text="same progress") is False
+
+
+def test_should_stop_for_stall_uses_running_step_threshold(monkeypatch):
+    reloaded = importlib.reload(settings_module)
+    settings = reloaded.Settings()
+    state = StateStore(settings)
+    job = state._job_from_item(
+        {
+            "job_id": "job-1",
+            "source": "telegram",
+            "query": "Research jackets",
+            "task_class": "heavy",
+            "status": "running",
+            "current_step": "running_agent",
+            "created_at": "2026-05-20T00:00:00+00:00",
+            "heartbeat_repeat_count": 18,
+            "last_progress_at": "2026-05-20T00:00:00+00:00",
+        }
+    )
+    monkeypatch.setattr(state, "get_job", lambda _job_id: job)
+    monkeypatch.setattr("app.storage.utc_now", lambda: datetime.fromisoformat("2026-05-20T00:15:00+00:00"))
+    assert state.should_stop_for_stall("job-1", interval_seconds=300) is True

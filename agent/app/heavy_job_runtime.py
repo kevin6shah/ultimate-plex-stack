@@ -105,9 +105,109 @@ def status_summary_for_query(query: str, *, attachments: bool) -> str:
     return "working through the task"
 
 
+def progress_summary_for_step(
+    query: str,
+    *,
+    current_step: str,
+    attachments: bool,
+    summary: str = "",
+    elapsed_seconds: float = 0.0,
+) -> str:
+    cleaned_summary = plain_text_message(summary)
+    generic_markers = {
+        "",
+        "worker picked up job",
+        "workspace prepared",
+        "attachments downloaded",
+        "agent completed",
+    }
+    baseline = status_summary_for_query(query, attachments=attachments)
+    if cleaned_summary and cleaned_summary not in generic_markers and cleaned_summary != baseline:
+        return cleaned_summary
+
+    lowered = query.lower()
+    running_phase = 0
+    if elapsed_seconds >= 480:
+        running_phase = 2
+    elif elapsed_seconds >= 180:
+        running_phase = 1
+
+    if current_step == "starting worker":
+        return "starting the task environment and loading the workspace"
+    if current_step == "attachments_ready":
+        if attachments:
+            return "organizing the uploaded files and preparing the workspace"
+        return "preparing the workspace and loading the first live sources"
+    if current_step == "uploading_outputs":
+        return "writing the final answer and packaging links or files"
+    if current_step == "running_agent":
+        if any(token in lowered for token in ("flight", "flights", "airline", "airport")):
+            phases = (
+                "checking live flight options and collecting candidate itineraries",
+                "comparing fares, timing, and airline tradeoffs across the shortlist",
+                "writing the final flight recommendation and direct booking links",
+            )
+            return phases[running_phase]
+        if any(token in lowered for token in ("hotel", "hotels", "stay", "airbnb", "accommodation")):
+            phases = (
+                "collecting hotel candidates with live pricing and location details",
+                "comparing neighborhoods, cancellation terms, and nightly rates",
+                "writing the final hotel shortlist and direct booking links",
+            )
+            return phases[running_phase]
+        if any(token in lowered for token in ("rental car", "car rental", "rent a car", "avis", "hertz", "enterprise")):
+            phases = (
+                "collecting rental car options and checking live availability",
+                "comparing providers, coverage terms, and total pricing",
+                "writing the final rental car shortlist and direct booking links",
+            )
+            return phases[running_phase]
+        if any(token in lowered for token in ("restaurant", "reservation", "resy", "opentable", "book me", "dinner")):
+            phases = (
+                "checking reservation sources and matching the correct venue",
+                "comparing available times, policies, and booking paths",
+                "writing the final reservation options and handoff links",
+            )
+            return phases[running_phase]
+        if any(token in lowered for token in ("jacket", "shoe", "shirt", "pants", "gift", "buy", "purchase", "order", "vendor", "product")):
+            phases = (
+                "reviewing product pages and collecting candidate options",
+                "comparing pricing, specs, and direct vendor links across the shortlist",
+                "writing the ranked recommendation and final purchase links",
+            )
+            return phases[running_phase]
+        if any(token in lowered for token in ("research", "compare", "review", "reddit", "google")):
+            phases = (
+                "reviewing sources and collecting the strongest candidates",
+                "comparing findings, checking links, and narrowing the shortlist",
+                "writing the final recommendation and supporting notes",
+            )
+            return phases[running_phase]
+        if any(token in lowered for token in ("browser", "website", "site", "search")):
+            phases = (
+                "opening live pages and collecting the first relevant details",
+                "checking the most promising pages and comparing what matters",
+                "writing the final summary from the gathered live sources",
+            )
+            return phases[running_phase]
+        if attachments:
+            phases = (
+                "reviewing the uploaded material and collecting the key details",
+                "comparing the extracted findings and narrowing the answer",
+                "writing the final answer from the uploaded material",
+            )
+            return phases[running_phase]
+    return cleaned_summary or baseline
+
+
 def progress_notification_text(job: AgentJob, *, current_step: str, summary: str) -> str:
     cleaned_step = humanize_step(current_step)
-    cleaned_summary = plain_text_message(summary)
+    cleaned_summary = progress_summary_for_step(
+        job.query,
+        current_step=current_step,
+        attachments=bool(job.attachments),
+        summary=summary,
+    )
     lines = ["Still working on your task."]
     if cleaned_step:
         lines.append(f"Current step: {cleaned_step}")

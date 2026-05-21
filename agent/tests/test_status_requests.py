@@ -1,7 +1,7 @@
 from datetime import datetime
 from types import SimpleNamespace
 
-from app.heavy_job_runtime import progress_notification_text, status_summary_for_query
+from app.heavy_job_runtime import progress_notification_text, progress_summary_for_step, status_summary_for_query
 from app.jobs import AgentJob, CheckpointPayload, JobSource, JobStatus, TaskClass
 from app.main import (
     _active_job_is_stale,
@@ -406,4 +406,23 @@ def test_progress_notification_text_is_descriptive() -> None:
     message = progress_notification_text(job, current_step="running_agent", summary="checking live flight options and comparing fares")
     assert "Still working on your task." in message
     assert "Current step: running agent" in message
-    assert "Latest progress: checking live flight options and comparing fares" in message
+    assert "Latest progress: checking live flight options and collecting candidate itineraries" in message
+
+
+def test_progress_summary_for_step_gets_more_specific_over_time() -> None:
+    early = progress_summary_for_step(
+        "Research and compare lightweight running jackets with direct vendor links",
+        current_step="running_agent",
+        attachments=False,
+        summary="researching sources and comparing findings",
+        elapsed_seconds=30,
+    )
+    later = progress_summary_for_step(
+        "Research and compare lightweight running jackets with direct vendor links",
+        current_step="running_agent",
+        attachments=False,
+        summary="researching sources and comparing findings",
+        elapsed_seconds=600,
+    )
+    assert "collecting candidate options" in early
+    assert "final purchase links" in later
