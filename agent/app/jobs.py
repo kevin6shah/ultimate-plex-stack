@@ -85,6 +85,12 @@ class AgentJob(BaseModel):
     artifact_keys: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     last_status_sent_at: Optional[str] = None
+    last_status_sent_text: str = ""
+    last_heartbeat_fingerprint: str = ""
+    heartbeat_repeat_count: int = 0
+    heartbeat_repeat_since: Optional[str] = None
+    last_progress_at: Optional[str] = None
+    loop_stop_requested_at: Optional[str] = None
 
 
 class AgentResult(BaseModel):

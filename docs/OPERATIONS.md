@@ -380,3 +380,17 @@ After every material change:
 3. Update `docs/MAINTENANCE_JOURNAL.md`
 4. Update the relevant doc in `docs/`
 5. If the change altered normal operations, update `SAY_THIS_WHEN_AUTO_COMPACT.md`
+Emergency stop:
+
+```bash
+AWS_PROFILE=iris AWS_REGION=us-east-1 EC2_SSH_KEY=~/.aws/keys/iris-migration-20260510.pem ./scripts/stop-friday-runtime.sh
+```
+
+This script is the operator kill switch for runaway validation or stuck live traffic. It:
+
+- terminates any currently running Temporal workflows on the shared host
+- stops the on-demand dedicated worker EC2 instance
+
+Guardrail note:
+
+- after the `2026-05-20` KMS free-tier scare, secret-backed SSM reads are now cached in-process and the default worker idle grace is `600` seconds instead of `1800`

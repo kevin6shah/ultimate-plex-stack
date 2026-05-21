@@ -47,13 +47,14 @@ def test_run_worker_places_env_flags_before_image(monkeypatch, tmp_path: Path) -
     cmd = captured["cmd"]
     assert isinstance(cmd, list)
     image_index = cmd.index(broker.WORKER_IMAGE)
-    assert image_index == len(cmd) - 1
+    assert image_index < len(cmd) - 1
     assert "-e" in cmd[:image_index]
     assert "FIRECRAWL_MCP_ENABLED=true" in cmd[:image_index]
     assert "FIRECRAWL_API_KEY_PARAM=/friday/agent/firecrawl-api-key" in cmd[:image_index]
     assert "GMAIL_ACCOUNT_EMAIL_PARAM=/friday/agent/gmail-account-email" in cmd[:image_index]
     assert "GMAIL_ACCOUNT_EMAIL=friday.nyc.agent@gmail.com" in cmd[:image_index]
     assert "GMAIL_APP_PASSWORD=app-password" in cmd[:image_index]
+    assert cmd[image_index + 1 :] == broker.WORKER_COMMAND.split()
 
     claim_path = tmp_path / "workspaces" / "job-123" / "claim.json"
     assert json.loads(claim_path.read_text(encoding="utf-8"))["job"]["job_id"] == "job-123"

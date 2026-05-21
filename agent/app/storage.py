@@ -36,6 +36,27 @@ class StateStore:
             }
         )
 
+    def claim_telegram_update(self, *, chat_id: str, update_id: int, user_id: str) -> bool:
+        expires_at = int((utc_now() + timedelta(days=7)).timestamp())
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"TELEGRAM_UPDATE#{chat_id}",
+                    "SK": f"UPDATE#{update_id}",
+                    "chat_id": str(chat_id),
+                    "user_id": str(user_id),
+                    "update_id": int(update_id),
+                    "created_at": utc_now().isoformat(),
+                    "ttl": expires_at,
+                },
+                ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
     def _thread_pk(self, *, channel: str, user_id: str, conversation_id: str) -> str:
         return f"THREAD#{channel}#{user_id}#{conversation_id}"
 
@@ -265,6 +286,13 @@ class StateStore:
             "output_files": job.output_files,
             "artifact_keys": job.artifact_keys,
             "metadata": job.metadata,
+            "last_status_sent_at": job.last_status_sent_at,
+            "last_status_sent_text": job.last_status_sent_text,
+            "last_heartbeat_fingerprint": job.last_heartbeat_fingerprint,
+            "heartbeat_repeat_count": job.heartbeat_repeat_count,
+            "heartbeat_repeat_since": job.heartbeat_repeat_since,
+            "last_progress_at": job.last_progress_at,
+            "loop_stop_requested_at": job.loop_stop_requested_at,
             "GSI1PK": f"JOB_STATUS#{job.status.value}",
             "GSI1SK": f"{job.created_at}#{job.job_id}",
         }
@@ -334,19 +362,41 @@ class StateStore:
             ExpressionAttributeValues=values,
         )
 
-    def update_job_heartbeat(self, job_id: str, *, current_step: str = "", summary: str = "") -> None:
+    def update_job_heartbeat(self, job_id: str, *, current_step: str = "", summary: str = "") -> AgentJob:
+        job = self.get_job(job_id)
+        if job is None:
+            raise KeyError(f"job not found: {job_id}")
+        timestamp = utc_now().isoformat()
+        normalized_step = current_step[:500]
+        normalized_summary = summary[:2000]
+        fingerprint = f"{normalized_step}\n{normalized_summary}".strip()
+        same_progress = bool(fingerprint) and fingerprint == job.last_heartbeat_fingerprint
+        repeat_count = int(job.heartbeat_repeat_count or 0) + 1 if same_progress else 0
+        repeat_since = job.heartbeat_repeat_since if same_progress else None
+        if same_progress and not repeat_since:
+            repeat_since = timestamp
+        last_progress_at = job.last_progress_at if same_progress else timestamp
         self.table.update_item(
             Key={"PK": f"JOB#{job_id}", "SK": "META"},
-            UpdateExpression="SET last_heartbeat_at = :heartbeat, updated_at = :updated_at, current_step = :current_step, latest_checkpoint_summary = :summary",
+            UpdateExpression=(
+                "SET last_heartbeat_at = :heartbeat, updated_at = :updated_at, current_step = :current_step, "
+                "latest_checkpoint_summary = :summary, last_heartbeat_fingerprint = :fingerprint, "
+                "heartbeat_repeat_count = :repeat_count, heartbeat_repeat_since = :repeat_since, last_progress_at = :last_progress_at"
+            ),
             ExpressionAttributeValues={
-                ":heartbeat": utc_now().isoformat(),
-                ":updated_at": utc_now().isoformat(),
-                ":current_step": current_step[:500],
-                ":summary": summary[:2000],
+                ":heartbeat": timestamp,
+                ":updated_at": timestamp,
+                ":current_step": normalized_step,
+                ":summary": normalized_summary,
+                ":fingerprint": fingerprint,
+                ":repeat_count": repeat_count,
+                ":repeat_since": repeat_since,
+                ":last_progress_at": last_progress_at,
             },
         )
+        return self.get_job(job_id) or job
 
-    def should_send_status_update(self, job_id: str, *, interval_seconds: int) -> bool:
+    def should_send_status_update(self, job_id: str, *, interval_seconds: int, text: str) -> bool:
         job = self.get_job(job_id)
         if job is None:
             return False
@@ -356,15 +406,47 @@ class StateStore:
             last_sent = datetime.fromisoformat(job.last_status_sent_at)
         except ValueError:
             return True
-        return (utc_now() - last_sent).total_seconds() >= interval_seconds
+        elapsed = (utc_now() - last_sent).total_seconds()
+        normalized_text = text.strip()
+        if normalized_text and normalized_text != (job.last_status_sent_text or "").strip():
+            return elapsed >= interval_seconds
+        return elapsed >= max(interval_seconds * 4, 1800)
 
-    def mark_status_update_sent(self, job_id: str) -> None:
+    def mark_status_update_sent(self, job_id: str, *, text: str) -> None:
         timestamp = utc_now().isoformat()
         self.table.update_item(
             Key={"PK": f"JOB#{job_id}", "SK": "META"},
-            UpdateExpression="SET last_status_sent_at = :sent, updated_at = :updated_at",
+            UpdateExpression="SET last_status_sent_at = :sent, last_status_sent_text = :text, updated_at = :updated_at",
             ExpressionAttributeValues={
                 ":sent": timestamp,
+                ":text": text[:1000],
+                ":updated_at": timestamp,
+            },
+        )
+
+    def should_stop_for_stall(self, job_id: str, *, interval_seconds: int) -> bool:
+        job = self.get_job(job_id)
+        if job is None or job.loop_stop_requested_at:
+            return False
+        if int(job.heartbeat_repeat_count or 0) < 8:
+            return False
+        raw_timestamp = job.last_progress_at or job.heartbeat_repeat_since
+        if not raw_timestamp:
+            return False
+        try:
+            last_progress = datetime.fromisoformat(raw_timestamp)
+        except ValueError:
+            return False
+        stale_seconds = (utc_now() - last_progress).total_seconds()
+        return stale_seconds >= max(interval_seconds * 6, 600)
+
+    def mark_loop_stop_requested(self, job_id: str) -> None:
+        timestamp = utc_now().isoformat()
+        self.table.update_item(
+            Key={"PK": f"JOB#{job_id}", "SK": "META"},
+            UpdateExpression="SET loop_stop_requested_at = :timestamp, updated_at = :updated_at",
+            ExpressionAttributeValues={
+                ":timestamp": timestamp,
                 ":updated_at": timestamp,
             },
         )
@@ -621,5 +703,12 @@ class StateStore:
                 "output_files": item.get("output_files", []),
                 "artifact_keys": item.get("artifact_keys", []),
                 "metadata": item.get("metadata", {}),
+                "last_status_sent_at": item.get("last_status_sent_at"),
+                "last_status_sent_text": item.get("last_status_sent_text", ""),
+                "last_heartbeat_fingerprint": item.get("last_heartbeat_fingerprint", ""),
+                "heartbeat_repeat_count": item.get("heartbeat_repeat_count", 0),
+                "heartbeat_repeat_since": item.get("heartbeat_repeat_since"),
+                "last_progress_at": item.get("last_progress_at"),
+                "loop_stop_requested_at": item.get("loop_stop_requested_at"),
             }
         )

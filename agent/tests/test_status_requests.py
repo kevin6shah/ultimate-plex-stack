@@ -1,6 +1,7 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+from app.heavy_job_runtime import progress_notification_text, status_summary_for_query
 from app.jobs import AgentJob, CheckpointPayload, JobSource, JobStatus, TaskClass
 from app.main import (
     _active_job_is_stale,
@@ -12,6 +13,7 @@ from app.main import (
     _is_input_reply,
     _is_stop_all_request,
     _is_status_request,
+    _job_indicates_user_stop,
     _job_accepts_live_worker_updates,
     _looks_like_natural_input_reply,
     _partial_findings_text,
@@ -59,6 +61,22 @@ def test_format_status_message_for_running_job() -> None:
     assert "Latest update: reviewing travel and vlogging options" in text
 
 
+def test_format_status_message_for_running_job_with_interrupted_checkpoint() -> None:
+    job = AgentJob(
+        source=JobSource.TELEGRAM,
+        query="research cameras",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.RUNNING,
+        current_step="running_agent",
+        latest_checkpoint_summary="interrupted: preparing a report and output files",
+    )
+    state = SimpleNamespace(get_latest_checkpoint=lambda _job_id: None)
+    text = _format_status_message(state, job)
+    assert "appears interrupted" in text
+    assert "Still working on your latest task." not in text
+    assert "resume that task" in text
+
+
 def test_format_status_message_for_interrupted_job() -> None:
     job = AgentJob(
         source=JobSource.TELEGRAM,
@@ -72,6 +90,36 @@ def test_format_status_message_for_interrupted_job() -> None:
     assert "interrupted" in text
     assert "resume that task" in text
     assert "stopped by you" not in text
+
+
+def test_humanize_worker_failure_for_non_user_interruption() -> None:
+    text = _humanize_worker_failure(
+        "research cameras",
+        "worker interrupted before output upload",
+        JobStatus.INTERRUPTED,
+    )
+    assert "interrupted before it finished" in text
+
+
+def test_humanize_worker_failure_for_activity_cancelled_stop() -> None:
+    text = _humanize_worker_failure(
+        "research cameras",
+        "Activity cancelled",
+        JobStatus.INTERRUPTED,
+    )
+    assert text == "I stopped that task."
+
+
+def test_job_indicates_user_stop_for_existing_interrupted_job() -> None:
+    job = AgentJob(
+        source=JobSource.SIRI,
+        query="research cameras",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.INTERRUPTED,
+        current_step="stopped by user",
+        error_message="stopped by user",
+    )
+    assert _job_indicates_user_stop(job, "") is True
 
 
 def test_format_status_message_for_paused_input_job() -> None:
@@ -341,3 +389,21 @@ def test_active_job_is_not_stale_when_paused_for_input() -> None:
         created_at="2026-05-18T20:00:00+00:00",
     )
     assert not _active_job_is_stale(job, now=datetime.fromisoformat("2026-05-18T22:00:00+00:00"))
+
+
+def test_status_summary_for_query_is_domain_specific() -> None:
+    assert status_summary_for_query("Find flights from NYC to Chicago", attachments=False) == "checking live flight options and comparing fares"
+    assert status_summary_for_query("Find me a rental car in Ibiza", attachments=False) == "checking rental car availability and comparing prices"
+    assert status_summary_for_query("Book me a restaurant reservation tonight", attachments=False) == "checking reservation sources and matching real venues"
+
+
+def test_progress_notification_text_is_descriptive() -> None:
+    job = AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Find flights from NYC to Chicago",
+        task_class=TaskClass.HEAVY,
+    )
+    message = progress_notification_text(job, current_step="running_agent", summary="checking live flight options and comparing fares")
+    assert "Still working on your task." in message
+    assert "Current step: running agent" in message
+    assert "Latest progress: checking live flight options and comparing fares" in message

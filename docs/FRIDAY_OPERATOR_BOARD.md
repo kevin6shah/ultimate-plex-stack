@@ -23,6 +23,10 @@ Future Codex/Friday sessions should read this early and keep it current.
   - booking / reservations / commerce -> vetted connector if one is actually installed and approved, otherwise deterministic fetch first, then Stagehand, then Browser-use only as the last browser fallback
   - login walls / sign-up pages -> pause and ask instead of improvising account creation
 - Keep the dedicated on-demand Friday worker as the default heavy-task execution surface; do not fall back to the shared Iris/VPN host for rebuilds or runtime patching.
+- If Temporal is introduced, keep the split strict:
+  - shared host may own always-on orchestration only
+  - dedicated worker remains the only approved heavy browser/activity surface
+- Any infra/runtime session that touches the shared host must leave behind an explicit inventory of the production responsibilities already running there.
 - Finish one clean end-to-end validation of the new screenshot-delivery defaults on a completed browser-heavy task.
 
 ## Operator Preferences
@@ -124,6 +128,11 @@ Future Codex/Friday sessions should read this early and keep it current.
   - deterministic public-web read still runs first
   - Stagehand now sits ahead of Browser-use in the interactive browser fallback order
   - Browser-use remains the last-resort browser fallback instead of the default interactive lane
+- Added the first repo-level Temporal execution cutover:
+  - heavy Siri/Telegram jobs can start a Temporal workflow instead of relying on the old heavy-job claim loop
+  - paused-input replies can signal the existing workflow to continue
+  - shared-host and dedicated-worker install paths now have explicit Temporal worker modes
+  - the legacy claim/broker path remains in repo only as an explicit legacy backend
 
 ## Notes
 

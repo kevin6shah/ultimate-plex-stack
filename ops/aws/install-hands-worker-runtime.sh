@@ -15,14 +15,26 @@ BROWSER_USE_MODEL_VALUE="${10:-deepseek-chat}"
 BROWSER_USE_CLOUD_MODEL_VALUE="${11:-bu-latest}"
 BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE_VALUE="${12:-us}"
 SECRETS_ENV_FILE="${13:-}"
+STATE_TABLE_NAME="${14:-}"
+ARTIFACTS_BUCKET_NAME="${15:-}"
 WORK_ROOT="/srv/friday-hands"
 INSTALL_ROOT="/opt/friday-hands"
 SWAPFILE_MB="${FRIDAY_SWAPFILE_MB:-2048}"
+EXECUTION_BACKEND="${FRIDAY_EXECUTION_BACKEND:-legacy}"
+TEMPORAL_HOST_VALUE="${TEMPORAL_HOST:-}"
+TEMPORAL_NAMESPACE_VALUE="${TEMPORAL_NAMESPACE:-default}"
+TEMPORAL_WORKFLOW_TASK_QUEUE_VALUE="${TEMPORAL_WORKFLOW_TASK_QUEUE:-friday-workflow}"
+TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE_VALUE="${TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE:-friday-heavy-activity}"
 
 [[ -f "$RUNTIME_TGZ" ]] || { echo "runtime archive not found: $RUNTIME_TGZ" >&2; exit 1; }
 [[ -n "$API_BASE_URL" ]] || { echo "api base url is required" >&2; exit 1; }
 [[ -n "$WORKER_API_KEY" ]] || { echo "worker api key is required" >&2; exit 1; }
 [[ -n "$DEEPSEEK_API_KEY" ]] || { echo "deepseek api key is required" >&2; exit 1; }
+if [[ "$EXECUTION_BACKEND" == "temporal" ]]; then
+  [[ -n "$STATE_TABLE_NAME" ]] || { echo "state table is required for temporal mode" >&2; exit 1; }
+  [[ -n "$ARTIFACTS_BUCKET_NAME" ]] || { echo "artifacts bucket is required for temporal mode" >&2; exit 1; }
+  [[ -n "$TEMPORAL_HOST_VALUE" ]] || { echo "TEMPORAL_HOST is required for temporal mode" >&2; exit 1; }
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 shutdown -c >/dev/null 2>&1 || true
@@ -80,6 +92,8 @@ BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE=${BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE_VALU
 BROWSER_USE_STEP_TIMEOUT_SECONDS=120
 BROWSER_USE_MAX_FAILURES=3
 BROWSER_USE_TASK_TIMEOUT_SECONDS=90
+CHROME_PATH=/ms-playwright/chromium-1148/chrome-linux/chrome
+STAGEHAND_LOCAL_CHROME_PATH=/ms-playwright/chromium-1148/chrome-linux/chrome
 MCP_REGISTRATION_TIMEOUT_SECONDS=20
 BRAVE_SEARCH_API_KEY_PARAM=/friday/agent/brave-search-api-key
 FIRECRAWL_MCP_ENABLED=${FIRECRAWL_MCP_ENABLED:-true}
@@ -108,6 +122,16 @@ OPENTABLE_PASSWORD_PARAM=/friday/agent/opentable-password
 GMAIL_MCP_ENABLED=${GMAIL_MCP_ENABLED:-false}
 GMAIL_ACCOUNT_EMAIL_PARAM=/friday/agent/gmail-account-email
 GMAIL_APP_PASSWORD_PARAM=/friday/agent/gmail-app-password
+STATE_TABLE=${STATE_TABLE_NAME}
+ARTIFACTS_BUCKET=${ARTIFACTS_BUCKET_NAME}
+FRIDAY_EXECUTION_BACKEND=${EXECUTION_BACKEND}
+TEMPORAL_ENABLED=$([[ "$EXECUTION_BACKEND" == "temporal" ]] && echo true || echo false)
+TEMPORAL_HOST=${TEMPORAL_HOST_VALUE}
+TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE_VALUE}
+TEMPORAL_WORKFLOW_TASK_QUEUE=${TEMPORAL_WORKFLOW_TASK_QUEUE_VALUE}
+TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE=${TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE_VALUE}
+TEMPORAL_ACTIVITY_WORKER_IDENTITY=friday-dedicated-activity-worker
+TELEGRAM_BOT_TOKEN_PARAM=/friday/agent/telegram-bot-token
 ENVEOF
 chmod 600 /etc/friday-hands.env
 
@@ -152,6 +176,35 @@ WantedBy=multi-user.target
 SERVICEEOF
 
 systemctl daemon-reload
+if [[ "$EXECUTION_BACKEND" == "temporal" ]]; then
+  systemctl stop friday-hands-broker.service >/dev/null 2>&1 || true
+  systemctl disable friday-hands-broker.service >/dev/null 2>&1 || true
+  cat >/etc/systemd/system/friday-temporal-activity-worker.service <<SERVICEEOF
+[Unit]
+Description=Friday Temporal heavy activity worker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/friday-hands.env
+ExecStart=/usr/bin/docker run --rm --name friday-temporal-activity-worker --env-file /etc/friday-hands.env --network bridge --mount type=bind,src=${WORK_ROOT}/workspaces,dst=${WORK_ROOT}/workspaces friday-hands-worker:latest python /opt/friday/temporal_activity_worker.py
+ExecStop=/usr/bin/docker stop friday-temporal-activity-worker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+  systemctl daemon-reload
+  systemctl enable --now friday-temporal-activity-worker.service
+  echo "Friday dedicated Temporal activity worker installed."
+  exit 0
+fi
+
 systemctl enable --now friday-hands-broker.service
 
 echo "Friday dedicated hands worker runtime installed."

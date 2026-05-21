@@ -45,7 +45,11 @@ from .jobs import (
 from .routing import classify_task, is_long_task, task_routing_profile
 from .settings import settings
 from .storage import StateStore
+from .temporal_runtime import temporal_backend_enabled
 from .telegram import TelegramClient, parse_telegram_update
+from .worker_lifecycle import ensure_dedicated_worker_running as shared_ensure_dedicated_worker_running
+from .worker_lifecycle import maybe_stop_dedicated_worker_if_idle as shared_maybe_stop_dedicated_worker_if_idle
+from .heavy_job_runtime import progress_notification_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -118,65 +122,21 @@ def _worker_instance_state() -> str:
 
 
 def _ensure_dedicated_worker_running() -> None:
-    if not _dedicated_worker_enabled():
-        return
-    state = _worker_instance_state()
-    logger.info("dedicated worker instance state=%s instance_id=%s", state, settings.hands_worker_instance_id)
-    if state == "stopped":
-        settings.ec2.start_instances(InstanceIds=[settings.hands_worker_instance_id])
-    elif state in {"stopping", "pending", "running"}:
-        return
+    shared_ensure_dedicated_worker_running(settings)
 
 
 def _maybe_stop_dedicated_worker_if_idle(state: StateStore) -> None:
-    if not _dedicated_worker_enabled():
+    shared_maybe_stop_dedicated_worker_if_idle(settings, state)
+
+
+async def _start_heavy_job(state: StateStore, job: AgentJob) -> None:
+    state.create_job(job)
+    if temporal_backend_enabled(settings):
+        from .temporal_client import start_heavy_job_workflow
+
+        await start_heavy_job_workflow(settings, state, job)
         return
-    if not settings.hands_worker_stop_enabled:
-        logger.info("dedicated worker stop disabled; leaving instance running")
-        return
-    active = state.list_jobs(
-        statuses=(
-            JobStatus.QUEUED,
-            JobStatus.RUNNING,
-        ),
-        limit=100,
-    )
-    heavy_active = [job for job in active if job.task_class == TaskClass.HEAVY]
-    if heavy_active:
-        logger.info("dedicated worker remains running; active heavy jobs=%s", len(heavy_active))
-        return
-    grace_seconds = max(0, settings.hands_worker_idle_grace_seconds)
-    if grace_seconds:
-        recent_statuses = (
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.INTERRUPTED,
-            JobStatus.TIMED_OUT,
-            JobStatus.PAUSED_FOR_INPUT,
-            JobStatus.WAITING_APPROVAL,
-            JobStatus.CHECKPOINTED,
-            JobStatus.PAUSED_BUDGET,
-        )
-        recent_jobs = state.list_jobs(statuses=recent_statuses, limit=20)
-        now = datetime.now(timezone.utc)
-        for job in recent_jobs:
-            if job.task_class != TaskClass.HEAVY:
-                continue
-            last_activity = _parse_job_timestamp(job.last_heartbeat_at or job.created_at)
-            if last_activity is None:
-                continue
-            idle_seconds = (now - last_activity).total_seconds()
-            if idle_seconds < grace_seconds:
-                logger.info(
-                    "dedicated worker remains running; last heavy activity was %.1fs ago (grace=%ss)",
-                    idle_seconds,
-                    grace_seconds,
-                )
-                return
-    instance_state = _worker_instance_state()
-    if instance_state == "running":
-        logger.info("stopping dedicated worker instance_id=%s after queue drain", settings.hands_worker_instance_id)
-        settings.ec2.stop_instances(InstanceIds=[settings.hands_worker_instance_id])
+    _ensure_dedicated_worker_running()
 
 
 def _normalize_query(text: str) -> str:
@@ -301,8 +261,10 @@ def _humanize_worker_failure(query: str, error_message: str, status: JobStatus) 
     lowered = normalized.lower()
     query_lowered = query.lower()
 
-    if status == JobStatus.INTERRUPTED and "stopped by user" in lowered:
-        return "I stopped that task."
+    if status == JobStatus.INTERRUPTED:
+        if "stopped by user" in lowered or "activity cancelled" in lowered or "activity canceled" in lowered:
+            return "I stopped that task."
+        return "This task was interrupted before it finished. Say 'resume that task' if you want me to continue from the last checkpoint."
     if status == JobStatus.TIMED_OUT:
         return "This task took too long and timed out before it finished."
     if "request_limit of 50" in lowered or "would exceed the request_limit" in lowered:
@@ -490,6 +452,21 @@ def _job_accepts_live_worker_updates(job: AgentJob) -> bool:
     return job.status == JobStatus.RUNNING
 
 
+def _checkpoint_indicates_interruption(summary: str) -> bool:
+    return (summary or "").strip().lower().startswith("interrupted:")
+
+
+def _job_indicates_user_stop(job: AgentJob, latest_summary: str) -> bool:
+    current_step = (job.current_step or "").strip().lower()
+    error_message = (job.error_message or "").strip().lower()
+    return (
+        job.status == JobStatus.INTERRUPTED
+        or current_step == "stopped by user"
+        or "stopped by user" in error_message
+        or _checkpoint_indicates_interruption(latest_summary)
+    )
+
+
 def _remember_if_tagged(state: StateStore, *, user_id: str, query: str) -> bool:
     normalized = query.strip()
     if not normalized.startswith("#"):
@@ -513,6 +490,100 @@ def _looks_like_internal_tool_markup(text: str) -> bool:
 
 
 def _latest_status_job_for_user(state: StateStore, *, source: JobSource, user_id: str) -> Optional[AgentJob]:
+    raise RuntimeError("use async variant")
+
+
+async def _reconcile_temporal_jobs(state: StateStore, jobs: list[AgentJob]) -> list[AgentJob]:
+    refreshed = _refresh_stale_active_jobs(state, jobs)
+    if not refreshed or not temporal_backend_enabled(settings):
+        return refreshed
+    temporal_jobs = [
+        job for job in refreshed if str((job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
+    ]
+    if not temporal_jobs:
+        return refreshed
+    try:
+        from .temporal_runtime import get_temporal_client, heavy_workflow_id
+
+        client = await get_temporal_client(settings)
+    except Exception:
+        return refreshed
+
+    status_updates: dict[str, AgentJob] = {}
+    for job in temporal_jobs:
+        checkpoint = state.get_latest_checkpoint(job.job_id)
+        latest_summary = job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or ""
+        try:
+            handle = client.get_workflow_handle(heavy_workflow_id(settings, job.job_id))
+            description = await handle.describe()
+            raw_status = getattr(description, "status", "")
+            status_name = getattr(raw_status, "name", str(raw_status)).upper()
+        except Exception:
+            continue
+        if status_name in {"RUNNING", "CONTINUED_AS_NEW"}:
+            continue
+        if status_name in {"TERMINATED", "CANCELED", "CANCELLED"}:
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped by user",
+                error_message="stopped by user",
+            )
+        elif status_name == "TIMED_OUT":
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.TIMED_OUT,
+                current_step="workflow timed out",
+                error_message="The workflow timed out before the task finished.",
+            )
+        elif status_name == "FAILED":
+            if _checkpoint_indicates_interruption(latest_summary):
+                state.update_job_status(
+                    job.job_id,
+                    status=JobStatus.INTERRUPTED,
+                    current_step=job.current_step or (checkpoint.current_step if checkpoint else "") or "interrupted",
+                    error_message="This task was interrupted before it finished.",
+                )
+            else:
+                state.update_job_status(
+                    job.job_id,
+                    status=JobStatus.FAILED,
+                    current_step="workflow failed",
+                    error_message="The workflow failed before the task finished.",
+                )
+        elif status_name == "COMPLETED":
+            if (job.result_preview or "").strip() or job.output_files or job.artifact_keys:
+                state.update_job_status(
+                    job.job_id,
+                    status=JobStatus.COMPLETED,
+                    current_step="completed",
+                    error_message="",
+                )
+            elif _job_indicates_user_stop(job, latest_summary):
+                state.update_job_status(
+                    job.job_id,
+                    status=JobStatus.INTERRUPTED,
+                    current_step=job.current_step or (checkpoint.current_step if checkpoint else "") or "stopped by user",
+                    error_message=job.error_message or "stopped by user",
+                )
+            else:
+                state.update_job_status(
+                    job.job_id,
+                    status=JobStatus.INTERRUPTED,
+                    current_step="workflow finished without persisting a final result",
+                    error_message="The workflow finished internally, but its final result was not persisted cleanly.",
+                )
+        refreshed_job = state.get_job(job.job_id)
+        if refreshed_job is not None:
+            status_updates[job.job_id] = refreshed_job
+    return [status_updates.get(job.job_id, job) for job in refreshed]
+
+
+def _job_sort_timestamp(job: AgentJob) -> str:
+    return job.created_at or job.updated_at or ""
+
+
+async def _latest_status_job_for_user_async(state: StateStore, *, source: JobSource, user_id: str) -> Optional[AgentJob]:
     active_statuses = (
         JobStatus.RUNNING,
         JobStatus.WAITING_WORKER,
@@ -524,21 +595,27 @@ def _latest_status_job_for_user(state: StateStore, *, source: JobSource, user_id
         JobStatus.PAUSED_BUDGET,
         JobStatus.TIMED_OUT,
     )
-    active = _refresh_stale_active_jobs(
+    active_jobs = await _reconcile_temporal_jobs(
         state,
         state.list_jobs_for_user(source=source.value, user_id=user_id, statuses=active_statuses, limit=10),
     )
-    for job in active:
-        if job.status in active_statuses:
-            return job
     recent_statuses = (
         JobStatus.COMPLETED,
         JobStatus.FAILED,
     )
-    return state.get_latest_job_for_user(source=source.value, user_id=user_id, statuses=recent_statuses)
+    recent_jobs = state.list_jobs_for_user(source=source.value, user_id=user_id, statuses=recent_statuses, limit=10)
+    candidates = active_jobs + recent_jobs
+    if not candidates:
+        return None
+    ordered = sorted(candidates, key=_job_sort_timestamp, reverse=True)
+    return ordered[0]
 
 
 def _active_jobs_for_user(state: StateStore, *, source: JobSource, user_id: str) -> list[AgentJob]:
+    raise RuntimeError("use async variant")
+
+
+async def _active_jobs_for_user_async(state: StateStore, *, source: JobSource, user_id: str) -> list[AgentJob]:
     jobs = state.list_jobs_for_user(
         source=source.value,
         user_id=user_id,
@@ -551,7 +628,7 @@ def _active_jobs_for_user(state: StateStore, *, source: JobSource, user_id: str)
         ),
         limit=10,
     )
-    refreshed = _refresh_stale_active_jobs(state, jobs)
+    refreshed = await _reconcile_temporal_jobs(state, jobs)
     return [
         job
         for job in refreshed
@@ -724,6 +801,50 @@ def _stop_jobs(state: StateStore, jobs: list[AgentJob]) -> tuple[int, int]:
     return stopped_now, signaled
 
 
+async def _stop_jobs_async(state: StateStore, jobs: list[AgentJob]) -> tuple[int, int]:
+    stopped_now = 0
+    signaled = 0
+    for job in jobs:
+        uses_temporal = str((job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
+        if _active_job_is_stale(job):
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped after losing progress",
+                error_message=_stale_active_job_error(job),
+            )
+            stopped_now += 1
+            continue
+        if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER, JobStatus.WAITING_APPROVAL, JobStatus.PAUSED_FOR_INPUT}:
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped by user",
+                error_message="stopped by user",
+            )
+            if uses_temporal:
+                from .temporal_client import signal_stop_heavy_job
+
+                signaled += 1 if await signal_stop_heavy_job(settings, job.job_id, "stopped by user") else 0
+            stopped_now += 1
+        elif job.status == JobStatus.RUNNING:
+            state.update_job_status(
+                job.job_id,
+                status=JobStatus.INTERRUPTED,
+                current_step="stopped by user",
+                error_message="stopped by user",
+            )
+            if uses_temporal:
+                from .temporal_client import signal_stop_heavy_job
+
+                signaled += 1 if await signal_stop_heavy_job(settings, job.job_id, "stopped by user") else 0
+            else:
+                state.record_control_signal(job.job_id, command=ControlCommand.STOP, note="stopped by user")
+                signaled += 1
+            stopped_now += 1
+    return stopped_now, signaled
+
+
 def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
     if job is None:
         return "I do not see a recent long-running task to report on."
@@ -735,6 +856,9 @@ def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
     if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
         return f"Your latest task is queued.{step_line}{summary_line}".strip()
     if job.status == JobStatus.RUNNING:
+        if _checkpoint_indicates_interruption(summary):
+            tail = "\nSay 'resume that task' if you want me to continue from the last checkpoint."
+            return f"Your latest task appears interrupted while I reconcile its final state.{step_line}{summary_line}{tail}".strip()
         return f"Still working on your latest task.{step_line}{summary_line}".strip()
     if job.status == JobStatus.WAITING_APPROVAL:
         return f"Your latest task is waiting for approval.{step_line}{summary_line}".strip()
@@ -888,9 +1012,9 @@ async def run_and_notify(job: AgentJob) -> None:
             long_task=True,
             attachments=job.attachments,
             resume_from_job_id=job.resume_from_job_id,
+            metadata={"execution_backend": "temporal" if temporal_backend_enabled(settings) else "legacy"},
         )
-        state.create_job(heavy_job)
-        _ensure_dedicated_worker_running()
+        await _start_heavy_job(state, heavy_job)
         if job.chat_id:
             await telegram.send_message(job.chat_id, "I started that and will notify you in Telegram.")
         return
@@ -1103,6 +1227,9 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
     user_id = str(message.from_.id if message.from_ else message.chat.id)
     conversation_id = chat_id
     state = store()
+    if not state.claim_telegram_update(chat_id=chat_id, update_id=update.update_id, user_id=user_id):
+        logger.info("ignoring duplicate telegram update chat_id=%s update_id=%s", chat_id, update.update_id)
+        return {"status": "duplicate_ignored"}
     state.put_session(channel="telegram", user_id=user_id, metadata={"chat_id": chat_id})
 
     if query and _remember_if_tagged(state, user_id=user_id, query=query):
@@ -1118,7 +1245,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             text=query,
             task_class=TaskClass.LIGHT,
         )
-        jobs = _active_jobs_for_user(state, source=JobSource.TELEGRAM, user_id=user_id)
+        jobs = await _active_jobs_for_user_async(state, source=JobSource.TELEGRAM, user_id=user_id)
         status_text = _format_tasks_list(state, jobs)
         state.record_turn(
             channel="telegram",
@@ -1142,7 +1269,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
         )
         status_text = _format_status_message(
             state,
-            _latest_status_job_for_user(state, source=JobSource.TELEGRAM, user_id=user_id),
+            await _latest_status_job_for_user_async(state, source=JobSource.TELEGRAM, user_id=user_id),
         )
         state.record_turn(
             channel="telegram",
@@ -1164,9 +1291,9 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             text=query,
             task_class=TaskClass.LIGHT,
         )
-        jobs = _active_jobs_for_user(state, source=JobSource.TELEGRAM, user_id=user_id)
+        jobs = await _active_jobs_for_user_async(state, source=JobSource.TELEGRAM, user_id=user_id)
         if _is_stop_all_request(query):
-            stopped_now, signaled = _stop_jobs(state, jobs)
+            stopped_now, signaled = await _stop_jobs_async(state, jobs)
             total = stopped_now + signaled
             if total == 0:
                 reply = "I do not see any active long-running tasks to stop right now."
@@ -1181,7 +1308,7 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             if target is None:
                 reply = "I could not tell which task to stop. Ask me to list your tasks, then say something like 'stop 1' or 'stop <job id>'."
             else:
-                stopped_now, signaled = _stop_jobs(state, [target])
+                stopped_now, signaled = await _stop_jobs_async(state, [target])
                 findings = _partial_findings_text(state, target) if _wants_findings_after_stop(query) else ""
                 if stopped_now:
                     reply = f"Stopped task {target.job_id[:8]}."
@@ -1213,6 +1340,22 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
 
     paused_job = _latest_paused_input_job_for_user(state, source=JobSource.TELEGRAM, user_id=user_id)
     paused_checkpoint = state.get_latest_checkpoint(paused_job.job_id) if paused_job is not None else None
+    paused_job_uses_temporal = paused_job is not None and str((paused_job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
+    if (
+        paused_job is not None
+        and paused_job_uses_temporal
+        and message.document is None
+        and query
+        and (_is_input_reply(query) or _looks_like_natural_input_reply(query))
+    ):
+        reply_text = _strip_input_reply_prefix(query or "")
+        from .temporal_client import signal_answer_heavy_job
+
+        resumed = await signal_answer_heavy_job(settings, paused_job.job_id, reply_text)
+        if resumed:
+            state.update_job_status(paused_job.job_id, status=JobStatus.RUNNING, current_step="resuming task")
+            await TelegramClient(settings).send_message(chat_id, "I resumed that and will notify you in Telegram.")
+            return {"status": "resumed", "job_id": paused_job.job_id}
     if paused_job is not None:
         if message.document is not None or (query and (_is_input_reply(query) or _looks_like_natural_input_reply(query))):
             effective_query = _build_paused_input_resume_query(
@@ -1283,9 +1426,9 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             long_task=True,
             attachments=attachments,
             resume_from_job_id=resume_from_job_id,
+            metadata={"execution_backend": "temporal" if temporal_backend_enabled(settings) else "legacy"},
         )
-        state.create_job(created_job)
-        _ensure_dedicated_worker_running()
+        await _start_heavy_job(state, created_job)
         await TelegramClient(settings).send_message(chat_id, "I started that and will notify you in Telegram.")
         return {"status": "queued", "job_id": created_job.job_id}
 
@@ -1300,9 +1443,9 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             long_task=True,
             attachments=attachments,
             resume_from_job_id=resume_from_job_id,
+            metadata={"execution_backend": "temporal" if temporal_backend_enabled(settings) else "legacy"},
         )
-        state.create_job(job)
-        _ensure_dedicated_worker_running()
+        await _start_heavy_job(state, job)
         await TelegramClient(settings).send_message(chat_id, "I started that and will notify you in Telegram.")
         return {"status": "queued", "job_id": job.job_id}
 
@@ -1340,7 +1483,7 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             text=query,
             task_class=TaskClass.LIGHT,
         )
-        jobs = _active_jobs_for_user(state, source=JobSource.SIRI, user_id="siri")
+        jobs = await _active_jobs_for_user_async(state, source=JobSource.SIRI, user_id="siri")
         status_text = _format_tasks_list(state, jobs)
         state.record_turn(
             channel="siri",
@@ -1363,7 +1506,7 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
         )
         status_text = _format_status_message(
             state,
-            _latest_status_job_for_user(state, source=JobSource.SIRI, user_id="siri"),
+            await _latest_status_job_for_user_async(state, source=JobSource.SIRI, user_id="siri"),
         )
         state.record_turn(
             channel="siri",
@@ -1384,9 +1527,9 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             text=query,
             task_class=TaskClass.LIGHT,
         )
-        jobs = _active_jobs_for_user(state, source=JobSource.SIRI, user_id="siri")
+        jobs = await _active_jobs_for_user_async(state, source=JobSource.SIRI, user_id="siri")
         if _is_stop_all_request(query):
-            stopped_now, signaled = _stop_jobs(state, jobs)
+            stopped_now, signaled = await _stop_jobs_async(state, jobs)
             total = stopped_now + signaled
             if total == 0:
                 reply = "I do not see any active long-running tasks to stop right now."
@@ -1401,7 +1544,7 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             if target is None:
                 reply = "I could not tell which task to stop. Ask me to list your tasks, then say something like stop 1."
             else:
-                stopped_now, signaled = _stop_jobs(state, [target])
+                stopped_now, signaled = await _stop_jobs_async(state, [target])
                 findings = _partial_findings_text(state, target) if _wants_findings_after_stop(query) else ""
                 if stopped_now:
                     reply = f"Stopped task {target.job_id[:8]}."
@@ -1432,6 +1575,14 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
     conversation_id = "siri"
     paused_job = _latest_paused_input_job_for_user(state, source=JobSource.SIRI, user_id="siri")
     paused_checkpoint = state.get_latest_checkpoint(paused_job.job_id) if paused_job is not None else None
+    paused_job_uses_temporal = paused_job is not None and str((paused_job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
+    if paused_job is not None and paused_job_uses_temporal and (_is_input_reply(query) or _looks_like_natural_input_reply(query)):
+        from .temporal_client import signal_answer_heavy_job
+
+        resumed = await signal_answer_heavy_job(settings, paused_job.job_id, _strip_input_reply_prefix(query))
+        if resumed:
+            state.update_job_status(paused_job.job_id, status=JobStatus.RUNNING, current_step="resuming task")
+            return SiriResponse(response="I resumed that and will notify you in Telegram.", queued=True, job_id=paused_job.job_id)
     if paused_job is not None:
         if _is_input_reply(query) or _looks_like_natural_input_reply(query):
             task_class = TaskClass.HEAVY
@@ -1480,9 +1631,9 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             conversation_id=conversation_id,
             long_task=True,
             resume_from_job_id=resume_from_job_id,
+            metadata={"execution_backend": "temporal" if temporal_backend_enabled(settings) else "legacy"},
         )
-        state.create_job(job)
-        _ensure_dedicated_worker_running()
+        await _start_heavy_job(state, job)
         return SiriResponse(response="I started that and will notify you in Telegram.", queued=True, job_id=job.job_id)
 
     state.record_turn(
@@ -1529,9 +1680,9 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
                 user_id="siri",
                 conversation_id=conversation_id,
                 long_task=True,
+                metadata={"execution_backend": "temporal" if temporal_backend_enabled(settings) else "legacy"},
             )
-            state.create_job(job)
-            _ensure_dedicated_worker_running()
+            await _start_heavy_job(state, job)
             return SiriResponse(response="I started that and will notify you in Telegram.", queued=True, job_id=job.job_id)
         return SiriResponse(response=result.text)
     except TimeoutError:
@@ -1544,9 +1695,9 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             user_id="siri",
             conversation_id=conversation_id,
             long_task=True,
+            metadata={"execution_backend": "temporal" if temporal_backend_enabled(settings) else "legacy"},
         )
-        state.create_job(job)
-        _ensure_dedicated_worker_running()
+        await _start_heavy_job(state, job)
         return SiriResponse(response="I started that and will notify you in Telegram.", queued=True, job_id=job.job_id)
 
 
@@ -1555,6 +1706,8 @@ async def worker_claim(request: Request, x_friday_worker_key: Optional[str] = He
     expected_key = settings.secret(settings.worker_api_key_param)
     if expected_key and x_friday_worker_key != expected_key:
         raise HTTPException(status_code=401, detail="invalid worker key")
+    if temporal_backend_enabled(settings):
+        return WorkerClaimResponse(ok=False)
 
     state = store()
     if not state.budget_available():
@@ -1604,6 +1757,8 @@ async def worker_claim_specific(job_id: str, request: Request, x_friday_worker_k
     expected_key = settings.secret(settings.worker_api_key_param)
     if expected_key and x_friday_worker_key != expected_key:
         raise HTTPException(status_code=401, detail="invalid worker key")
+    if temporal_backend_enabled(settings):
+        return WorkerClaimResponse(ok=False)
 
     state = store()
     job = state.claim_job(job_id)
@@ -1657,13 +1812,27 @@ async def worker_heartbeat(body: WorkerHeartbeat, x_friday_worker_key: Optional[
         raise HTTPException(status_code=404, detail="job not found")
     if not _job_accepts_live_worker_updates(job):
         return {"status": "ignored"}
-    state.update_job_heartbeat(body.job_id, current_step=body.current_step, summary=body.summary)
+    updated_job = state.update_job_heartbeat(body.job_id, current_step=body.current_step, summary=body.summary)
+    config = state.get_config()
+    if state.should_stop_for_stall(body.job_id, interval_seconds=config.status_update_interval_seconds):
+        state.record_control_signal(
+            body.job_id,
+            command=ControlCommand.STOP,
+            note="auto-stopped after repeated identical worker heartbeats with no meaningful progress",
+        )
+        state.mark_loop_stop_requested(body.job_id)
+        if updated_job.chat_id:
+            await TelegramClient(settings).send_message(
+                updated_job.chat_id,
+                "I stopped this task because it appeared stuck on the same step without meaningful progress. "
+                "If you want, I can resume it or try a different approach.",
+            )
+        return {"status": "stall_stop_requested"}
     if body.notify and job.chat_id:
-        config = state.get_config()
-        if state.should_send_status_update(body.job_id, interval_seconds=config.status_update_interval_seconds):
-            summary = body.summary.strip() or body.current_step.strip() or "still working"
-            await TelegramClient(settings).send_message(job.chat_id, f"Still working: {summary[:1000]}")
-            state.mark_status_update_sent(body.job_id)
+        message = progress_notification_text(updated_job, current_step=body.current_step, summary=body.summary)
+        if state.should_send_status_update(body.job_id, interval_seconds=config.status_update_interval_seconds, text=message):
+            await TelegramClient(settings).send_message(job.chat_id, message)
+            state.mark_status_update_sent(body.job_id, text=message)
     return {"status": "ok"}
 
 

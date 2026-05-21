@@ -18,6 +18,10 @@ BUDGET_ALERT_EMAIL_VALUE="${BUDGET_ALERT_EMAIL:-}"
 AGENT_RESERVED_CONCURRENCY_VALUE="${AGENT_RESERVED_CONCURRENCY:-0}"
 HANDS_WORKER_MODE_VALUE="${HANDS_WORKER_MODE:-shared_host}"
 HANDS_WORKER_INSTANCE_ID_VALUE="${HANDS_WORKER_INSTANCE_ID:-}"
+HANDS_WORKER_STACK_NAME_VALUE="${HANDS_WORKER_STACK_NAME:-friday-hands-worker}"
+EC2_SSH_KEY_VALUE="${EC2_SSH_KEY:-}"
+REMOTE_BUILD_HOST_VALUE="${REMOTE_BUILD_HOST:-}"
+REMOTE_BUILD_USER_VALUE="${REMOTE_BUILD_USER:-ubuntu}"
 SET_TELEGRAM_WEBHOOK_VALUE="${SET_TELEGRAM_WEBHOOK:-0}"
 DEEPSEEK_API_KEY_PARAM_VALUE="${DEEPSEEK_API_KEY_PARAM:-/friday/agent/deepseek-api-key}"
 BRAVE_SEARCH_API_KEY_PARAM_VALUE="${BRAVE_SEARCH_API_KEY_PARAM:-/friday/agent/brave-search-api-key}"
@@ -61,12 +65,17 @@ RESY_MCP_ENABLED_VALUE="${RESY_MCP_ENABLED:-false}"
 OPENTABLE_MCP_ENABLED_VALUE="${OPENTABLE_MCP_ENABLED:-false}"
 GMAIL_MCP_ENABLED_VALUE="${GMAIL_MCP_ENABLED:-false}"
 SHARED_HOST_INSTANCE_ID_VALUE="${SHARED_HOST_INSTANCE_ID:-}"
+EXECUTION_BACKEND_VALUE="${FRIDAY_EXECUTION_BACKEND:-temporal}"
+TEMPORAL_ENABLED_VALUE="${TEMPORAL_ENABLED:-}"
+TEMPORAL_HOST_VALUE="${TEMPORAL_HOST:-}"
+TEMPORAL_NAMESPACE_VALUE="${TEMPORAL_NAMESPACE:-default}"
+TEMPORAL_WORKFLOW_TASK_QUEUE_VALUE="${TEMPORAL_WORKFLOW_TASK_QUEUE:-friday-workflow}"
+TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE_VALUE="${TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE:-friday-heavy-activity}"
 
 [[ -n "$AWS_PROFILE_NAME" ]] || { echo "AWS_PROFILE is required" >&2; exit 1; }
 
-for cmd in aws docker; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "required command not found: $cmd" >&2; exit 1; }
-done
+command -v aws >/dev/null 2>&1 || { echo "required command not found: aws" >&2; exit 1; }
+command -v docker >/dev/null 2>&1 || { echo "required command not found: docker" >&2; exit 1; }
 
 stack_status="$(
   AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
@@ -82,6 +91,25 @@ if [[ -z "$SHARED_HOST_INSTANCE_ID_VALUE" ]]; then
   )"
 fi
 
+if [[ "$EXECUTION_BACKEND_VALUE" == "temporal" && -z "$TEMPORAL_HOST_VALUE" ]]; then
+  shared_host_public_dns="$(
+    AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+      aws cloudformation describe-stacks --stack-name "$SHARED_HOST_STACK_NAME_VALUE" \
+        --query 'Stacks[0].Outputs[?OutputKey==`PublicDnsName`].OutputValue' --output text 2>/dev/null || true
+  )"
+  if [[ -n "$shared_host_public_dns" && "$shared_host_public_dns" != "None" ]]; then
+    TEMPORAL_HOST_VALUE="${shared_host_public_dns}:7233"
+  fi
+fi
+
+if [[ -z "$TEMPORAL_ENABLED_VALUE" ]]; then
+  if [[ "$EXECUTION_BACKEND_VALUE" == "temporal" ]]; then
+    TEMPORAL_ENABLED_VALUE="true"
+  else
+    TEMPORAL_ENABLED_VALUE="false"
+  fi
+fi
+
 if [[ -z "$stack_status" ]]; then
   common_parameters=(
     "BootstrapOnly=true"
@@ -91,6 +119,12 @@ if [[ -z "$stack_status" ]]; then
     "SharedHostInstanceId=${SHARED_HOST_INSTANCE_ID_VALUE}"
     "HandsWorkerMode=${HANDS_WORKER_MODE_VALUE}"
     "HandsWorkerInstanceId=${HANDS_WORKER_INSTANCE_ID_VALUE}"
+    "ExecutionBackend=${EXECUTION_BACKEND_VALUE}"
+    "TemporalEnabled=${TEMPORAL_ENABLED_VALUE}"
+    "TemporalHost=${TEMPORAL_HOST_VALUE}"
+    "TemporalNamespace=${TEMPORAL_NAMESPACE_VALUE}"
+    "TemporalWorkflowTaskQueue=${TEMPORAL_WORKFLOW_TASK_QUEUE_VALUE}"
+    "TemporalHeavyActivityTaskQueue=${TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE_VALUE}"
     "DeepSeekApiKeyParam=${DEEPSEEK_API_KEY_PARAM_VALUE}"
     "BraveSearchApiKeyParam=${BRAVE_SEARCH_API_KEY_PARAM_VALUE}"
     "BrowserUseApiKeyParam=${BROWSER_USE_API_KEY_PARAM_VALUE}"
@@ -152,12 +186,51 @@ if [[ -n "$IMAGE_URI_OVERRIDE_VALUE" ]]; then
   image_uri="$IMAGE_URI_OVERRIDE_VALUE"
 else
   registry="${repository_uri%/*}"
-  AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
-    aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
-
   image_uri="${repository_uri}:${IMAGE_TAG_VALUE}"
-  docker build --platform linux/amd64 --provenance=false -t "$image_uri" "$ROOT_DIR/agent"
-  docker push "$image_uri"
+  if docker info >/dev/null 2>&1; then
+    AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+      aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
+    docker build --platform linux/amd64 --provenance=false -t "$image_uri" "$ROOT_DIR/agent"
+    docker push "$image_uri"
+  else
+    if [[ -z "$REMOTE_BUILD_HOST_VALUE" ]]; then
+      REMOTE_BUILD_HOST_VALUE="$(
+        AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+          aws cloudformation describe-stacks --stack-name "$HANDS_WORKER_STACK_NAME_VALUE" \
+            --query 'Stacks[0].Outputs[?OutputKey==`PublicIp`].OutputValue' --output text 2>/dev/null || true
+      )"
+    fi
+    [[ -n "$REMOTE_BUILD_HOST_VALUE" && "$REMOTE_BUILD_HOST_VALUE" != "None" ]] || {
+      echo "Local Docker unavailable and no remote build host resolved" >&2
+      exit 1
+    }
+    [[ -n "$EC2_SSH_KEY_VALUE" && -f "$EC2_SSH_KEY_VALUE" ]] || {
+      echo "Local Docker unavailable; EC2_SSH_KEY is required for remote build fallback" >&2
+      exit 1
+    }
+
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' EXIT
+    COPYFILE_DISABLE=1 tar -czf "$tmp_dir/friday-agent-build.tgz" -C "$ROOT_DIR" agent
+    AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
+      aws ecr get-login-password >"$tmp_dir/ecr-login.txt"
+
+    ssh_opts=(-i "$EC2_SSH_KEY_VALUE" -o StrictHostKeyChecking=accept-new)
+    scp "${ssh_opts[@]}" \
+      "$tmp_dir/friday-agent-build.tgz" \
+      "$tmp_dir/ecr-login.txt" \
+      "${REMOTE_BUILD_USER_VALUE}@${REMOTE_BUILD_HOST_VALUE}:/tmp/"
+
+    ssh "${ssh_opts[@]}" "${REMOTE_BUILD_USER_VALUE}@${REMOTE_BUILD_HOST_VALUE}" \
+      "set -euo pipefail
+       rm -rf /tmp/friday-agent-build
+       mkdir -p /tmp/friday-agent-build
+       tar -xzf /tmp/friday-agent-build.tgz -C /tmp/friday-agent-build
+       cat /tmp/ecr-login.txt | sudo docker login --username AWS --password-stdin '$registry' >/dev/null
+       sudo docker build --platform linux/amd64 -t '$image_uri' /tmp/friday-agent-build/agent
+       sudo docker push '$image_uri'
+       rm -rf /tmp/friday-agent-build /tmp/friday-agent-build.tgz /tmp/ecr-login.txt"
+  fi
 fi
 
 runtime_parameters=(
@@ -169,6 +242,12 @@ runtime_parameters=(
   "SharedHostInstanceId=${SHARED_HOST_INSTANCE_ID_VALUE}"
   "HandsWorkerMode=${HANDS_WORKER_MODE_VALUE}"
   "HandsWorkerInstanceId=${HANDS_WORKER_INSTANCE_ID_VALUE}"
+  "ExecutionBackend=${EXECUTION_BACKEND_VALUE}"
+  "TemporalEnabled=${TEMPORAL_ENABLED_VALUE}"
+  "TemporalHost=${TEMPORAL_HOST_VALUE}"
+  "TemporalNamespace=${TEMPORAL_NAMESPACE_VALUE}"
+  "TemporalWorkflowTaskQueue=${TEMPORAL_WORKFLOW_TASK_QUEUE_VALUE}"
+  "TemporalHeavyActivityTaskQueue=${TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE_VALUE}"
   "DeepSeekApiKeyParam=${DEEPSEEK_API_KEY_PARAM_VALUE}"
   "BraveSearchApiKeyParam=${BRAVE_SEARCH_API_KEY_PARAM_VALUE}"
   "BrowserUseApiKeyParam=${BROWSER_USE_API_KEY_PARAM_VALUE}"

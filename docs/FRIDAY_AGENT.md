@@ -33,7 +33,12 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - DynamoDB stores transient session metadata, 48-hour conversation context, durable `#memory`, heavy-job metadata, checkpoints, approvals, and the model spend ledger.
 - SSM SecureString stores tokens and API keys.
 - Lambda handles only light tasks and job coordination.
-- Heavy browser/file tasks are being moved to a dedicated on-demand EC2 hands worker so Lambda remains coordination-only and the shared VPN/Iris host is no longer the long-term execution target.
+- When `FRIDAY_EXECUTION_BACKEND=temporal`, Lambda is only ingress/client coordination:
+  - it starts/signals Temporal workflows
+  - it mirrors user-facing state into DynamoDB/Telegram
+  - it starts the dedicated worker when heavy execution is needed
+- Temporal mode only activates when a real `TEMPORAL_HOST` is configured. If that host is empty, the code intentionally does not pretend Temporal is live.
+- Heavy browser/file tasks belong on the dedicated on-demand EC2 worker so the shared VPN/Iris host remains orchestration-only, not the heavy runtime target.
 
 ## Dashboard And Cost View
 
@@ -57,8 +62,15 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - `agent/app/browser.py`: Playwright browser task implementation.
 - `agent/app/research.py`: deterministic search/fetch wrappers and tool-output sanitization.
 - `agent/app/workspace.py`: isolated workspace file and shell helpers used by the hands worker.
-- `hands/host/broker.py`: local broker used by the hands worker host to claim heavy jobs and launch the isolated worker container.
-- `hands/worker/runner.py`: hands worker container entrypoint.
+- `agent/app/temporal_runtime.py`: Temporal backend gating and client connection helpers.
+- `agent/app/temporal_client.py`: control-plane workflow start/signal helpers.
+- `agent/app/temporal_workflows.py`: durable heavy-task workflow definition.
+- `agent/app/temporal_control_activities.py`: shared-host orchestration activities that prepare claims and finalize user-visible state.
+- `agent/app/heavy_job_runtime.py`: shared heavy-job helpers for claims, pause/resume text, and final Telegram delivery.
+- `hands/host/temporal_workflow_worker.py`: shared-host Temporal workflow worker.
+- `hands/worker/temporal_activity_worker.py`: dedicated-worker Temporal heavy activity worker.
+- `hands/host/broker.py`: legacy heavy-job claim loop, retained only for explicit legacy mode.
+- `hands/worker/runner.py`: legacy claim-driven worker container entrypoint.
 - `ops/aws/friday-agent.yaml`: CloudFormation for ECR, Lambda, Function URL, SQS, DynamoDB, IAM, logs, and optional budget.
 - `ops/aws/install-hands-runtime.sh`: installs the rootless Docker worker runtime on the shared host.
 - `scripts/deploy-hands-host.sh`: pushes the hands runtime to the shared host and wires it to the live Lambda Function URL.
@@ -79,13 +91,15 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - The browser tool is not offered in Lambda light-mode at all.
 - Heavy tasks are classified before execution. Browser actions, attachments, file-processing work, and explicit resume requests are routed to the hands runtime instead of Lambda.
 - Heavy tasks can now pause durably for missing user input instead of failing terminally. The worker writes a `paused_for_input` state, preserves a checkpoint, and asks the user for the missing answer.
-- The current explicit resume contract for paused-input jobs is: reply with `answer: ...` or send the requested attachment. That reply creates a new heavy job that resumes from the saved workspace/checkpoint state.
+- In Temporal mode, the explicit resume contract for paused-input jobs is: reply with `answer: ...`. That signals the existing workflow to continue from the saved checkpoint/workspace instead of creating a separate replacement job.
+- Attachment-driven resume is still handled by creating a new heavy run when the workflow needs a newly uploaded file.
 - Browser-use step screenshots are no longer sent back to Telegram by default. They are only kept/sent when the original request explicitly asks for screenshots or images, and multiple requested screenshots are bundled into one zip.
 - The intended common-use routing hierarchy is:
   - real connector or deterministic API when one exists and is vetted
   - workspace MCP / MarkItDown / local structured file tools for files, spreadsheets, and document outputs
   - deterministic search/fetch and page conversion for general web reading
-  - Browser-use only for interaction, login, form fill, confirmation, or unsupported flows
+  - Stagehand for bounded interactive fallback after deterministic/API paths fail
+  - Browser-use only for the final interaction/login/form-fill fallback when Stagehand is unavailable or also fails
 - The capability contract for what Friday may actually promise lives in `docs/FRIDAY_CAPABILITIES_MATRIX.md`.
 - Stable general questions should stay synchronous and answer from model knowledge.
 - Conversation/task context is remembered for up to 48 hours per channel/user/conversation so follow-up questions still work.
@@ -141,11 +155,13 @@ For the Friday mailbox specifically:
 
 ## Current Hands Stack
 
-Friday's heavy-task execution stack currently is:
+Friday's intended heavy-task execution stack now is:
 
 - `PydanticAI` for planning and typed tool use
 - deterministic research wrappers (`web_search`, `fetch_web_page`) before browser escalation
-- `Browser-use` as the primary browser/computer-use loop on the dedicated worker
+- `Temporal` for durable heavy-task orchestration, stop/resume signals, and pause-for-input continuity
+- `Stagehand` as the preferred interactive browser lane on the dedicated worker
+- `Browser-use` only as the last browser fallback
 - `playwright-stealth` plus rotated user agents in the dedicated worker
 - the official filesystem MCP server for broad file/directory operations within the worker workspace roots
 - a Friday-owned workspace helper MCP server for preview, markdown conversion, and PDF generation
@@ -168,7 +184,7 @@ Current live proof on the dedicated worker:
 - direct Skiplagged travel tools have completed real flights, hotels, and rental-car tasks
 - Gmail remains intentionally disabled because the dedicated Friday mailbox was blocked by Google; email/OTP steps should currently fall back to pause/resume plus operator input
 
-This is now a Browser-use-backed heavy-task substrate, not the older custom selector-centric Playwright path. The older direct Playwright browser layer is still useful as fallback code/history, but it is no longer the primary hands architecture.
+This is now meant to be a Temporal-orchestrated, Stagehand-first heavy-task substrate. The older claim-loop broker and Browser-use-first path remain in repo only as explicit legacy fallbacks and migration references.
 
 Current explicit direction:
 
@@ -191,10 +207,10 @@ The repo now includes a first task-routing-profile pass for that direction:
 
 Those profiles currently shape heavy-task routing guidance and heavy/light classification. They are not yet the full connector-backed routing layer by themselves.
 
-The repo now also includes a first-pass durable pause-for-input path on top of this substrate. Live validation on `2026-05-15` proved:
-- a heavy Siri task can enter `paused_for_input`
-- a follow-up `answer: ...` reply creates a resumed heavy job with `resume_from_job_id`
-- the resumed job can claim the worker and continue from the prior checkpoint path
+The repo now includes a durable pause-for-input path that is intended to live on the Temporal workflow, not as a new replacement heavy job each time:
+- a heavy Siri or Telegram task can enter `paused_for_input`
+- a follow-up `answer: ...` signal can resume the same workflow
+- the dedicated worker can continue from the prior checkpoint/workspace path without handing orchestration back to the old claim loop
 
 The screenshot-suppression default is deployed live as part of the same rollout, but a clean end-to-end completed browser job proving the exact Telegram artifact/zip behavior is still pending.
 

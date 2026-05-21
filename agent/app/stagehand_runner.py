@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from .research import sanitize_tool_output
 from .settings import Settings
@@ -12,6 +15,8 @@ from .workspace import Workspace
 
 
 logger = logging.getLogger(__name__)
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 
 LOW_QUALITY_STAGEHAND_PATTERNS = (
     "i need more information",
@@ -95,6 +100,118 @@ def _stagehand_partial_findings(actions: list[object]) -> str:
     if not findings:
         return ""
     return "\n".join(f"- {item}" for item in findings[-4:])
+
+
+def _stagehand_extract_explicit_urls(task: str) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in URL_PATTERN.findall(task or ""):
+        candidate = match.rstrip(").,]")
+        if candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+    return urls
+
+
+def _stagehand_search_url(task: str) -> str:
+    query = " ".join((task or "").split())
+    query = query[:280]
+    return f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+
+
+def _coerce_stagehand_json(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _coerce_stagehand_findings(value: object) -> list[str]:
+    if isinstance(value, list):
+        findings: list[str] = []
+        for item in value:
+            text = " ".join(str(item or "").split())
+            if text:
+                findings.append(text[:400])
+        return findings
+    if isinstance(value, str):
+        text = " ".join(value.split())
+        return [text[:400]] if text else []
+    return []
+
+
+def _coerce_stagehand_search_results(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    results: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title", "")).split())
+        url = " ".join(str(item.get("url", "")).split())
+        snippet = " ".join(str(item.get("snippet", "")).split())
+        if not url.startswith(("http://", "https://")):
+            continue
+        results.append(
+            {
+                "title": title[:200],
+                "url": url[:500],
+                "snippet": snippet[:300],
+            }
+        )
+    return results
+
+
+def _format_stagehand_summary(
+    *,
+    summary: str,
+    findings: list[str],
+    current_url: str,
+    search_results: list[dict[str, str]],
+    blocker: str,
+) -> str:
+    parts: list[str] = []
+    normalized_summary = " ".join(summary.split())
+    if normalized_summary:
+        parts.append(normalized_summary[:2500])
+    if findings:
+        parts.append("\n".join(f"- {item}" for item in findings[:5]))
+    if search_results:
+        rendered = []
+        for item in search_results[:3]:
+            title = item.get("title") or item.get("url") or "Candidate result"
+            url = item.get("url") or ""
+            snippet = item.get("snippet") or ""
+            line = f"- {title}"
+            if url:
+                line += f" ({url})"
+            if snippet:
+                line += f": {snippet}"
+            rendered.append(line[:700])
+        if rendered:
+            parts.append("Candidate sources:\n" + "\n".join(rendered))
+    if current_url.strip():
+        parts.append(f"Current page: {current_url.strip()[:500]}")
+    if blocker.strip():
+        parts.append(f"Stagehand issue: {blocker.strip()[:500]}")
+    return sanitize_tool_output("\n\n".join(part for part in parts if part).strip())
+
+
+async def _stagehand_raw_json(awaitable: object) -> dict[str, object]:
+    response = await awaitable
+    try:
+        data = await response.json()
+    finally:
+        try:
+            await response.close()
+        except Exception:
+            pass
+    return _coerce_stagehand_json(data)
 
 
 def _stagehand_browser_payload(*, settings: Settings, workspace: Workspace, chrome_path: str) -> dict[str, object]:
@@ -198,40 +315,132 @@ async def run_stagehand_task(
         session_id = getattr(getattr(session_response, "data", None), "session_id", "") or ""
         if not session_id:
             return "STAGEHAND_BROWSER_TASK_FAILED: stagehand did not return a session id."
+        raw_sessions = client.sessions.with_raw_response
+        model_config = {"model_name": model_name, "api_key": deepseek_key}
+        explicit_urls = _stagehand_extract_explicit_urls(task)
+        target_url = explicit_urls[0] if explicit_urls else _stagehand_search_url(task)
+        search_results: list[dict[str, str]] = []
+        blocker = ""
 
-        execute_response = await asyncio.wait_for(
-            client.sessions.execute(
-                session_id,
-                agent_config={
-                    "mode": settings.stagehand_mode,
-                    "model": {"model_name": model_name, "api_key": deepseek_key},
-                    "execution_model": {"model_name": model_name, "api_key": deepseek_key},
-                    "system_prompt": system_prompt,
-                },
-                execute_options={
-                    "instruction": normalized_task,
-                    "max_steps": float(max(1, max_steps)),
-                    "tool_timeout": float(max(1000, settings.stagehand_tool_timeout_ms)),
-                    "use_search": False,
-                },
+        await asyncio.wait_for(
+            _stagehand_raw_json(
+                raw_sessions.navigate(
+                    session_id,
+                    url=target_url,
+                    options={
+                        "wait_until": "domcontentloaded",
+                        "timeout": float(max(5000, settings.stagehand_tool_timeout_ms)),
+                    },
+                )
             ),
             timeout=max(5, settings.stagehand_task_timeout_seconds),
         )
-        result = getattr(getattr(execute_response, "data", None), "result", None)
-        if result is None:
-            return "STAGEHAND_BROWSER_TASK_FAILED: stagehand returned no result payload."
-        message = sanitize_tool_output(getattr(result, "message", "") or "")
-        partial_findings = _stagehand_partial_findings(list(getattr(result, "actions", []) or []))
-        if getattr(result, "success", False) and not _stagehand_result_needs_fallback(message):
-            return message or _merge_stagehand_partial_findings(
-                message="",
-                partial_findings=partial_findings,
-                primary_error="Stagehand completed without a usable summary.",
+
+        if not explicit_urls:
+            initial_extract = await asyncio.wait_for(
+                _stagehand_raw_json(
+                    raw_sessions.extract(
+                        session_id,
+                        instruction=(
+                            "Extract the best search results for this task. "
+                            "Prefer direct sources over summaries.\n\n"
+                            + normalized_task
+                        ),
+                        schema={
+                            "type": "object",
+                            "properties": {
+                                "summary": {"type": "string"},
+                                "results": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "title": {"type": "string"},
+                                            "url": {"type": "string"},
+                                            "snippet": {"type": "string"},
+                                        },
+                                        "required": ["title", "url"],
+                                    },
+                                },
+                            },
+                            "required": ["summary"],
+                        },
+                        options={
+                            "model": model_config,
+                            "timeout": float(max(5000, settings.stagehand_tool_timeout_ms)),
+                        },
+                    )
+                ),
+                timeout=max(5, settings.stagehand_task_timeout_seconds),
             )
+            extract_result = _coerce_stagehand_json(_coerce_stagehand_json(initial_extract).get("data", {})).get("result", {})
+            extract_result = _coerce_stagehand_json(extract_result)
+            search_results = _coerce_stagehand_search_results(extract_result.get("results"))
+            if search_results:
+                target_url = search_results[0]["url"]
+                await asyncio.wait_for(
+                    _stagehand_raw_json(
+                        raw_sessions.navigate(
+                            session_id,
+                            url=target_url,
+                            options={
+                                "wait_until": "domcontentloaded",
+                                "timeout": float(max(5000, settings.stagehand_tool_timeout_ms)),
+                            },
+                        )
+                    ),
+                    timeout=max(5, settings.stagehand_task_timeout_seconds),
+                )
+
+        final_extract = await asyncio.wait_for(
+            _stagehand_raw_json(
+                raw_sessions.extract(
+                    session_id,
+                    instruction=(
+                        "Summarize the current page for the user's task. "
+                        "Return concrete findings and note any blocker briefly.\n\n"
+                        + normalized_task
+                    ),
+                    schema={
+                        "type": "object",
+                        "properties": {
+                            "summary": {"type": "string"},
+                            "findings": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "current_url": {"type": "string"},
+                            "blocker": {"type": "string"},
+                        },
+                        "required": ["summary"],
+                    },
+                    options={
+                        "model": model_config,
+                        "timeout": float(max(5000, settings.stagehand_tool_timeout_ms)),
+                    },
+                )
+            ),
+            timeout=max(5, settings.stagehand_task_timeout_seconds),
+        )
+        extract_payload = _coerce_stagehand_json(_coerce_stagehand_json(final_extract).get("data", {})).get("result", {})
+        extract_payload = _coerce_stagehand_json(extract_payload)
+        message = sanitize_tool_output(str(extract_payload.get("summary", "") or ""))
+        current_url = str(extract_payload.get("current_url", "") or target_url)
+        findings = _coerce_stagehand_findings(extract_payload.get("findings"))
+        blocker = " ".join(str(extract_payload.get("blocker", blocker) or "").split())
+        rendered = _format_stagehand_summary(
+            summary=message,
+            findings=findings,
+            current_url=current_url,
+            search_results=search_results,
+            blocker=blocker,
+        )
+        if rendered and not _stagehand_result_needs_fallback(rendered):
+            return rendered
         return _merge_stagehand_partial_findings(
-            message=message,
-            partial_findings=partial_findings,
-            primary_error="Stagehand did not complete the task cleanly.",
+            message=rendered,
+            partial_findings="",
+            primary_error=blocker or "Stagehand did not return a usable summary.",
         )
     except TimeoutError:
         logger.warning("stagehand browser task timed out after %ss", settings.stagehand_task_timeout_seconds)

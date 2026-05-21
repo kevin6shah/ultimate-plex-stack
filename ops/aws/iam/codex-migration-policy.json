@@ -11,6 +11,7 @@
         "cloudformation:DescribeStacks",
         "cloudformation:DescribeStackResources",
         "cloudformation:DescribeStackEvents",
+        "cloudformation:ContinueUpdateRollback",
         "cloudformation:CreateChangeSet",
         "cloudformation:DescribeChangeSet",
         "cloudformation:ExecuteChangeSet",
@@ -28,6 +29,7 @@
         "ec2:RunInstances",
         "ec2:StartInstances",
         "ec2:StopInstances",
+        "ec2:ModifyInstanceAttribute",
         "ec2:RebootInstances",
         "ec2:TerminateInstances",
         "ec2:DescribeInstances",
@@ -166,7 +168,8 @@
         "logs:FilterLogEvents",
         "budgets:ModifyBudget",
         "budgets:ViewBudget",
-        "billing:GetBillingViewData"
+        "billing:GetBillingViewData",
+        "ce:GetCostAndUsage"
       ],
       "Resource": "*"
     },
@@ -177,6 +180,7 @@
         "iam:CreateRole",
         "iam:DeleteRole",
         "iam:GetRole",
+        "iam:ListUserPolicies",
         "iam:ListAttachedRolePolicies",
         "iam:ListRolePolicies",
         "iam:PutRolePolicy",

@@ -121,6 +121,14 @@ def _normalize_worker_error_message(query: str, message: str) -> str:
 
 def _status_summary_for_query(query: str, *, attachments: bool) -> str:
     lowered = query.lower()
+    if any(token in lowered for token in ("flight", "flights", "airline", "airport")):
+        return "checking live flight options and comparing fares"
+    if any(token in lowered for token in ("hotel", "hotels", "stay", "airbnb", "accommodation")):
+        return "comparing hotel options, locations, and prices"
+    if any(token in lowered for token in ("rental car", "car rental", "rent a car", "avis", "hertz", "enterprise")):
+        return "checking rental car availability and comparing prices"
+    if any(token in lowered for token in ("restaurant", "reservation", "resy", "opentable", "book me", "dinner")):
+        return "checking reservation sources and matching real venues"
     if any(token in lowered for token in ("research", "compare", "review", "reddit", "google")):
         return "researching sources and comparing findings"
     if any(token in lowered for token in ("browser", "website", "site", "search")):

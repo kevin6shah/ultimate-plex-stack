@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import cached_property
+from threading import Lock
+
+
+_SECRET_CACHE: dict[tuple[str, str], str] = {}
+_SECRET_CACHE_LOCK = Lock()
 
 
 def _secret_setting(param_env: str, value_env: str) -> str:
@@ -108,7 +113,21 @@ class Settings:
     hands_worker_mode: str = os.environ.get("HANDS_WORKER_MODE", "shared_host")
     hands_worker_instance_id: str = os.environ.get("HANDS_WORKER_INSTANCE_ID", "")
     hands_worker_stop_enabled: bool = os.environ.get("HANDS_WORKER_STOP_ENABLED", "true").lower() == "true"
-    hands_worker_idle_grace_seconds: int = int(os.environ.get("HANDS_WORKER_IDLE_GRACE_SECONDS", "1800"))
+    hands_worker_idle_grace_seconds: int = int(os.environ.get("HANDS_WORKER_IDLE_GRACE_SECONDS", "600"))
+    execution_backend: str = os.environ.get("FRIDAY_EXECUTION_BACKEND", "legacy")
+    temporal_enabled: bool = os.environ.get("TEMPORAL_ENABLED", "false").lower() == "true"
+    temporal_host: str = os.environ.get("TEMPORAL_HOST", "").strip()
+    temporal_namespace: str = os.environ.get("TEMPORAL_NAMESPACE", "default").strip()
+    temporal_workflow_task_queue: str = os.environ.get("TEMPORAL_WORKFLOW_TASK_QUEUE", "friday-workflow").strip()
+    temporal_heavy_activity_task_queue: str = os.environ.get("TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE", "friday-heavy-activity").strip()
+    temporal_client_identity: str = os.environ.get("TEMPORAL_CLIENT_IDENTITY", "friday-control-plane").strip()
+    temporal_workflow_id_prefix: str = os.environ.get("TEMPORAL_WORKFLOW_ID_PREFIX", "friday-heavy-job").strip()
+    temporal_worker_identity: str = os.environ.get("TEMPORAL_WORKER_IDENTITY", "friday-workflow-worker").strip()
+    temporal_activity_worker_identity: str = os.environ.get("TEMPORAL_ACTIVITY_WORKER_IDENTITY", "friday-heavy-activity-worker").strip()
+    temporal_activity_heartbeat_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_HEARTBEAT_SECONDS", "10"))
+    temporal_activity_schedule_to_close_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_SCHEDULE_TO_CLOSE_SECONDS", "5400"))
+    temporal_activity_start_to_close_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_START_TO_CLOSE_SECONDS", "5400"))
+    temporal_activity_max_attempts: int = int(os.environ.get("TEMPORAL_ACTIVITY_MAX_ATTEMPTS", "3"))
 
     @cached_property
     def ssm(self):
@@ -133,8 +152,18 @@ class Settings:
             return ""
         if not parameter_name.startswith("/"):
             return parameter_name
-        response = self.ssm.get_parameter(Name=parameter_name, WithDecryption=True)
-        return response["Parameter"]["Value"]
+        cache_key = (self.aws_region, parameter_name)
+        cached = _SECRET_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        with _SECRET_CACHE_LOCK:
+            cached = _SECRET_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            response = self.ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            value = response["Parameter"]["Value"]
+            _SECRET_CACHE[cache_key] = value
+            return value
 
 
 settings = Settings()

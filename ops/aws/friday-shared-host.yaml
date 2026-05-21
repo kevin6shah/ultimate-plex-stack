@@ -15,18 +15,97 @@ Parameters:
     Type: AWS::EC2::Image::Id
   InstanceType:
     Type: String
-    Default: t3.micro
+    Default: t3a.small
     AllowedValues:
       - t2.micro
       - t3.micro
+      - t3a.small
+      - t3.small
   SshCidr:
     Type: String
     Description: CIDR allowed to SSH to the shared host.
   RootVolumeSizeGiB:
     Type: Number
     Default: 8
+  StateTableName:
+    Type: String
+    Default: friday-agent-state
+  ArtifactsBucketName:
+    Type: String
+    Default: ''
+  EnableTemporalIngress:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  TemporalPort:
+    Type: Number
+    Default: 7233
+  TemporalIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to reach the Temporal gRPC endpoint when enabled.
+
+Conditions:
+  EnableArtifactsBucketAccess: !Not [!Equals [!Ref ArtifactsBucketName, '']]
+  EnableTemporalIngressCondition: !Equals [!Ref EnableTemporalIngress, 'true']
 
 Resources:
+  FridaySharedHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: friday-shared-host-agent-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/friday/agent/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}/index/*'
+              - !If
+                - EnableArtifactsBucketAccess
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                  Resource: !Sub 'arn:aws:s3:::${ArtifactsBucketName}'
+                - !Ref AWS::NoValue
+              - !If
+                - EnableArtifactsBucketAccess
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                  Resource: !Sub 'arn:aws:s3:::${ArtifactsBucketName}/*'
+                - !Ref AWS::NoValue
+
+  FridaySharedHostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref FridaySharedHostRole
+
   FridaySharedHostSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -49,6 +128,14 @@ Resources:
           FromPort: 51820
           ToPort: 51820
           CidrIp: 0.0.0.0/0
+        - !If
+          - EnableTemporalIngressCondition
+          - Description: Temporal gRPC
+            IpProtocol: tcp
+            FromPort: !Ref TemporalPort
+            ToPort: !Ref TemporalPort
+            CidrIp: !Ref TemporalIngressCidr
+          - !Ref AWS::NoValue
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -64,6 +151,7 @@ Resources:
       ImageId: !Ref ImageId
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref FridaySharedHostInstanceProfile
       NetworkInterfaces:
         - AssociatePublicIpAddress: true
           DeviceIndex: 0

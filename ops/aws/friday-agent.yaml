@@ -49,6 +49,26 @@ Parameters:
   HandsWorkerInstanceId:
     Type: String
     Default: ''
+  ExecutionBackend:
+    Type: String
+    Default: legacy
+    AllowedValues: [legacy, temporal]
+  TemporalEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  TemporalHost:
+    Type: String
+    Default: ''
+  TemporalNamespace:
+    Type: String
+    Default: default
+  TemporalWorkflowTaskQueue:
+    Type: String
+    Default: friday-workflow
+  TemporalHeavyActivityTaskQueue:
+    Type: String
+    Default: friday-heavy-activity
   DeepSeekApiKeyParam:
     Type: String
     Default: /friday/agent/deepseek-api-key
@@ -475,6 +495,12 @@ Resources:
           ARTIFACT_URL_TTL_SECONDS: 3600
           HANDS_WORKER_MODE: !Ref HandsWorkerMode
           HANDS_WORKER_INSTANCE_ID: !Ref HandsWorkerInstanceId
+          FRIDAY_EXECUTION_BACKEND: !Ref ExecutionBackend
+          TEMPORAL_ENABLED: !Ref TemporalEnabled
+          TEMPORAL_HOST: !Ref TemporalHost
+          TEMPORAL_NAMESPACE: !Ref TemporalNamespace
+          TEMPORAL_WORKFLOW_TASK_QUEUE: !Ref TemporalWorkflowTaskQueue
+          TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE: !Ref TemporalHeavyActivityTaskQueue
 
   AgentFunctionUrl:
     Type: AWS::Lambda::Url

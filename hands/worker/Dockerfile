@@ -7,7 +7,9 @@ ARG GMAIL_MCP_REF=c9a31741c7e879575c9dfc90192a7a430efef812
 ARG RESTAURANT_CLI_REF=78547125e8bb0faf79dd70c87e608f93b4004e68
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    CHROME_PATH=/ms-playwright/chromium-1148/chrome-linux/chrome \
+    STAGEHAND_LOCAL_CHROME_PATH=/ms-playwright/chromium-1148/chrome-linux/chrome
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg \
@@ -48,5 +50,6 @@ RUN pip install -r /tmp/requirements.txt \
 
 COPY agent/app ./app
 COPY hands/worker/runner.py ./runner.py
+COPY hands/worker/temporal_activity_worker.py ./temporal_activity_worker.py
 
 CMD ["python", "/opt/friday/runner.py"]

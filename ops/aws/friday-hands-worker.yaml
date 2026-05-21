@@ -15,7 +15,7 @@ Parameters:
     Type: AWS::EC2::Image::Id
   InstanceType:
     Type: String
-    Default: t3.micro
+    Default: t3a.small
     AllowedValues:
       - t3.micro
       - t3a.small
@@ -28,8 +28,73 @@ Parameters:
   RootVolumeSizeGiB:
     Type: Number
     Default: 20
+  StateTableName:
+    Type: String
+    Default: friday-agent-state
+  ArtifactsBucketName:
+    Type: String
+    Default: ''
+
+Conditions:
+  EnableArtifactsBucketAccess: !Not [!Equals [!Ref ArtifactsBucketName, '']]
 
 Resources:
+  FridayHandsWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: friday-hands-worker-agent-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/friday/agent/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StateTableName}/index/*'
+              - !If
+                - EnableArtifactsBucketAccess
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                  Resource: !Sub 'arn:aws:s3:::${ArtifactsBucketName}'
+                - !Ref AWS::NoValue
+              - !If
+                - EnableArtifactsBucketAccess
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                  Resource: !Sub 'arn:aws:s3:::${ArtifactsBucketName}/*'
+                - !Ref AWS::NoValue
+
+  FridayHandsWorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref FridayHandsWorkerRole
+
   FridayHandsWorkerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -57,6 +122,7 @@ Resources:
       ImageId: !Ref ImageId
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref FridayHandsWorkerInstanceProfile
       InstanceInitiatedShutdownBehavior: stop
       NetworkInterfaces:
         - AssociatePublicIpAddress: true

@@ -1,6 +1,6 @@
 # AWS Cost Model
 
-Last updated: `2026-05-17`
+Last updated: `2026-05-20`
 
 ## Purpose
 
@@ -92,7 +92,33 @@ These are the live price inputs used in the formulas below.
 | SNS free tier | `1M publishes` | `https://aws.amazon.com/sns/faqs/` |
 | SSM Parameter Store standard | `No additional charge` | `https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-advanced-parameters.html` |
 | AWS Budgets monitoring | `Free`; first two action-enabled budgets are free | `https://aws.amazon.com/aws-cost-management/aws-budgets/pricing/` |
+| AWS KMS request usage | first `20,000 requests/month` free, then `$0.03 / 10,000 requests` | `https://aws.amazon.com/kms/pricing/` |
 | Internet egress | First `100 GB/month` free across AWS services | `https://aws.amazon.com/ec2/pricing/on-demand/` |
+
+## KMS Incident Note
+
+On `2026-05-20`, Friday hit the AWS free-tier alert threshold for `awskms` request usage:
+
+- alert value: `17,100 requests`
+- free-tier limit: `20,000 requests/month`
+
+Direct cost impact at the time of the alert:
+
+```text
+$0.00
+```
+
+Reason:
+
+- AWS KMS request pricing stays free through the first `20,000 requests/month`
+- the request spike was caused by repeated SecureString reads from SSM Parameter Store with `WithDecryption=True`
+- the old `Settings.secret()` implementation did not cache decrypted values in-process, so repeated Siri/Telegram validation traffic amplified KMS request count
+
+Guardrails added after this incident:
+
+- `Settings.secret()` now memoizes decrypted SSM values for the life of the process
+- the default dedicated-worker idle grace was reduced from `1800` seconds to `600` seconds so validation runs do not leave the on-demand worker up for an extra 30 minutes by default
+- `scripts/stop-friday-runtime.sh` now provides a one-command operator kill switch that terminates running Temporal workflows and stops the dedicated worker instance
 
 ## External Model Price Inputs
 

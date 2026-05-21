@@ -7,6 +7,7 @@ mangum==0.19.0
 playwright==1.49.1
 playwright-stealth==2.0.0
 stagehand==3.20.0
+temporalio==1.11.1
 pydantic==2.10.4
 pydantic-ai-slim[openai]==0.8.1
 uvicorn==0.34.0

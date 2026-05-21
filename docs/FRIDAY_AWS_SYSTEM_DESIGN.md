@@ -1,6 +1,6 @@
 # Friday AWS System Design
 
-Last updated: `2026-05-16`
+Last updated: `2026-05-19`
 
 ## Purpose
 
@@ -55,6 +55,13 @@ Current live shape from the repo cost model:
 - `8 GiB gp3` root disk
 - `1` public IPv4
 
+Production responsibilities that already exist here today:
+
+- Iris production backend
+- WireGuard / VPN ingress
+- Friday shared-host deployment/runtime adjacency
+- any future always-on Friday orchestration substrate must fit around those responsibilities instead of displacing them
+
 What it is **not** for:
 
 - it is not the intended permanent Friday heavy-task worker
@@ -67,6 +74,20 @@ Why:
 - it carries non-Friday responsibilities
 - it has small compute/disk limits by design
 - mutations here affect Iris and VPN stability, not just Friday
+
+What is allowed here for Friday:
+
+- small control-plane-adjacent services that must be always on
+- orchestration metadata or workflow workers that are light on CPU, disk, and browser/runtime dependencies
+- deployment helpers and low-churn operational glue
+
+What is not allowed here for Friday without explicit operator approval:
+
+- Playwright/Chromium image rebuild churn
+- always-on browser automation sessions
+- large artifact processing
+- the primary heavy task runtime
+- casual “temporary” fallback of broken dedicated-worker responsibilities
 
 ### 2. Friday control plane
 
@@ -215,6 +236,48 @@ The intended home for:
 
 is the dedicated Friday on-demand worker, not the shared host.
 
+## Temporal Direction
+
+Friday v2 should treat Temporal as orchestration, not as an excuse to collapse the compute planes.
+
+Approved placement:
+
+- Temporal server and lightweight workflow worker:
+  - always-on shared host
+  - only if they remain small, predictable, and non-browser-heavy
+- Temporal heavy activity worker:
+  - dedicated Friday on-demand worker
+  - owns browser execution, heavy MCPs, file/artifact work, and other long-running task bodies
+- Lambda / Function URL control plane:
+  - remains the Siri/Telegram ingress
+  - starts workflows, signals workflows, queries workflow state, and starts the dedicated worker when needed
+
+Why this split is approved:
+
+- the dedicated worker is not always on, so it cannot be the sole home for Temporal orchestration
+- the shared host is always on, so it can own durable orchestration state and lightweight workflow polling
+- heavy runtime still stays off the shared host, preserving the original boundary
+
+What this means in practice:
+
+- shared host may gain Temporal server/workflow-process responsibilities
+- shared host must not become the browser or Playwright runtime just because Temporal lives there
+- dedicated worker remains the only approved home for Stagehand/browser-use/heavy task execution
+- the repo-level Temporal backend should be considered inactive until `TEMPORAL_HOST` points at a real always-on Temporal service
+
+## Shared Host Inventory Rule
+
+Any session that changes Friday infra or runtime assumptions must keep an explicit inventory of what is already live on the shared host.
+
+At minimum, that inventory should answer:
+
+- what non-Friday production services live there
+- what Friday services live there
+- what new always-on services are being proposed there
+- why those services are small enough to coexist safely
+
+If that inventory changes, update this document and any operator-facing handoff notes in the same workstream.
+
 ### Rule 5: Cost-effective does not mean architecture-agnostic
 
 The cheapest fix is not always the right fix.
@@ -274,6 +337,7 @@ Current intended direction:
 
 - Friday heavy tasks belong on the dedicated on-demand worker
 - the shared host should stay focused on Iris/VPN/shared services
+- if Temporal is adopted, it should own orchestration on the shared host while heavy activities stay on the dedicated worker
 - Skiplagged should replace brittle browser-first travel search
 - broken reservation connectors should not stay active just because they exist in repo
 
