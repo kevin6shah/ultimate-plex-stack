@@ -27,3 +27,6 @@ backup/
 
 # Docker
 .docker/
+
+# Local runtime scratch
+tmp/

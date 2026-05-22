@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         finalize_heavy_job_stop,
         prepare_heavy_job_claim,
         prepare_heavy_job_resume_claim,
+        renew_gmail_watch_activity,
     )
 
 
@@ -36,6 +37,12 @@ class FridayHeavyJobWorkflow:
         normalized = (text or "").strip()
         if normalized:
             self.resume_reply = normalized
+
+    @workflow.signal
+    def submit_verification_code(self, code: str) -> None:
+        normalized = (code or "").strip()
+        if normalized:
+            self.resume_reply = f"verification code: {normalized}"
 
     @workflow.run
     async def run(self, payload: dict) -> None:
@@ -155,3 +162,18 @@ class FridayHeavyJobWorkflow:
                 start_to_close_timeout=timedelta(minutes=2),
             )
             return
+
+
+@workflow.defn
+class FridayGmailWatchRenewalWorkflow:
+    @workflow.run
+    async def run(self, payload: dict | None = None) -> None:
+        config = payload or {}
+        renewal_days = max(1, int(config.get("renewal_days") or 5))
+        while True:
+            await workflow.execute_activity(
+                renew_gmail_watch_activity,
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            await workflow.sleep(timedelta(days=renewal_days))

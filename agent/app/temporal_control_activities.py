@@ -11,7 +11,8 @@ from .heavy_job_runtime import (
     record_job_assistant_turn,
     send_final_job_message,
 )
-from .jobs import CheckpointPayload, JobStatus
+from .gmail_oauth import renew_gmail_watch
+from .jobs import CheckpointPayload, JobStatus, MailboxWatchState, utc_now_iso
 from .settings import Settings, settings
 from .storage import StateStore
 from .worker_lifecycle import ensure_dedicated_worker_running, maybe_stop_dedicated_worker_if_idle
@@ -135,3 +136,43 @@ async def finalize_heavy_job_stop(job_id: str) -> None:
         return
     state.update_job_status(job_id, status=JobStatus.INTERRUPTED, current_step="stopped by user", error_message="stopped by user")
     maybe_stop_dedicated_worker_if_idle(settings, state)
+
+
+@activity.defn
+async def renew_gmail_watch_activity() -> dict:
+    state = _store()
+    mailbox_email = settings.secret(settings.gmail_account_email_param).strip()
+    watch_state = state.get_mailbox_watch_state(mailbox_email) if mailbox_email else None
+    now = utc_now_iso()
+    try:
+        payload = await renew_gmail_watch(settings)
+        state.put_mailbox_watch_state(
+            (watch_state or MailboxWatchState(mailbox_email=mailbox_email)).model_copy(
+                update={
+                    "mailbox_email": mailbox_email,
+                    "history_id": str(payload.get("historyId", "")),
+                    "expiration": str(payload.get("expiration", "")),
+                    "topic_name": settings.gmail_pubsub_topic_name,
+                    "watch_status": "active",
+                    "last_watch_renewed_at": now,
+                    "last_oauth_tested_at": now,
+                    "last_oauth_error": "",
+                    "updated_at": now,
+                }
+            )
+        )
+        return {"ok": True, "history_id": str(payload.get("historyId", "")), "expiration": str(payload.get("expiration", ""))}
+    except Exception as exc:
+        state.put_mailbox_watch_state(
+            (watch_state or MailboxWatchState(mailbox_email=mailbox_email)).model_copy(
+                update={
+                    "mailbox_email": mailbox_email,
+                    "topic_name": settings.gmail_pubsub_topic_name,
+                    "watch_status": "oauth_error",
+                    "last_oauth_tested_at": now,
+                    "last_oauth_error": str(exc)[:500],
+                    "updated_at": now,
+                }
+            )
+        )
+        raise

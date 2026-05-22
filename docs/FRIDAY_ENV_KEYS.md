@@ -1,6 +1,6 @@
 # Friday Environment Keys
 
-Last updated: `2026-05-20`
+Last updated: `2026-05-22`
 
 This file is the key-only inventory for the local Friday `.env` file and the SSM sync map.
 
@@ -22,6 +22,7 @@ Rules:
 
 - `FRIDAY_AGENT_EMAIL`
 - `FRIDAY_BOOKING_DISPLAY_NAME`
+- `TELEGRAM_BOT_USERNAME`
 
 ## Model And Research
 
@@ -46,17 +47,29 @@ Rules:
 
 ## Gmail
 
+- `GMAIL_PUBSUB_TOPIC_NAME`
+- `GMAIL_WATCH_LABEL_IDS`
+- `GMAIL_WATCH_LABEL_FILTER_ACTION`
+- `GMAIL_WATCH_RENEWAL_DAYS`
 - `GMAIL_ACCOUNT_EMAIL`
 - `GMAIL_ACCOUNT_PASSWORD`
 - `GMAIL_APP_PASSWORD`
+- `GMAIL_PUBSUB_VERIFICATION_TOKEN`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN`
 - `GMAIL_CLIENT_ID`
 - `GMAIL_CLIENT_SECRET`
 - `GMAIL_REFRESH_TOKEN`
+- `DASHBOARD_SESSION_TTL_SECONDS`
+- `DASHBOARD_SESSION_SECRET`
 
 Notes:
 
 - `GMAIL_ACCOUNT_PASSWORD` still exists in the local env inventory for compatibility with older flows.
-- `GMAIL_APP_PASSWORD` is the canonical SSM-backed Gmail password key used by the current deploy/runtime scripts.
+- `GMAIL_APP_PASSWORD` remains only for legacy Gmail MCP / app-password paths and is not part of the active mailbox event pipeline.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REFRESH_TOKEN` are now the canonical active mailbox OAuth contract.
+- `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` remain documented only as compatibility aliases that still point at the same SSM paths.
 
 ## Messaging
 

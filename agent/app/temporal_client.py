@@ -7,7 +7,7 @@ from .jobs import AgentJob, JobStatus
 from .settings import Settings
 from .storage import StateStore
 from .temporal_runtime import get_temporal_client, heavy_workflow_id
-from .temporal_workflows import FridayHeavyJobWorkflow
+from .temporal_workflows import FridayGmailWatchRenewalWorkflow, FridayHeavyJobWorkflow
 from .worker_lifecycle import ensure_dedicated_worker_running
 
 
@@ -51,3 +51,34 @@ async def signal_answer_heavy_job(settings: Settings, job_id: str, text: str) ->
         return True
     except TemporalError:
         return False
+
+
+async def signal_submit_verification_code(settings: Settings, job_id: str, code: str) -> bool:
+    client = await get_temporal_client(settings)
+    try:
+        handle = client.get_workflow_handle(heavy_workflow_id(settings, job_id))
+        await handle.signal(FridayHeavyJobWorkflow.submit_verification_code, code)
+        return True
+    except TemporalError:
+        return False
+
+
+def gmail_watch_workflow_id(settings: Settings) -> str:
+    prefix = settings.temporal_workflow_id_prefix or "friday"
+    return f"{prefix}-gmail-watch-renewal"
+
+
+async def ensure_gmail_watch_renewal_workflow(settings: Settings) -> str:
+    client = await get_temporal_client(settings)
+    workflow_id = gmail_watch_workflow_id(settings)
+    try:
+        await client.start_workflow(
+            FridayGmailWatchRenewalWorkflow.run,
+            {"renewal_days": max(1, settings.gmail_watch_renewal_days)},
+            id=workflow_id,
+            task_queue=settings.temporal_workflow_task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        )
+    except WorkflowAlreadyStartedError:
+        pass
+    return workflow_id

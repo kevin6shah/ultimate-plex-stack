@@ -69,6 +69,21 @@ Parameters:
   TemporalHeavyActivityTaskQueue:
     Type: String
     Default: friday-heavy-activity
+  GmailPubsubTopicName:
+    Type: String
+    Default: ''
+  GmailWatchLabelIds:
+    Type: String
+    Default: INBOX
+  GmailWatchLabelFilterAction:
+    Type: String
+    Default: include
+  GmailWatchRenewalDays:
+    Type: Number
+    Default: 5
+  DashboardSessionTtlSeconds:
+    Type: Number
+    Default: 86400
   DeepSeekApiKeyParam:
     Type: String
     Default: /friday/agent/deepseek-api-key
@@ -108,15 +123,21 @@ Parameters:
   GmailAppPasswordParam:
     Type: String
     Default: /friday/agent/gmail-app-password
-  GmailClientIdParam:
+  GoogleClientIdParam:
     Type: String
     Default: /friday/agent/gmail-client-id
-  GmailClientSecretParam:
+  GoogleClientSecretParam:
     Type: String
     Default: /friday/agent/gmail-client-secret
-  GmailRefreshTokenParam:
+  GoogleRefreshTokenParam:
     Type: String
     Default: /friday/agent/gmail-refresh-token
+  GmailPubsubVerificationTokenParam:
+    Type: String
+    Default: /friday/agent/gmail-pubsub-verification-token
+  DashboardSessionSecretParam:
+    Type: String
+    Default: /friday/agent/dashboard-session-secret
   TelegramBotTokenParam:
     Type: String
     Default: /friday/agent/telegram-bot-token
@@ -126,6 +147,9 @@ Parameters:
   TelegramWebhookSecretParam:
     Type: String
     Default: /friday/agent/telegram-webhook-secret
+  TelegramBotUsername:
+    Type: String
+    Default: ''
   SiriApiKeyParam:
     Type: String
     Default: /friday/agent/siri-api-key
@@ -386,9 +410,11 @@ Resources:
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ResyAuthTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenTableEmailParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenTablePasswordParam}'
-                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailClientIdParam}'
-                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailClientSecretParam}'
-                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailRefreshTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleClientIdParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleClientSecretParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleRefreshTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailPubsubVerificationTokenParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DashboardSessionSecretParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramAllowedChatIdParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramWebhookSecretParam}'
@@ -464,9 +490,11 @@ Resources:
           OPENTABLE_PASSWORD_PARAM: !Ref OpenTablePasswordParam
           GMAIL_ACCOUNT_EMAIL_PARAM: !Ref GmailAccountEmailParam
           GMAIL_APP_PASSWORD_PARAM: !Ref GmailAppPasswordParam
-          GMAIL_CLIENT_ID_PARAM: !Ref GmailClientIdParam
-          GMAIL_CLIENT_SECRET_PARAM: !Ref GmailClientSecretParam
-          GMAIL_REFRESH_TOKEN_PARAM: !Ref GmailRefreshTokenParam
+          GOOGLE_CLIENT_ID_PARAM: !Ref GoogleClientIdParam
+          GOOGLE_CLIENT_SECRET_PARAM: !Ref GoogleClientSecretParam
+          GOOGLE_REFRESH_TOKEN_PARAM: !Ref GoogleRefreshTokenParam
+          GMAIL_PUBSUB_VERIFICATION_TOKEN_PARAM: !Ref GmailPubsubVerificationTokenParam
+          DASHBOARD_SESSION_SECRET_PARAM: !Ref DashboardSessionSecretParam
           BROWSER_USE_ENABLED: !Ref BrowserUseEnabled
           BROWSER_USE_CLOUD_ENABLED: !Ref BrowserUseCloudEnabled
           BROWSER_USE_MODEL: !Ref BrowserUseModel
@@ -501,6 +529,12 @@ Resources:
           TEMPORAL_NAMESPACE: !Ref TemporalNamespace
           TEMPORAL_WORKFLOW_TASK_QUEUE: !Ref TemporalWorkflowTaskQueue
           TEMPORAL_HEAVY_ACTIVITY_TASK_QUEUE: !Ref TemporalHeavyActivityTaskQueue
+          GMAIL_PUBSUB_TOPIC_NAME: !Ref GmailPubsubTopicName
+          GMAIL_WATCH_LABEL_IDS: !Ref GmailWatchLabelIds
+          GMAIL_WATCH_LABEL_FILTER_ACTION: !Ref GmailWatchLabelFilterAction
+          GMAIL_WATCH_RENEWAL_DAYS: !Ref GmailWatchRenewalDays
+          TELEGRAM_BOT_USERNAME: !Ref TelegramBotUsername
+          DASHBOARD_SESSION_TTL_SECONDS: !Ref DashboardSessionTtlSeconds
 
   AgentFunctionUrl:
     Type: AWS::Lambda::Url

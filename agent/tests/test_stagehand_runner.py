@@ -43,15 +43,22 @@ def test_stagehand_browser_payload_includes_launch_options(tmp_path) -> None:
         settings=settings,
         workspace=workspace,
         chrome_path="/custom/chrome",
+        task="book a free reservation",
     )
     assert payload["type"] == "local"
     launch_options = payload["launchOptions"]
-    assert launch_options["args"] == ["--no-sandbox", "--disable-dev-shm-usage"]
+    assert "--no-sandbox" in launch_options["args"]
+    assert "--disable-dev-shm-usage" in launch_options["args"]
+    assert "--disable-blink-features=AutomationControlled" in launch_options["args"]
     assert launch_options["chromiumSandbox"] is False
     assert launch_options["headless"] is False
     assert launch_options["executablePath"] == "/custom/chrome"
     assert launch_options["preserveUserDataDir"] is True
+    assert launch_options["locale"] == "en-US"
+    assert launch_options["viewport"]["width"] > 0
+    assert launch_options["viewport"]["height"] > 0
     assert str(tmp_path / ".stagehand" / "profile") == launch_options["userDataDir"]
+    assert str(tmp_path / ".stagehand" / "downloads") == launch_options["downloadsPath"]
 
 
 def test_merge_stagehand_partial_findings_preserves_message_and_partial_context() -> None:

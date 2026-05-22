@@ -10,6 +10,8 @@ from typing import Optional
 
 from .artifacts import query_requests_browser_images
 from .browser import _choose_user_agent, run_browser_task
+from .booking_guard import zero_dollar_booking_instruction
+from .browser_fingerprint import browser_fingerprint_seed, build_browser_fingerprint, browser_use_profile_kwargs
 from .research import sanitize_tool_output
 from .settings import Settings
 from .workspace import Workspace
@@ -309,14 +311,14 @@ async def run_browser_use_task(
             use_cloud = True
 
     user_agent = _choose_user_agent(settings)
+    fingerprint = build_browser_fingerprint(seed=browser_fingerprint_seed(task), user_agent=user_agent)
     browser = Browser(
         browser_profile=BrowserProfile(
-            headless=True,
-            user_agent=user_agent,
-            user_data_dir=str(user_data_dir),
-            downloads_path=str(downloads_dir),
-            disable_security=False,
-            deterministic_rendering=False,
+            **browser_use_profile_kwargs(
+                fingerprint=fingerprint,
+                user_data_dir=str(user_data_dir),
+                downloads_path=str(downloads_dir),
+            ),
         ),
         use_cloud=use_cloud,
         cloud_proxy_country_code=settings.browser_use_cloud_proxy_country_code if use_cloud else None,
@@ -553,6 +555,8 @@ async def run_browser_use_task(
             " Use the official filesystem MCP tools for broad file and directory operations within the allowed workspace roots."
             " Use the Friday workspace helper MCP tools for preview, markdown conversion, and PDF generation."
             + optional_mcp_guidance
+            + " "
+            + zero_dollar_booking_instruction()
             +
             " Do not rely on built-in browser-use file actions."
         ),

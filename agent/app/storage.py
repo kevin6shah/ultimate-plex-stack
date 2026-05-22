@@ -12,7 +12,26 @@ from botocore.exceptions import ClientError
 
 from .budget import month_key, today_key, ttl_epoch
 from .context_memory import build_thread_summary
-from .jobs import AgentConfig, AgentJob, CheckpointPayload, ControlCommand, ControlSignal, JobStatus, TaskClass, ThreadTurn, ThreadTurnRole
+from .jobs import (
+    AgentConfig,
+    AgentJob,
+    AutomationPolicyRecord,
+    BookingRecord,
+    BrowserSessionRecord,
+    CheckpointPayload,
+    ControlCommand,
+    ControlSignal,
+    DashboardSessionRecord,
+    IdentityRecord,
+    IdentitySecretPointer,
+    JobStatus,
+    MailboxVerificationWaitRecord,
+    MailboxWatchState,
+    PaymentProfileRecord,
+    TaskClass,
+    ThreadTurn,
+    ThreadTurnRole,
+)
 from .settings import Settings
 
 
@@ -24,6 +43,10 @@ class StateStore:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.table = boto3.resource("dynamodb", region_name=settings.aws_region).Table(settings.state_table)
+
+    @staticmethod
+    def _to_dynamo(value: Any) -> Any:
+        return json.loads(json.dumps(value), parse_float=Decimal)
 
     def put_session(self, *, channel: str, user_id: str, metadata: dict[str, str]) -> None:
         expires_at = int((utc_now() + timedelta(seconds=self.settings.session_ttl_seconds)).timestamp())
@@ -259,6 +282,243 @@ class StateStore:
             for item in response.get("Items", []):
                 batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
             batch.delete_item(Key={"PK": self._context_pk(channel=channel, user_id=user_id, conversation_id=conversation_id), "SK": "LATEST"})
+
+    def put_identity(self, record: IdentityRecord) -> IdentityRecord:
+        payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
+        self.table.put_item(
+            Item={
+                "PK": "IDENTITY",
+                "SK": f"IDENTITY#{payload.identity_id}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "site_scope": payload.site_scope,
+                "category": payload.category,
+                "is_default": payload.is_default,
+                "updated_at": payload.updated_at,
+            }
+        )
+        return payload
+
+    def list_identities(self, limit: int = 50) -> list[IdentityRecord]:
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq("IDENTITY") & Key("SK").begins_with("IDENTITY#"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        return [IdentityRecord.model_validate(item.get("record", {})) for item in response.get("Items", [])]
+
+    def put_identity_secret_pointer(self, record: IdentitySecretPointer) -> IdentitySecretPointer:
+        self.table.put_item(
+            Item={
+                "PK": "IDENTITY",
+                "SK": f"SECRET#{record.identity_id}",
+                "record": self._to_dynamo(record.model_dump()),
+                "updated_at": record.updated_at,
+            }
+        )
+        return record
+
+    def get_identity_secret_pointer(self, identity_id: str) -> Optional[IdentitySecretPointer]:
+        item = self.table.get_item(Key={"PK": "IDENTITY", "SK": f"SECRET#{identity_id}"}).get("Item")
+        if not item:
+            return None
+        return IdentitySecretPointer.model_validate(item.get("record", {}))
+
+    def put_browser_session(self, record: BrowserSessionRecord) -> BrowserSessionRecord:
+        payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
+        self.table.put_item(
+            Item={
+                "PK": "BROWSER_SESSION",
+                "SK": f"SESSION#{payload.session_id}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "site_scope": payload.site_scope,
+                "identity_id": payload.identity_id,
+                "updated_at": payload.updated_at,
+            }
+        )
+        return payload
+
+    def list_browser_sessions(self, limit: int = 50) -> list[BrowserSessionRecord]:
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq("BROWSER_SESSION") & Key("SK").begins_with("SESSION#"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        return [BrowserSessionRecord.model_validate(item.get("record", {})) for item in response.get("Items", [])]
+
+    def put_automation_policy(self, record: AutomationPolicyRecord) -> AutomationPolicyRecord:
+        payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
+        self.table.put_item(
+            Item={
+                "PK": "AUTOMATION_POLICY",
+                "SK": f"POLICY#{payload.policy_id}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "site_scope": payload.site_scope,
+                "category": payload.category,
+                "updated_at": payload.updated_at,
+            }
+        )
+        return payload
+
+    def list_automation_policies(self, limit: int = 50) -> list[AutomationPolicyRecord]:
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq("AUTOMATION_POLICY") & Key("SK").begins_with("POLICY#"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        return [AutomationPolicyRecord.model_validate(item.get("record", {})) for item in response.get("Items", [])]
+
+    def put_payment_profile(self, record: PaymentProfileRecord) -> PaymentProfileRecord:
+        payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
+        self.table.put_item(
+            Item={
+                "PK": "PAYMENT_PROFILE",
+                "SK": f"PAYMENT#{payload.payment_profile_id}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "updated_at": payload.updated_at,
+            }
+        )
+        return payload
+
+    def list_payment_profiles(self, limit: int = 50) -> list[PaymentProfileRecord]:
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq("PAYMENT_PROFILE") & Key("SK").begins_with("PAYMENT#"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        return [PaymentProfileRecord.model_validate(item.get("record", {})) for item in response.get("Items", [])]
+
+    def put_booking_record(self, record: BookingRecord) -> BookingRecord:
+        payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
+        self.table.put_item(
+            Item={
+                "PK": "BOOKING",
+                "SK": f"BOOKING#{payload.booking_id}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "job_id": payload.job_id,
+                "site_key": payload.site_key,
+                "updated_at": payload.updated_at,
+            }
+        )
+        return payload
+
+    def claim_pubsub_delivery(self, delivery_id: str) -> bool:
+        expires_at = int((utc_now() + timedelta(days=7)).timestamp())
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": "MAILBOX_DELIVERY",
+                    "SK": f"PUBSUB#{delivery_id}",
+                    "created_at": utc_now().isoformat(),
+                    "ttl": expires_at,
+                },
+                ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def put_mailbox_watch_state(self, state: MailboxWatchState) -> MailboxWatchState:
+        payload = state.model_copy(update={"updated_at": utc_now().isoformat()})
+        self.table.put_item(
+            Item={
+                "PK": "MAILBOX",
+                "SK": f"WATCH#{payload.mailbox_email}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "updated_at": payload.updated_at,
+            }
+        )
+        return payload
+
+    def get_mailbox_watch_state(self, mailbox_email: str) -> Optional[MailboxWatchState]:
+        item = self.table.get_item(Key={"PK": "MAILBOX", "SK": f"WATCH#{mailbox_email}"}).get("Item")
+        if not item:
+            return None
+        return MailboxWatchState.model_validate(item.get("record", {}))
+
+    def put_mailbox_wait(self, record: MailboxVerificationWaitRecord) -> MailboxVerificationWaitRecord:
+        payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
+        ttl = int(datetime.fromisoformat(payload.expires_at).timestamp()) if payload.expires_at else ttl_epoch(self.settings.interrupted_job_ttl_days)
+        self.table.put_item(
+            Item={
+                "PK": "MAILBOX_WAIT",
+                "SK": f"WAIT#{payload.wait_id}",
+                "record": self._to_dynamo(payload.model_dump()),
+                "workflow_id": payload.workflow_id,
+                "job_id": payload.job_id,
+                "status": payload.status,
+                "updated_at": payload.updated_at,
+                "ttl": ttl,
+            }
+        )
+        return payload
+
+    def list_active_mailbox_waits(self, limit: int = 50) -> list[MailboxVerificationWaitRecord]:
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq("MAILBOX_WAIT") & Key("SK").begins_with("WAIT#"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        waits: list[MailboxVerificationWaitRecord] = []
+        for item in response.get("Items", []):
+            record = MailboxVerificationWaitRecord.model_validate(item.get("record", {}))
+            if record.status == "waiting":
+                waits.append(record)
+        return waits
+
+    def claim_mailbox_wait_message(self, *, wait_id: str, gmail_message_id: str) -> bool:
+        expires_at = int((utc_now() + timedelta(days=7)).timestamp())
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": f"MAILBOX_MATCH#{wait_id}",
+                    "SK": f"MSG#{gmail_message_id}",
+                    "created_at": utc_now().isoformat(),
+                    "ttl": expires_at,
+                },
+                ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def mark_mailbox_wait_matched(self, wait_id: str, *, gmail_message_id: str) -> None:
+        item = self.table.get_item(Key={"PK": "MAILBOX_WAIT", "SK": f"WAIT#{wait_id}"}).get("Item")
+        if not item:
+            return
+        record = MailboxVerificationWaitRecord.model_validate(item.get("record", {})).model_copy(
+            update={
+                "status": "matched",
+                "matched_message_id": gmail_message_id,
+                "updated_at": utc_now().isoformat(),
+            }
+        )
+        self.put_mailbox_wait(record)
+
+    def create_dashboard_session(self, record: DashboardSessionRecord) -> DashboardSessionRecord:
+        ttl = int(datetime.fromisoformat(record.expires_at).timestamp()) if record.expires_at else int((utc_now() + timedelta(seconds=self.settings.dashboard_session_ttl_seconds)).timestamp())
+        self.table.put_item(
+            Item={
+                "PK": "DASHBOARD_SESSION",
+                "SK": f"SESSION#{record.session_id}",
+                "record": self._to_dynamo(record.model_dump()),
+                "ttl": ttl,
+                "created_at": record.created_at,
+            }
+        )
+        return record
+
+    def get_dashboard_session(self, session_id: str) -> Optional[DashboardSessionRecord]:
+        item = self.table.get_item(Key={"PK": "DASHBOARD_SESSION", "SK": f"SESSION#{session_id}"}).get("Item")
+        if not item:
+            return None
+        return DashboardSessionRecord.model_validate(item.get("record", {}))
+
+    def delete_dashboard_session(self, session_id: str) -> None:
+        self.table.delete_item(Key={"PK": "DASHBOARD_SESSION", "SK": f"SESSION#{session_id}"})
 
     def create_job(self, job: AgentJob) -> AgentJob:
         now = utc_now().isoformat()

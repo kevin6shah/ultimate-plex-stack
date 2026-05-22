@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
+from .browser import _choose_user_agent
+from .booking_guard import zero_dollar_booking_instruction
+from .browser_fingerprint import browser_fingerprint_seed, build_browser_fingerprint, stagehand_launch_options
 from .research import sanitize_tool_output
 from .settings import Settings
 from .workspace import Workspace
@@ -214,17 +217,20 @@ async def _stagehand_raw_json(awaitable: object) -> dict[str, object]:
     return _coerce_stagehand_json(data)
 
 
-def _stagehand_browser_payload(*, settings: Settings, workspace: Workspace, chrome_path: str) -> dict[str, object]:
+def _stagehand_browser_payload(*, settings: Settings, workspace: Workspace, chrome_path: str, task: str) -> dict[str, object]:
     profile_dir = _workspace_dir(workspace, ".stagehand/profile")
-    launch_options: dict[str, object] = {
-        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-        "chromiumSandbox": False,
-        "headless": settings.stagehand_local_headless,
-        "userDataDir": str(profile_dir),
-        "preserveUserDataDir": True,
-    }
-    if chrome_path:
-        launch_options["executablePath"] = chrome_path
+    downloads_dir = _workspace_dir(workspace, ".stagehand/downloads")
+    fingerprint = build_browser_fingerprint(
+        seed=browser_fingerprint_seed(task),
+        user_agent=_choose_user_agent(settings),
+    )
+    launch_options = stagehand_launch_options(
+        fingerprint=fingerprint,
+        executable_path=chrome_path,
+        user_data_dir=str(profile_dir),
+        downloads_path=str(downloads_dir),
+    )
+    launch_options["headless"] = settings.stagehand_local_headless
     return {
         "type": "local",
         "launchOptions": launch_options,
@@ -288,7 +294,8 @@ async def run_stagehand_task(
         "You are Friday's bounded browser fallback. "
         "Only use this browser session after deterministic MCP/API/public-web paths were insufficient. "
         "Keep the task tightly scoped, avoid loops, and return a concise human-readable summary with concrete findings. "
-        "If a site blocks access, summarize what you were still able to verify instead of pretending you found nothing."
+        "If a site blocks access, summarize what you were still able to verify instead of pretending you found nothing. "
+        + zero_dollar_booking_instruction()
     )
     normalized_task = (
         "Interactive browser fallback mode. Deterministic MCP/API/public-web paths were insufficient for this task. "
@@ -307,7 +314,7 @@ async def run_stagehand_task(
     try:
         session_response = await client.sessions.start(
             model_name=model_name,
-            browser=_stagehand_browser_payload(settings=settings, workspace=workspace, chrome_path=chrome_path),
+            browser=_stagehand_browser_payload(settings=settings, workspace=workspace, chrome_path=chrome_path, task=task),
             self_heal=settings.stagehand_self_heal,
             verbose=1,
             system_prompt=system_prompt,

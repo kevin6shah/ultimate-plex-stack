@@ -11,6 +11,8 @@ from urllib.parse import quote_plus, unquote, urlparse
 
 import httpx
 
+from .booking_guard import enforce_zero_dollar_booking
+from .browser_fingerprint import STEALTH_INIT_SCRIPT, browser_fingerprint_seed, build_browser_fingerprint, common_chromium_args
 from .settings import Settings
 
 
@@ -305,25 +307,25 @@ class BrowserSession:
 
         self._playwright = await async_playwright().start()
         self._stealth = Stealth(init_scripts_only=True) if (self._settings is None or self._settings.browser_stealth_enabled) else None
+        fingerprint = build_browser_fingerprint(
+            seed=browser_fingerprint_seed(start_url or "friday-browser"),
+            user_agent=self._user_agent,
+        )
         self._browser = await self._playwright.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-                "--single-process",
-            ],
+            args=common_chromium_args(),
         )
         self._context = await self._browser.new_context(
-            user_agent=self._user_agent,
-            locale="en-US",
-            viewport={"width": 1440, "height": 900},
+            user_agent=fingerprint.user_agent,
+            locale=fingerprint.locale,
+            viewport=fingerprint.viewport(),
             accept_downloads=True,
+            timezone_id=fingerprint.timezone_id,
         )
         if self._stealth is not None:
             await self._stealth.apply_stealth_async(self._context)
+        await self._context.add_init_script(f"window.__fridayFingerprintSeed = {fingerprint.seed!r};")
+        await self._context.add_init_script(STEALTH_INIT_SCRIPT)
         self._page = await self._context.new_page()
         if start_url:
             await self.goto(start_url)
@@ -356,6 +358,7 @@ class BrowserSession:
         locator = self._page.locator(selector).first
         await locator.fill(text, timeout=10000)
         if submit:
+            enforce_zero_dollar_booking(await self.read(limit=8000))
             await locator.press("Enter")
         await self._page.wait_for_timeout(800)
         return await self.describe()

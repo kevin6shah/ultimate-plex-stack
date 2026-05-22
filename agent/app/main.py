@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import hashlib
+import hmac
 import logging
 import re
 import zipfile
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Any, Optional
 from urllib.parse import quote
 from uuid import uuid4
@@ -15,6 +18,7 @@ import boto3
 from fastapi import FastAPI, Header, HTTPException, Request
 from mangum import Mangum
 from pydantic import BaseModel
+from starlette.responses import HTMLResponse, RedirectResponse
 
 from .agent_core import run_agent
 from .artifacts import (
@@ -30,8 +34,10 @@ from .jobs import (
     AttachmentRef,
     CheckpointPayload,
     ControlCommand,
+    DashboardSessionRecord,
     JobSource,
     JobStatus,
+    MailboxWatchState,
     SaveConfigRequest,
     TaskClass,
     ThreadTurnRole,
@@ -41,6 +47,17 @@ from .jobs import (
     WorkerFailureRequest,
     WorkerHeartbeat,
     WorkerPauseRequest,
+)
+from .gmail_oauth import (
+    decode_pubsub_push_body,
+    extract_otp_codes,
+    first_matching_code,
+    gmail_api_get,
+    gmail_message_headers,
+    gmail_message_text,
+    list_history_message_ids,
+    mint_gmail_access_token,
+    renew_gmail_watch,
 )
 from .routing import classify_task, is_long_task, task_routing_profile
 from .settings import settings
@@ -57,6 +74,7 @@ logger = logging.getLogger(__name__)
 RUNNING_JOB_STALE_AFTER = timedelta(minutes=10)
 WAITING_JOB_STALE_AFTER = timedelta(minutes=15)
 ATTACHMENTS_READY_STALE_AFTER = timedelta(minutes=3)
+DASHBOARD_SESSION_COOKIE = "friday_dashboard_session"
 
 
 app = FastAPI(title="Friday Personal Agent")
@@ -95,6 +113,20 @@ def configure_observability() -> None:
 configure_observability()
 
 
+@app.on_event("startup")
+async def startup_housekeeping() -> None:
+    if not temporal_backend_enabled(settings):
+        return
+    if not settings.gmail_pubsub_topic_name.strip():
+        return
+    try:
+        from .temporal_client import ensure_gmail_watch_renewal_workflow
+
+        await ensure_gmail_watch_renewal_workflow(settings)
+    except Exception as exc:
+        logger.warning("gmail watch renewal workflow ensure failed: %s", exc)
+
+
 def store() -> StateStore:
     return StateStore(settings)
 
@@ -105,6 +137,10 @@ def queue_client():
 
 def s3_client():
     return settings.s3
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _dedicated_worker_enabled() -> bool:
@@ -141,6 +177,207 @@ async def _start_heavy_job(state: StateStore, job: AgentJob) -> None:
 
 def _normalize_query(text: str) -> str:
     return text.strip()
+
+
+def _dashboard_session_signature(session_id: str) -> str:
+    signing_secret = _resolved_optional_secret(settings.dashboard_session_secret_param)
+    if not signing_secret:
+        raise HTTPException(status_code=500, detail="dashboard session secret not configured")
+    return hmac.new(signing_secret.encode("utf-8"), session_id.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _encode_dashboard_session_cookie(session_id: str) -> str:
+    return f"{session_id}.{_dashboard_session_signature(session_id)}"
+
+
+def _decode_dashboard_session_cookie(raw_cookie: str) -> Optional[str]:
+    if not raw_cookie or "." not in raw_cookie:
+        return None
+    session_id, supplied_signature = raw_cookie.split(".", 1)
+    expected_signature = _dashboard_session_signature(session_id)
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return None
+    return session_id
+
+
+def _telegram_login_is_valid(payload: dict[str, str]) -> bool:
+    supplied_hash = (payload.get("hash") or "").strip()
+    if not supplied_hash:
+        return False
+    bot_token = _resolved_optional_secret(settings.telegram_bot_token_param)
+    if not bot_token:
+        return False
+    data_check = "\n".join(
+        f"{key}={value}"
+        for key, value in sorted((key, value) for key, value in payload.items() if key != "hash" and value is not None)
+    )
+    secret_key = hashlib.sha256(bot_token.encode("utf-8")).digest()
+    expected_hash = hmac.new(secret_key, data_check.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(supplied_hash, expected_hash):
+        return False
+    try:
+        auth_date = int(payload.get("auth_date") or "0")
+    except ValueError:
+        return False
+    age_seconds = int((_utc_now() - datetime.fromtimestamp(auth_date, tz=timezone.utc)).total_seconds())
+    return 0 <= age_seconds <= max(300, settings.dashboard_session_ttl_seconds)
+
+
+def _dashboard_login_widget_html() -> str:
+    bot_username = settings.telegram_bot_username.strip()
+    if not bot_username:
+        return "<p>Telegram dashboard login is not configured yet.</p>"
+    return (
+        '<script async src="https://telegram.org/js/telegram-widget.js?22" '
+        f'data-telegram-login="{escape(bot_username)}" '
+        'data-size="large" '
+        'data-userpic="false" '
+        'data-auth-url="/dashboard/auth/telegram" '
+        'data-request-access="write"></script>'
+    )
+
+
+def _dashboard_shell(*, title: str, active_view: str, body_html: str, session_name: str = "") -> str:
+    def nav_link(view: str, label: str) -> str:
+        current = " class='active'" if view == active_view else ""
+        return f"<a{current} href='/dashboard/{escape(view)}'>{escape(label)}</a>"
+
+    nav = " ".join(
+        [
+            nav_link("jobs", "Jobs"),
+            nav_link("mailbox", "Mailbox"),
+            nav_link("identities", "Identities"),
+            nav_link("policies", "Policies"),
+            nav_link("sessions", "Sessions"),
+            nav_link("payments", "Payments"),
+        ]
+    )
+    signed_in = f"<div class='whoami'>Signed in as {escape(session_name)}</div>" if session_name else ""
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{escape(title)}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --bg: #f6f4ef;
+        --ink: #1e1b17;
+        --muted: #6e655a;
+        --panel: #fffdfa;
+        --line: #d8d0c3;
+        --accent: #166534;
+        --accent-2: #f59e0b;
+      }}
+      body {{ margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(180deg, #f4efe5, #fbfaf7); color: var(--ink); }}
+      .page {{ max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }}
+      .mast {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 18px; }}
+      .mast h1 {{ margin: 0; font-size: 1.5rem; }}
+      .whoami {{ color: var(--muted); font-size: 0.95rem; }}
+      nav {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
+      nav a {{ text-decoration: none; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink); background: rgba(255,255,255,0.7); }}
+      nav a.active {{ background: var(--ink); color: white; border-color: var(--ink); }}
+      .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); }}
+      .panel + .panel {{ margin-top: 14px; }}
+      table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+      th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid #eee5d8; vertical-align: top; }}
+      th {{ color: var(--muted); font-weight: 600; font-size: 0.9rem; }}
+      .kpi {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-top: 12px; }}
+      .kpi div {{ border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: #fff; }}
+      .muted {{ color: var(--muted); }}
+      .pill {{ display: inline-block; padding: 3px 8px; border-radius: 999px; background: #eef4eb; color: var(--accent); font-size: 0.82rem; font-weight: 600; }}
+      .warn {{ color: #9a3412; }}
+      form.inline {{ display: inline; }}
+      button {{ cursor: pointer; border: none; border-radius: 10px; padding: 10px 14px; background: var(--ink); color: white; }}
+      button.secondary {{ background: var(--accent-2); color: #241b07; }}
+      pre {{ white-space: pre-wrap; word-break: break-word; background: #faf6ee; border-radius: 12px; padding: 12px; border: 1px solid var(--line); }}
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <div class="mast">
+        <div>
+          <h1>{escape(title)}</h1>
+          <div class="muted">Friday operator board for booking, mailbox, and workflow control.</div>
+        </div>
+        {signed_in}
+      </div>
+      <nav>{nav}</nav>
+      {body_html}
+    </main>
+  </body>
+</html>"""
+
+
+def _html_table(headers: list[str], rows: list[list[str]]) -> str:
+    head_html = "".join(f"<th>{escape(header)}</th>" for header in headers)
+    if not rows:
+        return "<p class='muted'>Nothing recorded yet.</p>"
+    body = []
+    for row in rows:
+        body.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+    return f"<table><thead><tr>{head_html}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+
+def _dashboard_record_rows(records: list[dict[str, Any]], *, fields: list[str]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for record in records:
+        row: list[str] = []
+        for field in fields:
+            value = record.get(field, "")
+            rendered = escape(str(value)) if value not in (None, "") else "<span class='muted'>-</span>"
+            row.append(rendered)
+        rows.append(row)
+    return rows
+
+
+def _require_dashboard_session(request: Request):
+    raw_cookie = request.cookies.get(DASHBOARD_SESSION_COOKIE, "")
+    session_id = _decode_dashboard_session_cookie(raw_cookie)
+    if not session_id:
+        raise HTTPException(status_code=401, detail="dashboard session required")
+    record = store().get_dashboard_session(session_id)
+    if record is None:
+        raise HTTPException(status_code=401, detail="dashboard session expired")
+    return record
+
+
+def _resolved_optional_secret(parameter_name: str) -> str:
+    if not parameter_name:
+        return ""
+    value = settings.secret(parameter_name).strip()
+    if not value:
+        return ""
+    if not parameter_name.startswith("/") and value == parameter_name and re.fullmatch(r"[A-Z0-9_]+", parameter_name):
+        return ""
+    return value
+
+
+def _mailbox_watch_state(state: StateStore) -> MailboxWatchState:
+    mailbox_email = _resolved_optional_secret(settings.gmail_account_email_param)
+    if not mailbox_email:
+        return MailboxWatchState(mailbox_email="", watch_status="missing_mailbox_email")
+    return state.get_mailbox_watch_state(mailbox_email) or MailboxWatchState(mailbox_email=mailbox_email)
+
+
+def _mailbox_wait_matches(wait, *, sender: str, subject: str, text: str, message_internal_date: datetime) -> Optional[str]:
+    if wait.status != "waiting":
+        return None
+    created_after = _parse_job_timestamp(wait.created_after) or datetime.fromtimestamp(0, tz=timezone.utc)
+    expires_at = _parse_job_timestamp(wait.expires_at) or (_utc_now() + timedelta(minutes=5))
+    if message_internal_date < created_after or _utc_now() > expires_at:
+        return None
+    if wait.expected_sender_patterns and not any(re.search(pattern, sender, flags=re.IGNORECASE) for pattern in wait.expected_sender_patterns):
+        return None
+    if wait.expected_subject_patterns and not any(re.search(pattern, subject, flags=re.IGNORECASE) for pattern in wait.expected_subject_patterns):
+        return None
+    patterns = wait.otp_regex or []
+    code = first_matching_code(text, patterns)
+    if code:
+        return code
+    fallback_codes = extract_otp_codes(text)
+    return fallback_codes[0] if fallback_codes else None
 
 
 def _is_resume_request(query: str) -> bool:
@@ -1198,6 +1435,342 @@ async def stop_job(job_id: str, x_friday_siri_key: Optional[str] = Header(defaul
         return {"status": "ok"}
     state.record_control_signal(job_id, command=ControlCommand.STOP, note="stopped by user")
     return {"status": "ok"}
+
+
+@app.get("/dashboard")
+async def dashboard_home(request: Request):
+    try:
+        _require_dashboard_session(request)
+    except HTTPException:
+        body = f"""
+        <section class="panel">
+          <p>Sign in with Telegram to manage identities, mailbox health, policies, jobs, sessions, and payment metadata.</p>
+          {_dashboard_login_widget_html()}
+        </section>
+        """
+        return HTMLResponse(_dashboard_shell(title="Friday Operator Board", active_view="jobs", body_html=body))
+    return RedirectResponse(url="/dashboard/jobs", status_code=302)
+
+
+@app.get("/dashboard/auth/telegram")
+async def dashboard_auth_telegram(request: Request):
+    params = {key: value for key, value in request.query_params.items()}
+    if not _telegram_login_is_valid(params):
+        raise HTTPException(status_code=401, detail="invalid telegram login payload")
+    expires_at = (_utc_now() + timedelta(seconds=settings.dashboard_session_ttl_seconds)).isoformat()
+    record = DashboardSessionRecord(
+        telegram_user_id=params.get("id", ""),
+        telegram_auth_date=params.get("auth_date", ""),
+        first_name=params.get("first_name", ""),
+        username=params.get("username", ""),
+        expires_at=expires_at,
+    )
+    store().create_dashboard_session(record)
+    response = RedirectResponse(url="/dashboard/jobs", status_code=302)
+    response.set_cookie(
+        DASHBOARD_SESSION_COOKIE,
+        _encode_dashboard_session_cookie(record.session_id),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=settings.dashboard_session_ttl_seconds,
+        path="/",
+    )
+    return response
+
+
+@app.post("/dashboard/logout")
+async def dashboard_logout(request: Request):
+    raw_cookie = request.cookies.get(DASHBOARD_SESSION_COOKIE, "")
+    session_id = _decode_dashboard_session_cookie(raw_cookie)
+    if session_id:
+        store().delete_dashboard_session(session_id)
+    response = RedirectResponse(url="/dashboard", status_code=302)
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/")
+    return response
+
+
+@app.post("/dashboard/mailbox/refresh-watch")
+async def dashboard_refresh_mailbox_watch(request: Request):
+    _require_dashboard_session(request)
+    state = store()
+    mailbox_email = _resolved_optional_secret(settings.gmail_account_email_param)
+    watch_state = _mailbox_watch_state(state)
+    try:
+        payload = await renew_gmail_watch(settings)
+        watch_state = MailboxWatchState(
+            mailbox_email=mailbox_email,
+            history_id=str(payload.get("historyId", "")),
+            expiration=str(payload.get("expiration", "")),
+            topic_name=settings.gmail_pubsub_topic_name,
+            watch_status="active",
+            last_watch_renewed_at=_utc_now().isoformat(),
+            last_push_received_at=watch_state.last_push_received_at,
+            last_oauth_tested_at=_utc_now().isoformat(),
+            last_oauth_error="",
+        )
+    except Exception as exc:
+        watch_state = watch_state.model_copy(
+            update={
+                "mailbox_email": mailbox_email,
+                "watch_status": "oauth_error",
+                "last_oauth_tested_at": _utc_now().isoformat(),
+                "last_oauth_error": str(exc)[:500],
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+    state.put_mailbox_watch_state(watch_state)
+    return RedirectResponse(url="/dashboard/mailbox", status_code=302)
+
+
+@app.post("/dashboard/jobs/{job_id}/stop")
+async def dashboard_stop_job(job_id: str, request: Request):
+    _require_dashboard_session(request)
+    state = store()
+    job = state.get_job(job_id)
+    if job is not None:
+        await _stop_jobs_async(state, [job])
+    return RedirectResponse(url="/dashboard/jobs", status_code=302)
+
+
+@app.get("/dashboard/{view_name}")
+async def dashboard_view(view_name: str, request: Request):
+    session = _require_dashboard_session(request)
+    state = store()
+    session_name = session.first_name or session.username or session.telegram_user_id
+    logout_html = """
+    <section class="panel">
+      <form class="inline" action="/dashboard/logout" method="post">
+        <button type="submit">Log out</button>
+      </form>
+    </section>
+    """
+    if view_name == "jobs":
+        active_statuses = (
+            JobStatus.RUNNING,
+            JobStatus.WAITING_WORKER,
+            JobStatus.QUEUED,
+            JobStatus.PAUSED_FOR_INPUT,
+            JobStatus.WAITING_APPROVAL,
+        )
+        recent_statuses = (JobStatus.INTERRUPTED, JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMED_OUT)
+        active_jobs = state.list_jobs(statuses=active_statuses, limit=25)
+        recent_jobs = state.list_jobs(statuses=recent_statuses, limit=25)
+        active_rows = []
+        for job in active_jobs:
+            action = (
+                f"<form class='inline' action='/dashboard/jobs/{escape(job.job_id)}/stop' method='post'>"
+                "<button type='submit' class='secondary'>Stop</button></form>"
+            )
+            active_rows.append(
+                [
+                    escape(job.job_id[:8]),
+                    f"<span class='pill'>{escape(job.status.value)}</span>",
+                    escape(job.source.value),
+                    escape((job.current_step or "-")[:80]),
+                    escape((job.latest_checkpoint_summary or job.query)[:120]),
+                    action,
+                ]
+            )
+        recent_rows = [
+            [
+                escape(job.job_id[:8]),
+                escape(job.status.value),
+                escape(job.source.value),
+                escape((job.current_step or "-")[:80]),
+                escape((job.result_preview or job.error_message or job.query)[:140]),
+            ]
+            for job in recent_jobs
+        ]
+        body = (
+            logout_html
+            + "<section class='panel'><h2>Active jobs</h2>"
+            + _html_table(["Job", "Status", "Source", "Step", "Latest detail", "Action"], active_rows)
+            + "</section><section class='panel'><h2>Recent terminal jobs</h2>"
+            + _html_table(["Job", "Status", "Source", "Step", "Outcome"], recent_rows)
+            + "</section>"
+        )
+        return HTMLResponse(_dashboard_shell(title="Friday Jobs", active_view="jobs", body_html=body, session_name=session_name))
+    if view_name == "mailbox":
+        watch_state = _mailbox_watch_state(state)
+        waits = state.list_active_mailbox_waits(limit=25)
+        wait_rows = [
+            [
+                escape(wait.wait_id[:8]),
+                escape(wait.site_key),
+                escape(wait.workflow_id),
+                escape(wait.job_id[:8]),
+                escape(wait.status),
+                escape(wait.expires_at or "-"),
+            ]
+            for wait in waits
+        ]
+        kpis = f"""
+        <div class="kpi">
+          <div><strong>Status</strong><br />{escape(watch_state.watch_status or 'unknown')}</div>
+          <div><strong>Mailbox</strong><br />{escape(watch_state.mailbox_email or '-')}</div>
+          <div><strong>History ID</strong><br />{escape(watch_state.history_id or '-')}</div>
+          <div><strong>Last push</strong><br />{escape(watch_state.last_push_received_at or '-')}</div>
+          <div><strong>Last OAuth test</strong><br />{escape(watch_state.last_oauth_tested_at or '-')}</div>
+          <div><strong>Last watch renew</strong><br />{escape(watch_state.last_watch_renewed_at or '-')}</div>
+        </div>
+        """
+        oauth_warning = (
+            f"<p class='warn'>Last OAuth/watch error: {escape(watch_state.last_oauth_error)}</p>"
+            if watch_state.last_oauth_error
+            else ""
+        )
+        body = (
+            logout_html
+            + "<section class='panel'><h2>Mailbox health</h2>"
+            + kpis
+            + oauth_warning
+            + "<form class='inline' action='/dashboard/mailbox/refresh-watch' method='post'><button type='submit'>Renew Gmail watch</button></form>"
+            + "</section><section class='panel'><h2>Verification waits</h2>"
+            + _html_table(["Wait", "Site", "Workflow", "Job", "Status", "Expires"], wait_rows)
+            + "</section>"
+        )
+        return HTMLResponse(_dashboard_shell(title="Friday Mailbox", active_view="mailbox", body_html=body, session_name=session_name))
+    if view_name == "identities":
+        identities = [record.model_dump() for record in state.list_identities(limit=100)]
+        body = logout_html + "<section class='panel'><h2>Identities</h2>" + _html_table(
+            ["Label", "Email", "Provider", "Category", "Site scope", "Default", "Status"],
+            _dashboard_record_rows(
+                identities,
+                fields=["label", "email", "provider", "category", "site_scope", "is_default", "status"],
+            ),
+        ) + "</section>"
+        return HTMLResponse(_dashboard_shell(title="Friday Identities", active_view="identities", body_html=body, session_name=session_name))
+    if view_name == "policies":
+        policies = [record.model_dump() for record in state.list_automation_policies(limit=100)]
+        body = logout_html + "<section class='panel'><h2>Policies</h2>" + _html_table(
+            ["Label", "Site scope", "Category", "$0 booking", "Account creation", "Login reuse", "Pause on SMS/CAPTCHA"],
+            _dashboard_record_rows(
+                policies,
+                fields=[
+                    "label",
+                    "site_scope",
+                    "category",
+                    "allow_zero_dollar_booking",
+                    "allow_account_creation",
+                    "allow_login_reuse",
+                    "pause_on_sms_or_captcha",
+                ],
+            ),
+        ) + "</section>"
+        return HTMLResponse(_dashboard_shell(title="Friday Policies", active_view="policies", body_html=body, session_name=session_name))
+    if view_name == "sessions":
+        sessions = [record.model_dump() for record in state.list_browser_sessions(limit=100)]
+        body = logout_html + "<section class='panel'><h2>Saved browser sessions</h2>" + _html_table(
+            ["Session", "Site scope", "Identity", "User agent", "Viewport", "Status", "Updated"],
+            [
+                [
+                    escape(record["session_id"][:8]),
+                    escape(record.get("site_scope", "")),
+                    escape(record.get("identity_id", "")),
+                    escape((record.get("user_agent", "") or "")[:50]),
+                    escape(f'{record.get("viewport_width", 0)}x{record.get("viewport_height", 0)}'),
+                    escape(record.get("status", "")),
+                    escape(record.get("updated_at", "")),
+                ]
+                for record in sessions
+            ],
+        ) + "</section>"
+        return HTMLResponse(_dashboard_shell(title="Friday Sessions", active_view="sessions", body_html=body, session_name=session_name))
+    if view_name == "payments":
+        payments = [record.model_dump() for record in state.list_payment_profiles(limit=100)]
+        body = (
+            logout_html
+            + "<section class='panel'><h2>Payment metadata</h2><p class='muted'>Phase 1 keeps this metadata visible but runtime booking remains blocked to $0 only.</p>"
+            + _html_table(
+                ["Label", "Provider", "Last4", "Limit cents", "Active", "Notes"],
+                _dashboard_record_rows(
+                    payments,
+                    fields=["label", "provider", "masked_last4", "limit_cents", "active", "notes"],
+                ),
+            )
+            + "</section>"
+        )
+        return HTMLResponse(_dashboard_shell(title="Friday Payments", active_view="payments", body_html=body, session_name=session_name))
+    raise HTTPException(status_code=404, detail="unknown dashboard view")
+
+
+@app.post("/internal/gmail/pubsub")
+async def gmail_pubsub_ingress(request: Request, token: Optional[str] = None) -> dict[str, Any]:
+    expected_token = _resolved_optional_secret(settings.gmail_pubsub_verification_token_param)
+    if expected_token and token != expected_token:
+        raise HTTPException(status_code=401, detail="invalid gmail pubsub token")
+    payload = await request.json()
+    event = decode_pubsub_push_body(payload)
+    state = store()
+    if not state.claim_pubsub_delivery(event.delivery_id):
+        return {"status": "duplicate_ignored", "delivery_id": event.delivery_id}
+
+    mailbox_email = _resolved_optional_secret(settings.gmail_account_email_param)
+    watch_state = _mailbox_watch_state(state).model_copy(
+        update={
+            "mailbox_email": mailbox_email or event.email_address,
+            "history_id": event.history_id,
+            "last_push_received_at": _utc_now().isoformat(),
+            "updated_at": _utc_now().isoformat(),
+        }
+    )
+    state.put_mailbox_watch_state(watch_state)
+
+    token_payload = await mint_gmail_access_token(settings)
+    message_ids = await list_history_message_ids(
+        settings,
+        access_token=token_payload["access_token"],
+        history_id=event.history_id,
+    )
+    waits = state.list_active_mailbox_waits(limit=100)
+    matched_waits = 0
+    signaled = 0
+
+    from .temporal_client import signal_submit_verification_code
+
+    for gmail_message_id in message_ids:
+        message = await gmail_api_get(
+            settings,
+            f"/messages/{quote(gmail_message_id)}",
+            access_token=token_payload["access_token"],
+            params={"format": "full"},
+        )
+        headers = gmail_message_headers(message)
+        sender = headers.get("from", "")
+        subject = headers.get("subject", "")
+        text = gmail_message_text(message)
+        raw_internal_date = str(message.get("internalDate", "")).strip()
+        try:
+            message_internal_date = datetime.fromtimestamp(int(raw_internal_date) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError):
+            message_internal_date = _utc_now()
+        for wait in waits:
+            code = _mailbox_wait_matches(
+                wait,
+                sender=sender,
+                subject=subject,
+                text=text,
+                message_internal_date=message_internal_date,
+            )
+            if not code:
+                continue
+            if not state.claim_mailbox_wait_message(wait_id=wait.wait_id, gmail_message_id=gmail_message_id):
+                break
+            matched_waits += 1
+            if await signal_submit_verification_code(settings, wait.job_id, code):
+                state.mark_mailbox_wait_matched(wait.wait_id, gmail_message_id=gmail_message_id)
+                signaled += 1
+            break
+
+    return {
+        "status": "ok",
+        "delivery_id": event.delivery_id,
+        "history_id": event.history_id,
+        "message_ids": len(message_ids),
+        "matched_waits": matched_waits,
+        "signals_sent": signaled,
+    }
 
 
 @app.post("/telegram")

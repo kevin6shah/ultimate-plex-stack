@@ -61,11 +61,13 @@ class Settings:
     opentable_password_param: str = _secret_setting("OPENTABLE_PASSWORD_PARAM", "OPENTABLE_PASSWORD")
     gmail_account_email_param: str = _secret_setting("GMAIL_ACCOUNT_EMAIL_PARAM", "GMAIL_ACCOUNT_EMAIL")
     gmail_app_password_param: str = _secret_setting("GMAIL_APP_PASSWORD_PARAM", "GMAIL_APP_PASSWORD")
-    gmail_client_id_param: str = _secret_setting("GMAIL_CLIENT_ID_PARAM", "GMAIL_CLIENT_ID")
-    gmail_client_secret_param: str = _secret_setting("GMAIL_CLIENT_SECRET_PARAM", "GMAIL_CLIENT_SECRET")
-    gmail_refresh_token_param: str = _secret_setting("GMAIL_REFRESH_TOKEN_PARAM", "GMAIL_REFRESH_TOKEN")
+    google_client_id_param: str = _secret_setting("GOOGLE_CLIENT_ID_PARAM", "GOOGLE_CLIENT_ID")
+    google_client_secret_param: str = _secret_setting("GOOGLE_CLIENT_SECRET_PARAM", "GOOGLE_CLIENT_SECRET")
+    google_refresh_token_param: str = _secret_setting("GOOGLE_REFRESH_TOKEN_PARAM", "GOOGLE_REFRESH_TOKEN")
     logfire_token_param: str = _secret_setting("LOGFIRE_TOKEN_PARAM", "LOGFIRE_TOKEN")
     worker_api_key_param: str = _secret_setting("WORKER_API_KEY_PARAM", "WORKER_API_KEY")
+    gmail_pubsub_verification_token_param: str = _secret_setting("GMAIL_PUBSUB_VERIFICATION_TOKEN_PARAM", "GMAIL_PUBSUB_VERIFICATION_TOKEN")
+    dashboard_session_secret_param: str = _secret_setting("DASHBOARD_SESSION_SECRET_PARAM", "DASHBOARD_SESSION_SECRET")
     browser_stealth_enabled: bool = os.environ.get("BROWSER_STEALTH_ENABLED", "true").lower() == "true"
     browser_user_agent_rotation: bool = os.environ.get("BROWSER_USER_AGENT_ROTATION", "true").lower() == "true"
     browser_use_enabled: bool = os.environ.get("BROWSER_USE_ENABLED", "true").lower() == "true"
@@ -108,6 +110,12 @@ class Settings:
     opentable_mcp_command: str = os.environ.get("OPENTABLE_MCP_COMMAND", "npx")
     opentable_mcp_args: str = os.environ.get("OPENTABLE_MCP_ARGS", "-y @striderlabs/mcp-opentable")
     gmail_mcp_enabled: bool = os.environ.get("GMAIL_MCP_ENABLED", "false").lower() == "true"
+    gmail_pubsub_topic_name: str = os.environ.get("GMAIL_PUBSUB_TOPIC_NAME", "").strip()
+    gmail_watch_label_ids: str = os.environ.get("GMAIL_WATCH_LABEL_IDS", "INBOX").strip()
+    gmail_watch_label_filter_action: str = os.environ.get("GMAIL_WATCH_LABEL_FILTER_ACTION", "include").strip()
+    gmail_watch_renewal_days: int = int(os.environ.get("GMAIL_WATCH_RENEWAL_DAYS", "5"))
+    telegram_bot_username: str = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip()
+    dashboard_session_ttl_seconds: int = int(os.environ.get("DASHBOARD_SESSION_TTL_SECONDS", str(24 * 60 * 60)))
     logfire_enabled: bool = os.environ.get("LOGFIRE_ENABLED", "false").lower() == "true"
     full_logfire_logging: bool = os.environ.get("LOGFIRE_FULL_CONTENT", "false").lower() == "true"
     hands_worker_mode: str = os.environ.get("HANDS_WORKER_MODE", "shared_host")
