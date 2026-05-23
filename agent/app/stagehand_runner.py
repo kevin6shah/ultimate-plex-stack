@@ -417,7 +417,7 @@ async def run_stagehand_task(
                                 "items": {"type": "string"},
                             },
                             "current_url": {"type": "string"},
-                            "blocker": {"type": "string"},
+                            "blocker": {"type": ["string", "null"]},
                         },
                         "required": ["summary"],
                     },
