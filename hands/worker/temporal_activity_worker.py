@@ -169,7 +169,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
         result = await run_agent(
             job.query,
             settings=settings,
-            store=local_store,
+            store=state,
+            spend_store=local_store,
             mode="heavy",
             context_summary=str(claim.get("context_summary") or ""),
             recent_turns=recent_turns,
@@ -178,6 +179,7 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             attachment_names=attachment_names,
             config=config,
             resume_checkpoint=resume_checkpoint,
+            current_job=job,
         )
         current_step = "uploading_outputs"
         current_step_started_at = time.monotonic()

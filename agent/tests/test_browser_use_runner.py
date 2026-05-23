@@ -6,7 +6,6 @@ from app.browser_use_runner import (
     _extract_browser_use_partial_findings,
     _filesystem_mcp_args,
     _firecrawl_mcp_env,
-    _gmail_mcp_env,
     _google_maps_mcp_env,
     _maps_openapi_mcp_env,
     _opentable_mcp_env,
@@ -39,27 +38,6 @@ def test_google_maps_mcp_env_uses_secret_and_enabled_tools() -> None:
     assert _google_maps_mcp_env(settings) == {
         "GOOGLE_MAPS_API_KEY": "gm-key",
         "GOOGLE_MAPS_ENABLED_TOOLS": "maps_search_places,maps_plan_route",
-    }
-
-
-def test_gmail_mcp_env_requires_email_and_app_password() -> None:
-    settings = replace(
-        Settings(),
-        gmail_account_email_param="/gmail/email",
-        gmail_app_password_param="/gmail/app-password",
-    )
-    secret_values = {
-        "/gmail/email": "friday.nyc.agent@gmail.com",
-        "/gmail/app-password": "abcd efgh ijkl mnop",
-    }
-    object.__setattr__(settings, "secret", lambda parameter_name: secret_values.get(parameter_name, ""))
-    assert _gmail_mcp_env(settings) == {
-        "EMAIL_ADDRESS": "friday.nyc.agent@gmail.com",
-        "EMAIL_PASSWORD": "abcd efgh ijkl mnop",
-        "IMAP_HOST": "imap.gmail.com",
-        "IMAP_PORT": "993",
-        "SMTP_HOST": "smtp.gmail.com",
-        "SMTP_PORT": "587",
     }
 
 

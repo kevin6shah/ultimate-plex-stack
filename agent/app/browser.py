@@ -4,6 +4,7 @@ import logging
 import re
 import asyncio
 import random
+import json
 from html import unescape
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional, TypeVar
@@ -12,7 +13,14 @@ from urllib.parse import quote_plus, unquote, urlparse
 import httpx
 
 from .booking_guard import enforce_zero_dollar_booking
-from .browser_fingerprint import STEALTH_INIT_SCRIPT, browser_fingerprint_seed, build_browser_fingerprint, common_chromium_args
+from .browser_fingerprint import (
+    STEALTH_INIT_SCRIPT,
+    BrowserFingerprint,
+    browser_fingerprint_seed,
+    build_browser_fingerprint,
+    common_chromium_args,
+    serialize_browser_session_state,
+)
 from .settings import Settings
 
 
@@ -296,21 +304,13 @@ class BrowserSession:
         self._settings = settings
         self._stealth = None
         self._user_agent = _choose_user_agent(settings)
+        self._fingerprint: BrowserFingerprint | None = None
 
-    async def start(self, start_url: str = "") -> str:
-        if self._page is not None:
-            if start_url:
-                await self.goto(start_url)
-            return await self.describe()
-        from playwright.async_api import async_playwright
+    async def _create_context(self, *, fingerprint: BrowserFingerprint) -> None:
         from playwright_stealth import Stealth
 
-        self._playwright = await async_playwright().start()
         self._stealth = Stealth(init_scripts_only=True) if (self._settings is None or self._settings.browser_stealth_enabled) else None
-        fingerprint = build_browser_fingerprint(
-            seed=browser_fingerprint_seed(start_url or "friday-browser"),
-            user_agent=self._user_agent,
-        )
+        self._fingerprint = fingerprint
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=common_chromium_args(),
@@ -327,6 +327,20 @@ class BrowserSession:
         await self._context.add_init_script(f"window.__fridayFingerprintSeed = {fingerprint.seed!r};")
         await self._context.add_init_script(STEALTH_INIT_SCRIPT)
         self._page = await self._context.new_page()
+
+    async def start(self, start_url: str = "") -> str:
+        if self._page is not None:
+            if start_url:
+                await self.goto(start_url)
+            return await self.describe()
+        from playwright.async_api import async_playwright
+
+        self._playwright = await async_playwright().start()
+        fingerprint = build_browser_fingerprint(
+            seed=browser_fingerprint_seed(start_url or "friday-browser"),
+            user_agent=self._user_agent,
+        )
+        await self._create_context(fingerprint=fingerprint)
         if start_url:
             await self.goto(start_url)
         return "Browser session started."
@@ -434,6 +448,67 @@ class BrowserSession:
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
+        self._fingerprint = None
+
+    async def export_session_state(self) -> dict:
+        await self.ensure_started()
+        assert self._context is not None
+        assert self._page is not None
+        fingerprint = self._fingerprint or build_browser_fingerprint(
+            seed=browser_fingerprint_seed(self._page.url or "friday-browser"),
+            user_agent=self._user_agent,
+        )
+        cookies = await self._context.cookies()
+        page_state = await self._page.evaluate(
+            """() => ({
+                origin: window.location.origin || '',
+                localStorage: Object.fromEntries(Object.entries(window.localStorage || {})),
+                sessionStorage: Object.fromEntries(Object.entries(window.sessionStorage || {})),
+            })"""
+        )
+        return serialize_browser_session_state(
+            cookies=cookies,
+            local_storage=page_state.get("localStorage") or {},
+            session_storage=page_state.get("sessionStorage") or {},
+            fingerprint=fingerprint,
+        ) | {"origin": page_state.get("origin", "")}
+
+    async def restore_session_state(self, payload: dict, *, start_url: str = "") -> str:
+        await self.close()
+        from playwright.async_api import async_playwright
+
+        fingerprint_payload = payload.get("fingerprint") or {}
+        fingerprint = BrowserFingerprint(
+            seed=str(fingerprint_payload.get("seed") or browser_fingerprint_seed(start_url or "friday-browser")),
+            user_agent=str(fingerprint_payload.get("user_agent") or self._user_agent),
+            viewport_width=int((fingerprint_payload.get("viewport") or {}).get("width") or 1440),
+            viewport_height=int((fingerprint_payload.get("viewport") or {}).get("height") or 900),
+            locale=str(fingerprint_payload.get("locale") or "en-US"),
+            timezone_id=str(fingerprint_payload.get("timezone_id") or "America/New_York"),
+        )
+        self._playwright = await async_playwright().start()
+        await self._create_context(fingerprint=fingerprint)
+        assert self._context is not None
+        assert self._page is not None
+        cookies = payload.get("cookies") or []
+        if cookies:
+            await self._context.add_cookies(cookies)
+        target_url = start_url.strip() or str(payload.get("origin") or "")
+        if target_url:
+            await self.goto(target_url)
+            local_storage = json.dumps(payload.get("local_storage") or {})
+            session_storage = json.dumps(payload.get("session_storage") or {})
+            await self._page.evaluate(
+                """([localStorageJson, sessionStorageJson]) => {
+                    const localValues = JSON.parse(localStorageJson || '{}');
+                    const sessionValues = JSON.parse(sessionStorageJson || '{}');
+                    for (const [key, value] of Object.entries(localValues)) window.localStorage.setItem(key, String(value));
+                    for (const [key, value] of Object.entries(sessionValues)) window.sessionStorage.setItem(key, String(value));
+                }""",
+                [local_storage, session_storage],
+            )
+            await self._page.reload(wait_until="domcontentloaded")
+        return "Browser session restored."
 
 
 async def _visit_url(page, url: str) -> tuple[str, str, str]:

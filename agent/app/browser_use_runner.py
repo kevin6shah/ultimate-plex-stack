@@ -160,21 +160,6 @@ def _google_maps_mcp_env(settings: Settings) -> dict[str, str]:
     return env
 
 
-def _gmail_mcp_env(settings: Settings) -> dict[str, str]:
-    email_address = _optional_secret(settings, settings.gmail_account_email_param, label="gmail_account_email")
-    app_password = _optional_secret(settings, settings.gmail_app_password_param, label="gmail_app_password")
-    if not (email_address and app_password):
-        return {}
-    return {
-        "EMAIL_ADDRESS": email_address,
-        "EMAIL_PASSWORD": app_password,
-        "IMAP_HOST": "imap.gmail.com",
-        "IMAP_PORT": "993",
-        "SMTP_HOST": "smtp.gmail.com",
-        "SMTP_PORT": "587",
-    }
-
-
 def _maps_openapi_mcp_env(settings: Settings) -> dict[str, str]:
     base_url = settings.maps_openapi_base_url.strip()
     spec_url = settings.maps_openapi_spec_url.strip()
@@ -346,9 +331,8 @@ async def run_browser_use_task(
         " Use Google Maps MCP tools for itinerary, place, route, and area-exploration tasks when available."
         " Use maps OpenAPI MCP tools for stable Google Maps/Places/Routes API calls when available."
         " Use reservation MCP tools only when they are explicitly enabled and healthy, and still ask for approval before a booking-commit step."
-        " Use Gmail tools only for the dedicated Friday mailbox, OTP retrieval, inbox summaries, confirmations, and verification emails when available."
-        " Do not send email unless the operator explicitly asked for it or approved it."
-        " Do not delete email or rely on mailbox mutation as the default flow."
+        " Do not attempt mailbox polling or direct email inbox mutation in this browser session."
+        " For login verification, use the dedicated verification-wait flow so the Temporal workflow can resume from Gmail push events."
     )
     if not enable_optional_mcps:
         optional_mcp_guidance = " Do not attempt MCP travel, maps, reservation, or email actions inside this browser session."
@@ -460,26 +444,7 @@ async def run_browser_use_task(
             logger.warning("google maps MCP enabled but GOOGLE_MAPS_API_KEY was unavailable")
 
     if enable_optional_mcps and settings.gmail_mcp_enabled:
-        gmail_env = _gmail_mcp_env(settings)
-        if gmail_env:
-            gmail_mcp = await _register_optional_mcp(
-                MCPClient=MCPClient,
-                tools=tools,
-                server_name="gmail",
-                command="node",
-                args=["/opt/friday/mcp/gmail-mcp/dist/index.js"],
-                env=gmail_env,
-                prefix="gmail_",
-                tool_filter=[
-                    "listMessages",
-                    "findMessage",
-                ],
-                timeout_seconds=settings.mcp_registration_timeout_seconds,
-            )
-            if gmail_mcp is not None:
-                mcp_clients.append(gmail_mcp)
-        else:
-            logger.warning("gmail MCP enabled but Gmail account email or app password was unavailable")
+        logger.info("gmail MCP is deprecated for the active mailbox runtime; using Gmail OAuth push events instead")
 
     if enable_optional_mcps and settings.maps_openapi_mcp_enabled:
         maps_openapi_env = _maps_openapi_mcp_env(settings)

@@ -4,7 +4,7 @@ import json
 import os
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -13,9 +13,20 @@ from pydantic_ai import Agent, RunContext
 
 from .browser import BrowserSession, run_browser_task
 from .browser_use_runner import run_browser_use_task
+from .booking_guard import enforce_zero_dollar_booking
 from .budget import estimate_deepseek_cost, usage_from_pydantic_ai
-from .jobs import AgentConfig, AgentResult, ThreadTurn, ThreadTurnRole
-from .jobs import CheckpointPayload
+from .jobs import (
+    AgentConfig,
+    AgentJob,
+    AgentResult,
+    BookingRecord,
+    BrowserSessionRecord,
+    CheckpointPayload,
+    IdentityRecord,
+    MailboxVerificationWaitRecord,
+    ThreadTurn,
+    ThreadTurnRole,
+)
 from .prompts import STATIC_SYSTEM_PROMPT
 from .research import fetch_page_content, sanitize_tool_output, search_web
 from .restaurant_cli import (
@@ -30,6 +41,7 @@ from .skiplagged import call_skiplagged_tool
 from .stagehand_runner import run_stagehand_task
 from .settings import Settings
 from .storage import StateStore
+from .temporal_runtime import heavy_workflow_id
 from .workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -57,8 +69,41 @@ class PauseForInputRequested(RuntimeError):
 @dataclass
 class AgentDependencies:
     settings: Settings
+    store: StateStore
     workspace: Optional[Workspace] = None
     browser: Optional[BrowserSession] = None
+    current_job: Optional[AgentJob] = None
+
+
+def _resolved_secret(settings: Settings, parameter_name: str) -> str:
+    if not parameter_name:
+        return ""
+    value = settings.secret(parameter_name).strip()
+    if not value:
+        return ""
+    if not parameter_name.startswith("/") and value == parameter_name and parameter_name.isupper():
+        return ""
+    return value
+
+
+def _ensure_default_mailbox_identity(settings: Settings, store: StateStore) -> Optional[IdentityRecord]:
+    mailbox_email = _resolved_secret(settings, settings.gmail_account_email_param)
+    if not mailbox_email:
+        return None
+    for record in store.list_identities(limit=100):
+        if record.email.strip().lower() == mailbox_email.lower():
+            return record
+    identity = IdentityRecord(
+        label="Friday Gmail",
+        email=mailbox_email,
+        provider="gmail",
+        category="shared_mailbox",
+        site_scope="shared",
+        is_default=True,
+        notes="Default Friday-controlled mailbox identity for verification and low-risk account flows.",
+    )
+    store.put_identity(identity)
+    return identity
 
 
 def _should_expose_browser_tools(query: str, routing_profile_name: str) -> bool:
@@ -362,6 +407,7 @@ async def run_agent(
     *,
     settings: Settings,
     store: StateStore,
+    spend_store: Optional[object] = None,
     mode: str = "light",
     context_summary: str = "",
     recent_turns: Optional[list[ThreadTurn]] = None,
@@ -370,8 +416,10 @@ async def run_agent(
     attachment_names: Optional[list[str]] = None,
     config: Optional[AgentConfig] = None,
     resume_checkpoint: Optional[CheckpointPayload] = None,
+    current_job: Optional[AgentJob] = None,
 ) -> AgentResult:
-    if not store.budget_available():
+    spend_target = spend_store or store
+    if not spend_target.budget_available():
         logger.warning("agent budget blocked request")
         return AgentResult(text="Daily Budget Reached", budget_blocked=True)
 
@@ -405,10 +453,15 @@ async def run_agent(
         resume_checkpoint=resume_checkpoint,
     )
 
+    if mode == "heavy":
+        _ensure_default_mailbox_identity(settings, store)
+
     deps = AgentDependencies(
         settings=settings,
+        store=store,
         workspace=workspace,
         browser=BrowserSession(workspace=workspace, settings=settings) if mode == "heavy" else None,
+        current_job=current_job,
     )
     system_prompt = STATIC_SYSTEM_PROMPT
     if effective_config.agent_name.strip() and effective_config.agent_name.strip() != "Friday":
@@ -1013,6 +1066,67 @@ async def run_agent(
                 resume_instructions=resume_instructions,
             )
 
+        @agent.tool
+        async def list_saved_identities(ctx: RunContext[AgentDependencies], limit: int = 20) -> str:
+            """List saved identities the operator already configured for reusable account or mailbox flows."""
+            records = ctx.deps.store.list_identities(limit=max(1, min(limit, 100)))
+            if not records:
+                return "No saved identities are configured yet."
+            lines = []
+            for record in records:
+                default_marker = " default" if record.is_default else ""
+                scope = record.site_scope or "shared"
+                lines.append(f"- {record.identity_id[:8]} | {record.label} | {record.email} | {record.provider} | {scope}{default_marker}")
+            return "\n".join(lines)
+
+        @agent.tool
+        async def wait_for_email_verification(
+            ctx: RunContext[AgentDependencies],
+            site_key: str,
+            sender_patterns: str = "",
+            subject_patterns: str = "",
+            otp_regex: str = "",
+            identity_id: str = "",
+            expires_in_minutes: int = 15,
+            summary: str = "waiting for verification email",
+        ) -> str:
+            """Pause the task while waiting for a verification email; Friday will resume automatically when the OTP arrives through Gmail push."""
+            if ctx.deps.current_job is None:
+                raise RuntimeError("mailbox verification wait requires a heavy job context")
+            mailbox_email = _resolved_secret(ctx.deps.settings, ctx.deps.settings.gmail_account_email_param)
+            workflow_id = heavy_workflow_id(ctx.deps.settings, ctx.deps.current_job.job_id)
+
+            def _split_patterns(value: str) -> list[str]:
+                return [part.strip() for part in value.replace("\n", ",").split(",") if part.strip()]
+
+            wait_record = MailboxVerificationWaitRecord(
+                workflow_id=workflow_id,
+                job_id=ctx.deps.current_job.job_id,
+                site_key=site_key.strip() or "generic-login",
+                identity_id=identity_id.strip(),
+                expected_sender_patterns=_split_patterns(sender_patterns),
+                expected_subject_patterns=_split_patterns(subject_patterns),
+                otp_regex=_split_patterns(otp_regex),
+                created_after=datetime.now(timezone.utc).isoformat(),
+                expires_at=(datetime.now(timezone.utc) + timedelta(minutes=max(1, expires_in_minutes))).isoformat(),
+            )
+            ctx.deps.store.put_mailbox_wait(wait_record)
+            raise PauseForInputRequested(
+                question="I am waiting for the verification email and will resume automatically when it arrives.",
+                details=(
+                    f"Mailbox: {mailbox_email or 'Friday mailbox not configured'}\n"
+                    f"Site: {wait_record.site_key}\n"
+                    f"Workflow: {workflow_id}\n"
+                    "If the email never arrives, you can still reply manually with 'answer: verification code: <code>'."
+                ),
+                summary=summary,
+                current_step="verification_waiting_email",
+                resume_instructions=(
+                    "When this task resumes, treat the new input as the verification code or verification email content "
+                    "and continue the login or booking flow without asking the same question again."
+                ),
+            )
+
         if allow_browser_tools:
 
             @agent.tool
@@ -1116,6 +1230,116 @@ async def run_agent(
                 except Exception as exc:
                     return _browser_tool_warning("browser_close", exc)
 
+            @agent.tool
+            async def browser_save_session(
+                ctx: RunContext[AgentDependencies],
+                site_scope: str,
+                identity_id: str = "",
+                status: str = "active",
+            ) -> str:
+                """Persist the current browser session for future account-gated runs on the same site."""
+                assert ctx.deps.browser is not None
+                if ctx.deps.current_job is None:
+                    raise RuntimeError("saving a browser session requires a heavy job context")
+                normalized_site = site_scope.strip()
+                if not normalized_site:
+                    raise RuntimeError("site_scope is required to save a browser session")
+                payload = await ctx.deps.browser.export_session_state()
+                fingerprint = payload.get("fingerprint") or {}
+                viewport = fingerprint.get("viewport") or {}
+                record = BrowserSessionRecord(
+                    identity_id=identity_id.strip(),
+                    site_scope=normalized_site,
+                    session_s3_key=f"browser-sessions/{ctx.deps.current_job.job_id}/{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.json",
+                    user_agent=str(fingerprint.get("user_agent") or ""),
+                    viewport_width=int(viewport.get("width") or 0),
+                    viewport_height=int(viewport.get("height") or 0),
+                    fingerprint_seed=str(fingerprint.get("seed") or ""),
+                    locale=str(fingerprint.get("locale") or "en-US"),
+                    timezone_id=str(fingerprint.get("timezone_id") or "America/New_York"),
+                    status=status.strip() or "active",
+                )
+                ctx.deps.settings.s3.put_object(
+                    Bucket=ctx.deps.settings.artifacts_bucket,
+                    Key=record.session_s3_key,
+                    Body=json.dumps(payload).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                ctx.deps.store.put_browser_session(record)
+                return sanitize_tool_output(
+                    f"Saved browser session {record.session_id[:8]} for {normalized_site} with identity {identity_id.strip() or '(none)'}."
+                )
+
+            @agent.tool
+            async def browser_restore_session(
+                ctx: RunContext[AgentDependencies],
+                site_scope: str,
+                session_id: str = "",
+                start_url: str = "",
+            ) -> str:
+                """Restore a previously saved browser session for the same site before continuing an account or booking flow."""
+                assert ctx.deps.browser is not None
+                normalized_site = site_scope.strip()
+                if not normalized_site and not session_id.strip():
+                    raise RuntimeError("site_scope or session_id is required to restore a browser session")
+                candidates = ctx.deps.store.list_browser_sessions(limit=100)
+                chosen = None
+                requested_id = session_id.strip()
+                for record in candidates:
+                    if requested_id and record.session_id == requested_id:
+                        chosen = record
+                        break
+                    if not requested_id and record.site_scope == normalized_site and record.status == "active":
+                        chosen = record
+                        break
+                if chosen is None:
+                    return "No saved browser session matched that site scope yet."
+                response = ctx.deps.settings.s3.get_object(Bucket=ctx.deps.settings.artifacts_bucket, Key=chosen.session_s3_key)
+                payload = json.loads(response["Body"].read().decode("utf-8"))
+                await ctx.deps.browser.restore_session_state(payload, start_url=start_url)
+                return sanitize_tool_output(
+                    f"Restored browser session {chosen.session_id[:8]} for {chosen.site_scope}."
+                )
+
+            @agent.tool
+            async def browser_assert_zero_dollar_checkout(ctx: RunContext[AgentDependencies], selector: str = "body", limit: int = 8000) -> str:
+                """Inspect the current page text and stop if a payment form, deposit, or non-zero total is visible."""
+                assert ctx.deps.browser is not None
+                page_text = await ctx.deps.browser.read(selector=selector, limit=limit)
+                enforce_zero_dollar_booking(page_text)
+                return "No payment form or non-zero total was detected in the inspected page text."
+
+        @agent.tool
+        async def record_zero_dollar_booking(
+            ctx: RunContext[AgentDependencies],
+            site_key: str,
+            venue_name: str,
+            booking_time: str = "",
+            external_reference: str = "",
+            identity_id: str = "",
+            session_id: str = "",
+            can_cancel: bool = False,
+        ) -> str:
+            """Persist a confirmed $0 booking so it can be reused for later status or cancellation flows."""
+            if ctx.deps.current_job is None:
+                raise RuntimeError("recording a booking requires a heavy job context")
+            record = BookingRecord(
+                job_id=ctx.deps.current_job.job_id,
+                site_key=site_key.strip() or "generic-booking",
+                identity_id=identity_id.strip(),
+                session_id=session_id.strip(),
+                external_reference=external_reference.strip(),
+                venue_name=venue_name.strip(),
+                booking_time=booking_time.strip(),
+                booking_total_cents=0,
+                can_cancel=can_cancel,
+                status="created",
+            )
+            ctx.deps.store.put_booking_record(record)
+            return sanitize_tool_output(
+                f"Recorded $0 booking {record.booking_id[:8]} for {record.venue_name or record.site_key}."
+            )
+
         if workspace is not None:
 
             @agent.tool
@@ -1203,7 +1427,7 @@ async def run_agent(
         input_cache_hit_per_1m=settings.deepseek_input_cache_hit_per_1m,
         output_per_1m=settings.deepseek_output_per_1m,
     )
-    store.add_spend(cost)
+    spend_target.add_spend(cost)
     logger.info(
         "agent completed request mode=%s input_tokens=%s output_tokens=%s cache_hits=%s cost_usd=%s",
         mode,
