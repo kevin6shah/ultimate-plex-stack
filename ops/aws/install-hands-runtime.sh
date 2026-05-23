@@ -189,8 +189,10 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now friday-temporal.service
-  systemctl enable --now friday-temporal-workflow-worker.service
+  systemctl enable friday-temporal.service
+  systemctl enable friday-temporal-workflow-worker.service
+  systemctl restart friday-temporal.service
+  systemctl restart friday-temporal-workflow-worker.service
   echo "Friday Temporal server and workflow worker installed."
   exit 0
 fi
@@ -219,6 +221,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now friday-hands-broker.service
+systemctl enable friday-hands-broker.service
+systemctl restart friday-hands-broker.service
 
 echo "Friday hands runtime installed."

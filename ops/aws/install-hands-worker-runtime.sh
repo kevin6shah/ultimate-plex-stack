@@ -203,11 +203,13 @@ RestartSec=10
 WantedBy=multi-user.target
 SERVICEEOF
   systemctl daemon-reload
-  systemctl enable --now friday-temporal-activity-worker.service
+  systemctl enable friday-temporal-activity-worker.service
+  systemctl restart friday-temporal-activity-worker.service
   echo "Friday dedicated Temporal activity worker installed."
   exit 0
 fi
 
-systemctl enable --now friday-hands-broker.service
+systemctl enable friday-hands-broker.service
+systemctl restart friday-hands-broker.service
 
 echo "Friday dedicated hands worker runtime installed."
