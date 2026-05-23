@@ -1,6 +1,13 @@
 import asyncio
+from typing import Optional
 
-from app.browser import _extract_page_text, _extract_search_result_links_from_html, _run_with_retries
+from app.browser import (
+    _extract_page_text,
+    _extract_search_result_links_from_html,
+    _guard_zero_dollar_before_action,
+    _run_with_retries,
+    _selector_or_text_suggests_terminal_action,
+)
 
 
 class FakeLocator:
@@ -9,6 +16,7 @@ class FakeLocator:
         self._raise_on_read = raise_on_read
         self._count = count
         self.first = self
+        self.attributes: dict[str, str] = {}
 
     async def count(self) -> int:
         return self._count
@@ -17,6 +25,9 @@ class FakeLocator:
         if self._raise_on_read:
             raise RuntimeError(f"timeout {timeout}")
         return self._text
+
+    async def get_attribute(self, name: str) -> Optional[str]:
+        return self.attributes.get(name)
 
 
 class FakePage:
@@ -29,6 +40,12 @@ class FakePage:
 
     async def evaluate(self, script: str) -> str:
         return self.js_text
+
+
+def test_selector_or_text_suggests_terminal_action_detects_booking_submit_controls() -> None:
+    assert _selector_or_text_suggests_terminal_action(selector="button.reserve-now", text="")
+    assert _selector_or_text_suggests_terminal_action(selector="button", text="Complete booking")
+    assert not _selector_or_text_suggests_terminal_action(selector="input.search", text="Search venues")
 
 
 def test_extract_page_text_falls_back_across_comma_selectors() -> None:
@@ -105,3 +122,19 @@ def test_extract_search_result_links_from_html_decodes_duckduckgo_redirects() ->
         "https://example.com/camera-review",
         "https://www.reddit.com/r/cameras/comments/abc123/",
     ]
+
+
+def test_guard_zero_dollar_before_action_blocks_non_zero_terminal_submit() -> None:
+    page = FakePage({"button.reserve-now": FakeLocator("Reserve table")}, js_text="Reservation summary total $25.00")
+
+    try:
+        asyncio.run(_guard_zero_dollar_before_action(page, selector="button.reserve-now", locator=page.locator("button.reserve-now")))
+    except RuntimeError as exc:
+        assert "NON_ZERO_CHECKOUT_BLOCKED" in str(exc)
+    else:
+        raise AssertionError("expected non-zero checkout block")
+
+
+def test_guard_zero_dollar_before_action_skips_non_terminal_controls() -> None:
+    page = FakePage({"input.search": FakeLocator("Search")}, js_text="Find restaurants near me")
+    asyncio.run(_guard_zero_dollar_before_action(page, selector="input.search", locator=page.locator("input.search")))

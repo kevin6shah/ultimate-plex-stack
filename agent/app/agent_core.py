@@ -185,6 +185,25 @@ def _is_structured_restaurant_task(query: str, routing_profile_name: str) -> boo
     return any(token in lowered for token in ("restaurant", "reservation", "reservations", "resy", "opentable", "table"))
 
 
+def _phase1_booking_runtime_guidance(query: str, routing_profile_name: str) -> str:
+    lowered = query.lower()
+    if routing_profile_name != "booking_commerce" and not any(
+        token in lowered for token in ("login", "sign in", "account", "book", "booking", "reservation", "cancel")
+    ):
+        return ""
+    return (
+        "Phase 1 booking/account rules:\n"
+        "- Friday may only autonomously complete $0 bookings in this flow. If a payment form, deposit, hold, fee, or non-zero total appears, stop immediately.\n"
+        "- Before or during login/account creation, call list_saved_identities to see if an existing identity already fits the site.\n"
+        "- If an email verification step appears, call wait_for_email_verification instead of polling the inbox manually. The workflow will resume automatically when Gmail push delivers the code.\n"
+        "- After a successful login or account creation, call browser_save_session so the site session can be reused later.\n"
+        "- If you return to a known site, prefer browser_restore_session before signing in again.\n"
+        "- Before any terminal booking submission, call browser_assert_zero_dollar_checkout unless the browser tool already blocked the action.\n"
+        "- Once a $0 booking is confirmed, call record_zero_dollar_booking with the site, venue, session, and any confirmation reference.\n"
+        "- If SMS OTP, CAPTCHA, device verification, or any non-zero checkout appears, pause instead of improvising."
+    )
+
+
 def _select_model(query: str, settings: Settings) -> str:
     lowered = query.lower()
     if any(token in lowered for token in ("think deeply", "reason", "plan carefully", "complex")):
@@ -477,6 +496,9 @@ async def run_agent(
             "Prefer concise, useful files over large raw dumps. "
             "If you need the user to answer something before continuing, call pause_for_input."
         )
+        booking_guidance = _phase1_booking_runtime_guidance(query, routing_profile.name)
+        if booking_guidance:
+            effective_query += "\n\n" + booking_guidance
 
         def _browser_tool_warning(action: str, exc: Exception) -> str:
             logger.warning("browser tool degraded action=%s error=%s", action, exc)

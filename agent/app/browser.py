@@ -58,6 +58,16 @@ RETRYABLE_BROWSER_ERROR_PATTERNS = (
     "target page, context or browser has been closed",
 )
 TRANSIENT_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+TERMINAL_ACTION_TOKENS = (
+    "book",
+    "reserve",
+    "confirm",
+    "checkout",
+    "submit",
+    "complete",
+    "place order",
+    "pay",
+)
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
@@ -71,6 +81,11 @@ def _choose_user_agent(settings: Settings | None) -> str:
 
 def _normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
+
+
+def _selector_or_text_suggests_terminal_action(*, selector: str, text: str) -> bool:
+    normalized = _normalize_whitespace(unescape(f"{selector} {text}")).lower()
+    return any(token in normalized for token in TERMINAL_ACTION_TOKENS)
 
 
 def _extract_urls(task: str) -> list[str]:
@@ -294,6 +309,24 @@ async def _extract_page_text(page, selector: str = "body") -> str:
     return ""
 
 
+async def _guard_zero_dollar_before_action(page, *, selector: str, locator) -> None:
+    snippets = [selector]
+    try:
+        snippets.append(await locator.inner_text(timeout=500))
+    except Exception:
+        pass
+    for attribute_name in ("aria-label", "value", "type", "name"):
+        try:
+            attribute_value = await locator.get_attribute(attribute_name)
+        except Exception:
+            attribute_value = None
+        if attribute_value:
+            snippets.append(str(attribute_value))
+    if not _selector_or_text_suggests_terminal_action(selector=selector, text=" ".join(snippets)):
+        return
+    enforce_zero_dollar_booking(await _extract_page_text(page, selector="body"))
+
+
 class BrowserSession:
     def __init__(self, workspace=None, *, settings: Settings | None = None) -> None:
         self._playwright = None
@@ -362,7 +395,9 @@ class BrowserSession:
     async def click(self, selector: str) -> str:
         await self.ensure_started()
         logger.info("browser click selector=%s", selector)
-        await self._page.locator(selector).first.click(timeout=10000)
+        locator = self._page.locator(selector).first
+        await _guard_zero_dollar_before_action(self._page, selector=selector, locator=locator)
+        await locator.click(timeout=10000)
         await self._page.wait_for_timeout(800)
         return await self.describe()
 
@@ -380,7 +415,10 @@ class BrowserSession:
     async def press(self, selector: str, key: str) -> str:
         await self.ensure_started()
         logger.info("browser press selector=%s key=%s", selector, key)
-        await self._page.locator(selector).first.press(key, timeout=10000)
+        locator = self._page.locator(selector).first
+        if key.strip().lower() in {"enter", "numpadenter", "space", " "}:
+            await _guard_zero_dollar_before_action(self._page, selector=selector, locator=locator)
+        await locator.press(key, timeout=10000)
         await self._page.wait_for_timeout(800)
         return await self.describe()
 
