@@ -11,7 +11,15 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import app.main as main_module
-from app.jobs import DashboardSessionRecord, MailboxVerificationWaitRecord
+from app.jobs import (
+    AutomationPolicyRecord,
+    BrowserSessionRecord,
+    DashboardSessionRecord,
+    IdentityRecord,
+    IdentitySecretPointer,
+    MailboxVerificationWaitRecord,
+    PaymentProfileRecord,
+)
 
 
 def _telegram_hash(payload: dict[str, str], bot_token: str) -> str:
@@ -21,6 +29,16 @@ def _telegram_hash(payload: dict[str, str], bot_token: str) -> str:
     )
     secret_key = hashlib.sha256(bot_token.encode("utf-8")).digest()
     return hmac.new(secret_key, data_check.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _dashboard_session_record() -> DashboardSessionRecord:
+    return DashboardSessionRecord(
+        telegram_user_id="123",
+        telegram_auth_date=str(int(datetime.now(timezone.utc).timestamp())),
+        first_name="Kevin",
+        username="kevinshah",
+        expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    )
 
 
 def test_dashboard_auth_telegram_sets_signed_cookie(monkeypatch) -> None:
@@ -165,3 +183,181 @@ def test_gmail_pubsub_ingress_signals_matching_wait(monkeypatch) -> None:
         assert saved_watch_states
     finally:
         object.__setattr__(main_module.settings, "secret", original_secret)
+
+
+def test_dashboard_identity_save_persists_identity_and_secret_pointer(monkeypatch) -> None:
+    saved: dict[str, object] = {}
+
+    class FakeStore:
+        def list_identities(self, limit: int = 200):
+            return []
+
+        def put_identity(self, record: IdentityRecord) -> IdentityRecord:
+            saved["identity"] = record
+            return record
+
+        def put_identity_secret_pointer(self, record: IdentitySecretPointer) -> IdentitySecretPointer:
+            saved["pointer"] = record
+            return record
+
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(
+        main_module,
+        "_require_dashboard_session",
+        lambda _request: _dashboard_session_record(),
+    )
+
+    client = TestClient(main_module.app)
+    response = client.post(
+        "/dashboard/identities/save",
+        data={
+            "label": "Friday Gmail",
+            "email": "friday.nyc.agent@gmail.com",
+            "provider": "gmail",
+            "category": "shared_mailbox",
+            "site_scope": "shared",
+            "status": "active",
+            "notes": "Primary verification mailbox",
+            "secret_parameter_name": "/friday/identity/gmail/password",
+            "secret_kind": "password",
+            "is_default": "on",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/dashboard/identities"
+    identity = saved["identity"]
+    pointer = saved["pointer"]
+    assert isinstance(identity, IdentityRecord)
+    assert identity.email == "friday.nyc.agent@gmail.com"
+    assert identity.is_default is True
+    assert isinstance(pointer, IdentitySecretPointer)
+    assert pointer.parameter_name == "/friday/identity/gmail/password"
+
+
+def test_dashboard_policy_save_persists_zero_dollar_policy(monkeypatch) -> None:
+    saved: list[AutomationPolicyRecord] = []
+
+    class FakeStore:
+        def list_automation_policies(self, limit: int = 200):
+            return []
+
+        def put_automation_policy(self, record: AutomationPolicyRecord) -> AutomationPolicyRecord:
+            saved.append(record)
+            return record
+
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(
+        main_module,
+        "_require_dashboard_session",
+        lambda _request: _dashboard_session_record(),
+    )
+
+    client = TestClient(main_module.app)
+    response = client.post(
+        "/dashboard/policies/save",
+        data={
+            "label": "Resy zero-dollar",
+            "site_scope": "resy.com",
+            "category": "restaurant",
+            "default_identity_id": "identity-123",
+            "allow_zero_dollar_booking": "on",
+            "allow_account_creation": "on",
+            "allow_login_reuse": "on",
+            "pause_on_sms_or_captcha": "on",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/dashboard/policies"
+    assert saved
+    assert saved[0].allow_zero_dollar_booking is True
+    assert saved[0].allow_account_creation is True
+    assert saved[0].default_identity_id == "identity-123"
+
+
+def test_dashboard_session_revoke_marks_session_revoked(monkeypatch) -> None:
+    session = BrowserSessionRecord(
+        session_id="session-123",
+        site_scope="resy.com",
+        session_s3_key="browser-sessions/job/session.json",
+        user_agent="ua",
+        viewport_width=1440,
+        viewport_height=900,
+        fingerprint_seed="seed",
+    )
+    updated: list[BrowserSessionRecord] = []
+    deleted: list[tuple[str, str]] = []
+
+    class FakeStore:
+        def list_browser_sessions(self, limit: int = 200):
+            return [session]
+
+        def put_browser_session(self, record: BrowserSessionRecord) -> BrowserSessionRecord:
+            updated.append(record)
+            return record
+
+    class FakeS3:
+        def delete_object(self, *, Bucket: str, Key: str) -> None:
+            deleted.append((Bucket, Key))
+
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(
+        main_module,
+        "_require_dashboard_session",
+        lambda _request: _dashboard_session_record(),
+    )
+    original_s3 = getattr(main_module.settings, "s3", None)
+    object.__setattr__(main_module.settings, "s3", FakeS3())
+    try:
+        client = TestClient(main_module.app)
+        response = client.post("/dashboard/sessions/session-123/revoke", follow_redirects=False)
+    finally:
+        object.__setattr__(main_module.settings, "s3", original_s3)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/dashboard/sessions"
+    assert deleted == [(main_module.settings.artifacts_bucket, "browser-sessions/job/session.json")]
+    assert updated
+    assert updated[0].status == "revoked"
+
+
+def test_dashboard_payment_save_persists_metadata_only(monkeypatch) -> None:
+    saved: list[PaymentProfileRecord] = []
+
+    class FakeStore:
+        def list_payment_profiles(self, limit: int = 200):
+            return []
+
+        def put_payment_profile(self, record: PaymentProfileRecord) -> PaymentProfileRecord:
+            saved.append(record)
+            return record
+
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(
+        main_module,
+        "_require_dashboard_session",
+        lambda _request: _dashboard_session_record(),
+    )
+
+    client = TestClient(main_module.app)
+    response = client.post(
+        "/dashboard/payments/save",
+        data={
+            "label": "Privacy $1 cap",
+            "provider": "manual",
+            "masked_last4": "4242",
+            "limit_cents": "100",
+            "notes": "Operator-managed temp card",
+            "active": "on",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/dashboard/payments"
+    assert saved
+    assert saved[0].masked_last4 == "4242"
+    assert saved[0].limit_cents == 100

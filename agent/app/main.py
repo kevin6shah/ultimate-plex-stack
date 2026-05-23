@@ -11,7 +11,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 from uuid import uuid4
 
 import boto3
@@ -30,15 +30,21 @@ from .artifacts import (
 from .jobs import (
     AgentConfig,
     AgentJob,
+    AutomationPolicyRecord,
     ArtifactUploadRequest,
     AttachmentRef,
+    BrowserSessionRecord,
     CheckpointPayload,
     ControlCommand,
     DashboardSessionRecord,
+    IdentityRecord,
+    IdentitySecretPointer,
     JobSource,
     JobStatus,
     MailboxWatchState,
+    PaymentProfileRecord,
     SaveConfigRequest,
+    SecretKind,
     TaskClass,
     ThreadTurnRole,
     WorkerCheckpointRequest,
@@ -289,6 +295,12 @@ def _dashboard_shell(*, title: str, active_view: str, body_html: str, session_na
       .pill {{ display: inline-block; padding: 3px 8px; border-radius: 999px; background: #eef4eb; color: var(--accent); font-size: 0.82rem; font-weight: 600; }}
       .warn {{ color: #9a3412; }}
       form.inline {{ display: inline; }}
+      form.stack, .stack {{ display: grid; gap: 10px; }}
+      .grid {{ display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }}
+      label {{ display: grid; gap: 6px; font-size: 0.92rem; color: var(--muted); }}
+      input, select, textarea {{ width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: white; color: var(--ink); }}
+      textarea {{ min-height: 88px; resize: vertical; }}
+      details summary {{ cursor: pointer; color: var(--accent); }}
       button {{ cursor: pointer; border: none; border-radius: 10px; padding: 10px 14px; background: var(--ink); color: white; }}
       button.secondary {{ background: var(--accent-2); color: #241b07; }}
       pre {{ white-space: pre-wrap; word-break: break-word; background: #faf6ee; border-radius: 12px; padding: 12px; border: 1px solid var(--line); }}
@@ -359,6 +371,61 @@ def _mailbox_watch_state(state: StateStore) -> MailboxWatchState:
     if not mailbox_email:
         return MailboxWatchState(mailbox_email="", watch_status="missing_mailbox_email")
     return state.get_mailbox_watch_state(mailbox_email) or MailboxWatchState(mailbox_email=mailbox_email)
+
+
+def _dashboard_form_str(form_data: Any, field: str, *, limit: int = 1000) -> str:
+    return str(form_data.get(field, "") or "").strip()[:limit]
+
+
+def _dashboard_form_bool(form_data: Any, field: str) -> bool:
+    return str(form_data.get(field, "") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _dashboard_form_int(form_data: Any, field: str) -> int:
+    raw = _dashboard_form_str(form_data, field, limit=50)
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _find_identity_record(state: StateStore, identity_id: str) -> Optional[IdentityRecord]:
+    for record in state.list_identities(limit=200):
+        if record.identity_id == identity_id:
+            return record
+    return None
+
+
+def _find_policy_record(state: StateStore, policy_id: str) -> Optional[AutomationPolicyRecord]:
+    for record in state.list_automation_policies(limit=200):
+        if record.policy_id == policy_id:
+            return record
+    return None
+
+
+def _find_payment_profile(state: StateStore, payment_profile_id: str) -> Optional[PaymentProfileRecord]:
+    for record in state.list_payment_profiles(limit=200):
+        if record.payment_profile_id == payment_profile_id:
+            return record
+    return None
+
+
+def _find_browser_session(state: StateStore, session_id: str) -> Optional[BrowserSessionRecord]:
+    for record in state.list_browser_sessions(limit=200):
+        if record.session_id == session_id:
+            return record
+    return None
+
+
+async def _dashboard_request_data(request: Request) -> dict[str, str]:
+    body = (await request.body()).decode("utf-8")
+    parsed = parse_qs(body, keep_blank_values=True)
+    return {
+        key: values[-1] if values else ""
+        for key, values in parsed.items()
+    }
 
 
 def _mailbox_wait_matches(wait, *, sender: str, subject: str, text: str, message_internal_date: datetime) -> Optional[str]:
@@ -1533,6 +1600,113 @@ async def dashboard_stop_job(job_id: str, request: Request):
     return RedirectResponse(url="/dashboard/jobs", status_code=302)
 
 
+@app.post("/dashboard/identities/save")
+async def dashboard_save_identity(request: Request):
+    _require_dashboard_session(request)
+    form = await _dashboard_request_data(request)
+    state = store()
+    identity_id = _dashboard_form_str(form, "identity_id")
+    existing = _find_identity_record(state, identity_id) if identity_id else None
+    record_kwargs = {
+        "identity_id": existing.identity_id if existing else identity_id,
+        "label": _dashboard_form_str(form, "label", limit=200) or (existing.label if existing else "Untitled identity"),
+        "email": _dashboard_form_str(form, "email", limit=320) or (existing.email if existing else ""),
+        "provider": _dashboard_form_str(form, "provider", limit=100) or (existing.provider if existing else "gmail"),
+        "category": _dashboard_form_str(form, "category", limit=100) or (existing.category if existing else "general"),
+        "site_scope": _dashboard_form_str(form, "site_scope", limit=200) or (existing.site_scope if existing else ""),
+        "is_default": _dashboard_form_bool(form, "is_default"),
+        "notes": _dashboard_form_str(form, "notes", limit=2000),
+        "status": _dashboard_form_str(form, "status", limit=100) or (existing.status if existing else "active"),
+    }
+    if existing:
+        record_kwargs["created_at"] = existing.created_at
+    record = IdentityRecord(**record_kwargs)
+    if record.is_default:
+        for other in state.list_identities(limit=200):
+            if other.identity_id != record.identity_id and other.is_default:
+                state.put_identity(other.model_copy(update={"is_default": False}))
+    saved = state.put_identity(record)
+    parameter_name = _dashboard_form_str(form, "secret_parameter_name", limit=500)
+    if parameter_name:
+        secret_kind_value = _dashboard_form_str(form, "secret_kind", limit=100) or SecretKind.PASSWORD.value
+        try:
+            secret_kind = SecretKind(secret_kind_value)
+        except ValueError:
+            secret_kind = SecretKind.PASSWORD
+        state.put_identity_secret_pointer(
+            IdentitySecretPointer(
+                identity_id=saved.identity_id,
+                parameter_name=parameter_name,
+                secret_kind=secret_kind,
+            )
+        )
+    return RedirectResponse(url="/dashboard/identities", status_code=302)
+
+
+@app.post("/dashboard/policies/save")
+async def dashboard_save_policy(request: Request):
+    _require_dashboard_session(request)
+    form = await _dashboard_request_data(request)
+    state = store()
+    policy_id = _dashboard_form_str(form, "policy_id")
+    existing = _find_policy_record(state, policy_id) if policy_id else None
+    record_kwargs = {
+        "policy_id": existing.policy_id if existing else policy_id,
+        "label": _dashboard_form_str(form, "label", limit=200) or (existing.label if existing else "Unnamed policy"),
+        "site_scope": _dashboard_form_str(form, "site_scope", limit=200) or (existing.site_scope if existing else ""),
+        "category": _dashboard_form_str(form, "category", limit=100) or (existing.category if existing else "general"),
+        "allow_account_creation": _dashboard_form_bool(form, "allow_account_creation"),
+        "allow_login_reuse": _dashboard_form_bool(form, "allow_login_reuse"),
+        "allow_zero_dollar_booking": _dashboard_form_bool(form, "allow_zero_dollar_booking"),
+        "pause_on_sms_or_captcha": _dashboard_form_bool(form, "pause_on_sms_or_captcha") or not any(
+            key in form for key in ("pause_on_sms_or_captcha",)
+        ),
+        "default_identity_id": _dashboard_form_str(form, "default_identity_id", limit=200),
+    }
+    if existing:
+        record_kwargs["created_at"] = existing.created_at
+    record = AutomationPolicyRecord(**record_kwargs)
+    state.put_automation_policy(record)
+    return RedirectResponse(url="/dashboard/policies", status_code=302)
+
+
+@app.post("/dashboard/payments/save")
+async def dashboard_save_payment_profile(request: Request):
+    _require_dashboard_session(request)
+    form = await _dashboard_request_data(request)
+    state = store()
+    payment_profile_id = _dashboard_form_str(form, "payment_profile_id")
+    existing = _find_payment_profile(state, payment_profile_id) if payment_profile_id else None
+    record_kwargs = {
+        "payment_profile_id": existing.payment_profile_id if existing else payment_profile_id,
+        "label": _dashboard_form_str(form, "label", limit=200) or (existing.label if existing else "Unnamed profile"),
+        "provider": _dashboard_form_str(form, "provider", limit=100) or (existing.provider if existing else "manual"),
+        "masked_last4": _dashboard_form_str(form, "masked_last4", limit=8) or (existing.masked_last4 if existing else ""),
+        "notes": _dashboard_form_str(form, "notes", limit=2000),
+        "limit_cents": max(0, _dashboard_form_int(form, "limit_cents")),
+        "active": _dashboard_form_bool(form, "active") or not any(key in form for key in ("active",)),
+    }
+    if existing:
+        record_kwargs["created_at"] = existing.created_at
+    record = PaymentProfileRecord(**record_kwargs)
+    state.put_payment_profile(record)
+    return RedirectResponse(url="/dashboard/payments", status_code=302)
+
+
+@app.post("/dashboard/sessions/{session_id}/revoke")
+async def dashboard_revoke_session(session_id: str, request: Request):
+    _require_dashboard_session(request)
+    state = store()
+    record = _find_browser_session(state, session_id)
+    if record is not None:
+        try:
+            settings.s3.delete_object(Bucket=settings.artifacts_bucket, Key=record.session_s3_key)
+        except Exception as exc:
+            logger.warning("failed to delete browser session artifact session_id=%s error=%s", session_id, exc)
+        state.put_browser_session(record.model_copy(update={"status": "revoked"}))
+    return RedirectResponse(url="/dashboard/sessions", status_code=302)
+
+
 @app.get("/dashboard/{view_name}")
 async def dashboard_view(view_name: str, request: Request):
     session = _require_dashboard_session(request)
@@ -1632,62 +1806,226 @@ async def dashboard_view(view_name: str, request: Request):
         )
         return HTMLResponse(_dashboard_shell(title="Friday Mailbox", active_view="mailbox", body_html=body, session_name=session_name))
     if view_name == "identities":
-        identities = [record.model_dump() for record in state.list_identities(limit=100)]
-        body = logout_html + "<section class='panel'><h2>Identities</h2>" + _html_table(
-            ["Label", "Email", "Provider", "Category", "Site scope", "Default", "Status"],
-            _dashboard_record_rows(
-                identities,
-                fields=["label", "email", "provider", "category", "site_scope", "is_default", "status"],
-            ),
-        ) + "</section>"
+        identity_records = state.list_identities(limit=100)
+        create_form = """
+        <form class="stack" action="/dashboard/identities/save" method="post">
+          <div class="grid">
+            <label>Label<input name="label" placeholder="Friday Gmail" /></label>
+            <label>Email<input name="email" type="email" placeholder="friday.nyc.agent@gmail.com" /></label>
+            <label>Provider<input name="provider" value="gmail" /></label>
+            <label>Category<input name="category" value="general" /></label>
+            <label>Site scope<input name="site_scope" placeholder="resy.com" /></label>
+            <label>Status<input name="status" value="active" /></label>
+            <label>Secret parameter name<input name="secret_parameter_name" placeholder="/friday/identity/resy/password" /></label>
+            <label>Secret kind
+              <select name="secret_kind">
+                <option value="password">password</option>
+                <option value="oauth_refresh_token">oauth_refresh_token</option>
+                <option value="cookie_jar">cookie_jar</option>
+              </select>
+            </label>
+          </div>
+          <label>Notes<textarea name="notes" placeholder="What this identity is for"></textarea></label>
+          <label><input type="checkbox" name="is_default" /> Default identity</label>
+          <div><button type="submit">Save identity</button></div>
+        </form>
+        """
+        rows = []
+        for record in identity_records:
+            pointer = state.get_identity_secret_pointer(record.identity_id)
+            pointer_text = (
+                f"{escape(pointer.parameter_name)}<br /><span class='muted'>{escape(pointer.secret_kind.value)}</span>"
+                if pointer
+                else "<span class='muted'>-</span>"
+            )
+            checked = " checked" if record.is_default else ""
+            edit_form = f"""
+            <details>
+              <summary>Edit</summary>
+              <form class="stack" action="/dashboard/identities/save" method="post">
+                <input type="hidden" name="identity_id" value="{escape(record.identity_id)}" />
+                <div class="grid">
+                  <label>Label<input name="label" value="{escape(record.label)}" /></label>
+                  <label>Email<input name="email" value="{escape(record.email)}" /></label>
+                  <label>Provider<input name="provider" value="{escape(record.provider)}" /></label>
+                  <label>Category<input name="category" value="{escape(record.category)}" /></label>
+                  <label>Site scope<input name="site_scope" value="{escape(record.site_scope)}" /></label>
+                  <label>Status<input name="status" value="{escape(record.status)}" /></label>
+                  <label>Secret parameter name<input name="secret_parameter_name" value="{escape(pointer.parameter_name if pointer else '')}" /></label>
+                  <label>Secret kind
+                    <select name="secret_kind">
+                      <option value="password"{' selected' if pointer and pointer.secret_kind == SecretKind.PASSWORD else ''}>password</option>
+                      <option value="oauth_refresh_token"{' selected' if pointer and pointer.secret_kind == SecretKind.OAUTH_REFRESH_TOKEN else ''}>oauth_refresh_token</option>
+                      <option value="cookie_jar"{' selected' if pointer and pointer.secret_kind == SecretKind.COOKIE_JAR else ''}>cookie_jar</option>
+                    </select>
+                  </label>
+                </div>
+                <label>Notes<textarea name="notes">{escape(record.notes)}</textarea></label>
+                <label><input type="checkbox" name="is_default"{checked} /> Default identity</label>
+                <div><button type="submit">Update</button></div>
+              </form>
+            </details>
+            """
+            rows.append(
+                [
+                    escape(record.label),
+                    escape(record.email),
+                    escape(record.provider),
+                    escape(record.category),
+                    escape(record.site_scope or "-"),
+                    "yes" if record.is_default else "no",
+                    escape(record.status),
+                    pointer_text,
+                    edit_form,
+                ]
+            )
+        body = (
+            logout_html
+            + "<section class='panel'><h2>Identities</h2><p class='muted'>Store site-scoped identities and SSM parameter pointers without exposing raw secret values.</p>"
+            + create_form
+            + _html_table(["Label", "Email", "Provider", "Category", "Site scope", "Default", "Status", "Secret pointer", "Action"], rows)
+            + "</section>"
+        )
         return HTMLResponse(_dashboard_shell(title="Friday Identities", active_view="identities", body_html=body, session_name=session_name))
     if view_name == "policies":
-        policies = [record.model_dump() for record in state.list_automation_policies(limit=100)]
-        body = logout_html + "<section class='panel'><h2>Policies</h2>" + _html_table(
-            ["Label", "Site scope", "Category", "$0 booking", "Account creation", "Login reuse", "Pause on SMS/CAPTCHA"],
-            _dashboard_record_rows(
-                policies,
-                fields=[
-                    "label",
-                    "site_scope",
-                    "category",
-                    "allow_zero_dollar_booking",
-                    "allow_account_creation",
-                    "allow_login_reuse",
-                    "pause_on_sms_or_captcha",
-                ],
-            ),
-        ) + "</section>"
+        policy_records = state.list_automation_policies(limit=100)
+        create_form = """
+        <form class="stack" action="/dashboard/policies/save" method="post">
+          <div class="grid">
+            <label>Label<input name="label" placeholder="Resy zero-dollar policy" /></label>
+            <label>Site scope<input name="site_scope" placeholder="resy.com" /></label>
+            <label>Category<input name="category" value="restaurant" /></label>
+            <label>Default identity ID<input name="default_identity_id" placeholder="optional identity id" /></label>
+          </div>
+          <div class="grid">
+            <label><input type="checkbox" name="allow_zero_dollar_booking" /> Allow $0 booking</label>
+            <label><input type="checkbox" name="allow_account_creation" /> Allow account creation</label>
+            <label><input type="checkbox" name="allow_login_reuse" /> Allow login reuse</label>
+            <label><input type="checkbox" name="pause_on_sms_or_captcha" checked /> Pause on SMS/CAPTCHA</label>
+          </div>
+          <div><button type="submit">Save policy</button></div>
+        </form>
+        """
+        rows = []
+        for record in policy_records:
+            edit_form = f"""
+            <details>
+              <summary>Edit</summary>
+              <form class="stack" action="/dashboard/policies/save" method="post">
+                <input type="hidden" name="policy_id" value="{escape(record.policy_id)}" />
+                <div class="grid">
+                  <label>Label<input name="label" value="{escape(record.label)}" /></label>
+                  <label>Site scope<input name="site_scope" value="{escape(record.site_scope)}" /></label>
+                  <label>Category<input name="category" value="{escape(record.category)}" /></label>
+                  <label>Default identity ID<input name="default_identity_id" value="{escape(record.default_identity_id)}" /></label>
+                </div>
+                <div class="grid">
+                  <label><input type="checkbox" name="allow_zero_dollar_booking"{' checked' if record.allow_zero_dollar_booking else ''} /> Allow $0 booking</label>
+                  <label><input type="checkbox" name="allow_account_creation"{' checked' if record.allow_account_creation else ''} /> Allow account creation</label>
+                  <label><input type="checkbox" name="allow_login_reuse"{' checked' if record.allow_login_reuse else ''} /> Allow login reuse</label>
+                  <label><input type="checkbox" name="pause_on_sms_or_captcha"{' checked' if record.pause_on_sms_or_captcha else ''} /> Pause on SMS/CAPTCHA</label>
+                </div>
+                <div><button type="submit">Update</button></div>
+              </form>
+            </details>
+            """
+            rows.append(
+                [
+                    escape(record.label),
+                    escape(record.site_scope or "-"),
+                    escape(record.category),
+                    "yes" if record.allow_zero_dollar_booking else "no",
+                    "yes" if record.allow_account_creation else "no",
+                    "yes" if record.allow_login_reuse else "no",
+                    "yes" if record.pause_on_sms_or_captcha else "no",
+                    escape(record.default_identity_id or "-"),
+                    edit_form,
+                ]
+            )
+        body = (
+            logout_html
+            + "<section class='panel'><h2>Policies</h2><p class='muted'>These policies control which sites Friday may use for autonomous account creation and $0-only bookings.</p>"
+            + create_form
+            + _html_table(["Label", "Site scope", "Category", "$0 booking", "Account creation", "Login reuse", "Pause on SMS/CAPTCHA", "Default identity", "Action"], rows)
+            + "</section>"
+        )
         return HTMLResponse(_dashboard_shell(title="Friday Policies", active_view="policies", body_html=body, session_name=session_name))
     if view_name == "sessions":
-        sessions = [record.model_dump() for record in state.list_browser_sessions(limit=100)]
+        sessions = state.list_browser_sessions(limit=100)
         body = logout_html + "<section class='panel'><h2>Saved browser sessions</h2>" + _html_table(
-            ["Session", "Site scope", "Identity", "User agent", "Viewport", "Status", "Updated"],
+            ["Session", "Site scope", "Identity", "User agent", "Viewport", "Status", "Updated", "Action"],
             [
                 [
-                    escape(record["session_id"][:8]),
-                    escape(record.get("site_scope", "")),
-                    escape(record.get("identity_id", "")),
-                    escape((record.get("user_agent", "") or "")[:50]),
-                    escape(f'{record.get("viewport_width", 0)}x{record.get("viewport_height", 0)}'),
-                    escape(record.get("status", "")),
-                    escape(record.get("updated_at", "")),
+                    escape(record.session_id[:8]),
+                    escape(record.site_scope),
+                    escape(record.identity_id or "-"),
+                    escape((record.user_agent or "")[:50]),
+                    escape(f"{record.viewport_width}x{record.viewport_height}"),
+                    escape(record.status),
+                    escape(record.updated_at),
+                    (
+                        f"<form class='inline' action='/dashboard/sessions/{escape(record.session_id)}/revoke' method='post'>"
+                        "<button type='submit' class='secondary'>Revoke</button></form>"
+                    )
+                    if record.status != "revoked"
+                    else "<span class='muted'>Revoked</span>"
                 ]
                 for record in sessions
             ],
         ) + "</section>"
         return HTMLResponse(_dashboard_shell(title="Friday Sessions", active_view="sessions", body_html=body, session_name=session_name))
     if view_name == "payments":
-        payments = [record.model_dump() for record in state.list_payment_profiles(limit=100)]
+        payment_records = state.list_payment_profiles(limit=100)
+        create_form = """
+        <form class="stack" action="/dashboard/payments/save" method="post">
+          <div class="grid">
+            <label>Label<input name="label" placeholder="Privacy $1 cap" /></label>
+            <label>Provider<input name="provider" value="manual" /></label>
+            <label>Masked last4<input name="masked_last4" placeholder="1234" /></label>
+            <label>Limit cents<input name="limit_cents" type="number" min="0" value="100" /></label>
+          </div>
+          <label>Notes<textarea name="notes" placeholder="Phase 1 metadata only; runtime remains $0-only."></textarea></label>
+          <label><input type="checkbox" name="active" checked /> Active</label>
+          <div><button type="submit">Save payment profile</button></div>
+        </form>
+        """
+        rows = []
+        for record in payment_records:
+            edit_form = f"""
+            <details>
+              <summary>Edit</summary>
+              <form class="stack" action="/dashboard/payments/save" method="post">
+                <input type="hidden" name="payment_profile_id" value="{escape(record.payment_profile_id)}" />
+                <div class="grid">
+                  <label>Label<input name="label" value="{escape(record.label)}" /></label>
+                  <label>Provider<input name="provider" value="{escape(record.provider)}" /></label>
+                  <label>Masked last4<input name="masked_last4" value="{escape(record.masked_last4)}" /></label>
+                  <label>Limit cents<input name="limit_cents" type="number" min="0" value="{record.limit_cents}" /></label>
+                </div>
+                <label>Notes<textarea name="notes">{escape(record.notes)}</textarea></label>
+                <label><input type="checkbox" name="active"{' checked' if record.active else ''} /> Active</label>
+                <div><button type="submit">Update</button></div>
+              </form>
+            </details>
+            """
+            rows.append(
+                [
+                    escape(record.label),
+                    escape(record.provider),
+                    escape(record.masked_last4 or "-"),
+                    escape(str(record.limit_cents)),
+                    "yes" if record.active else "no",
+                    escape(record.notes[:120] or "-"),
+                    edit_form,
+                ]
+            )
         body = (
             logout_html
             + "<section class='panel'><h2>Payment metadata</h2><p class='muted'>Phase 1 keeps this metadata visible but runtime booking remains blocked to $0 only.</p>"
+            + create_form
             + _html_table(
-                ["Label", "Provider", "Last4", "Limit cents", "Active", "Notes"],
-                _dashboard_record_rows(
-                    payments,
-                    fields=["label", "provider", "masked_last4", "limit_cents", "active", "notes"],
-                ),
+                ["Label", "Provider", "Last4", "Limit cents", "Active", "Notes", "Action"],
+                rows,
             )
             + "</section>"
         )
