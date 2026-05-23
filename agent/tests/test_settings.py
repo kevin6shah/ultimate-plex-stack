@@ -29,6 +29,25 @@ def test_secret_prefers_parameter_name_when_explicit_param_is_set(monkeypatch):
     assert settings.firecrawl_api_key_param == "/friday/agent/firecrawl-api-key"
 
 
+def test_google_oauth_settings_fall_back_to_legacy_gmail_aliases(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CLIENT_ID_PARAM", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET_PARAM", raising=False)
+    monkeypatch.delenv("GOOGLE_REFRESH_TOKEN_PARAM", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("GOOGLE_REFRESH_TOKEN", raising=False)
+    monkeypatch.setenv("GMAIL_CLIENT_ID_PARAM", "/friday/agent/gmail-client-id")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET_PARAM", "/friday/agent/gmail-client-secret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN_PARAM", "/friday/agent/gmail-refresh-token")
+
+    reloaded = importlib.reload(settings_module)
+    settings = reloaded.Settings()
+
+    assert settings.google_client_id_param == "/friday/agent/gmail-client-id"
+    assert settings.google_client_secret_param == "/friday/agent/gmail-client-secret"
+    assert settings.google_refresh_token_param == "/friday/agent/gmail-refresh-token"
+
+
 def test_secret_falls_back_to_direct_value_when_param_env_is_blank(monkeypatch):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "firecrawl-direct-secret")
     monkeypatch.setenv("FIRECRAWL_API_KEY_PARAM", "")

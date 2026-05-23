@@ -17,6 +17,18 @@ def _secret_setting(param_env: str, value_env: str) -> str:
     return os.environ.get(value_env, "")
 
 
+def _secret_setting_with_legacy(
+    param_env: str,
+    value_env: str,
+    legacy_param_env: str,
+    legacy_value_env: str,
+) -> str:
+    primary = _secret_setting(param_env, value_env)
+    if primary:
+        return primary
+    return _secret_setting(legacy_param_env, legacy_value_env)
+
+
 @dataclass(frozen=True)
 class Settings:
     state_table: str = os.environ.get("STATE_TABLE", "")
@@ -61,9 +73,24 @@ class Settings:
     opentable_password_param: str = _secret_setting("OPENTABLE_PASSWORD_PARAM", "OPENTABLE_PASSWORD")
     gmail_account_email_param: str = _secret_setting("GMAIL_ACCOUNT_EMAIL_PARAM", "GMAIL_ACCOUNT_EMAIL")
     gmail_app_password_param: str = _secret_setting("GMAIL_APP_PASSWORD_PARAM", "GMAIL_APP_PASSWORD")
-    google_client_id_param: str = _secret_setting("GOOGLE_CLIENT_ID_PARAM", "GOOGLE_CLIENT_ID")
-    google_client_secret_param: str = _secret_setting("GOOGLE_CLIENT_SECRET_PARAM", "GOOGLE_CLIENT_SECRET")
-    google_refresh_token_param: str = _secret_setting("GOOGLE_REFRESH_TOKEN_PARAM", "GOOGLE_REFRESH_TOKEN")
+    google_client_id_param: str = _secret_setting_with_legacy(
+        "GOOGLE_CLIENT_ID_PARAM",
+        "GOOGLE_CLIENT_ID",
+        "GMAIL_CLIENT_ID_PARAM",
+        "GMAIL_CLIENT_ID",
+    )
+    google_client_secret_param: str = _secret_setting_with_legacy(
+        "GOOGLE_CLIENT_SECRET_PARAM",
+        "GOOGLE_CLIENT_SECRET",
+        "GMAIL_CLIENT_SECRET_PARAM",
+        "GMAIL_CLIENT_SECRET",
+    )
+    google_refresh_token_param: str = _secret_setting_with_legacy(
+        "GOOGLE_REFRESH_TOKEN_PARAM",
+        "GOOGLE_REFRESH_TOKEN",
+        "GMAIL_REFRESH_TOKEN_PARAM",
+        "GMAIL_REFRESH_TOKEN",
+    )
     logfire_token_param: str = _secret_setting("LOGFIRE_TOKEN_PARAM", "LOGFIRE_TOKEN")
     worker_api_key_param: str = _secret_setting("WORKER_API_KEY_PARAM", "WORKER_API_KEY")
     gmail_pubsub_verification_token_param: str = _secret_setting("GMAIL_PUBSUB_VERIFICATION_TOKEN_PARAM", "GMAIL_PUBSUB_VERIFICATION_TOKEN")
