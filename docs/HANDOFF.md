@@ -69,7 +69,7 @@ This is the current highest-priority work and should stay the focus until valida
    - keep password entry in a secure dashboard/operator surface, not the model prompt path
    - require explicit approval before account creation submits
 9. Add login-wall pause/resume handling so account-gated sites stop at the correct decision point instead of failing or improvising.
-10. Replace the current OAuth-style Gmail MCP path with a headless IMAP/SMTP Gmail MCP using the dedicated Friday mailbox plus Gmail App Password authentication, then validate inbox/OTP reads live.
+10. Keep the dedicated Friday mailbox on the Gmail OAuth + Pub/Sub push path, then validate inbox/OTP resume live end to end without reintroducing IMAP/SMTP polling.
 11. Treat `Temporal + Stagehand + keep current Friday interfaces` as the current preferred v2 direction:
    - keep Telegram and Siri as the interfaces
    - keep Friday's current stop/pause/approval/status product semantics

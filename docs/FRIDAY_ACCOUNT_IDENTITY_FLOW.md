@@ -57,8 +57,8 @@ When a site requires an account:
 - Password material should live in SSM SecureString or another equivalent secure store.
 - The heavy worker should fetch the secret only at the moment it is needed inside the tool/runtime layer.
 - The dashboard or secure operator surface should support write-only or masked secret updates.
-- If a Gmail/email MCP is used for a dedicated Friday mailbox, the mailbox secret material must still live in SSM or equivalent secure storage, not in prompts or general env files.
-- Current preferred mailbox secret shape is a Gmail App Password for an IMAP/SMTP MCP, not an OAuth desktop-browser loop inside the worker.
+- The dedicated Friday mailbox secret material must still live in SSM or equivalent secure storage, not in prompts or general env files.
+- Current preferred mailbox shape is Gmail OAuth credentials plus Pub/Sub-driven event delivery, not an IMAP/App Password poller inside the worker.
 
 ### Mailbox Handling
 

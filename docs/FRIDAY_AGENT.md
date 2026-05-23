@@ -140,18 +140,21 @@ Optional MCP/connector SSM SecureString parameters now supported by the stack:
 /friday/agent/opentable-email
 /friday/agent/opentable-password
 /friday/agent/gmail-account-email
-/friday/agent/gmail-app-password
-/friday/agent/gmail-client-id
-/friday/agent/gmail-client-secret
-/friday/agent/gmail-refresh-token
+/friday/agent/google-client-id
+/friday/agent/google-client-secret
+/friday/agent/google-refresh-token
+/friday/agent/gmail-pubsub-verification-token
+/friday/agent/dashboard-session-secret
 ```
 
 Those are only needed when the corresponding MCP/connector is enabled in deployment settings.
 
 For the Friday mailbox specifically:
 
-- preferred current path: `/friday/agent/gmail-account-email` + `/friday/agent/gmail-app-password`
-- legacy path kept only for migration compatibility: `/friday/agent/gmail-client-id`, `/friday/agent/gmail-client-secret`, `/friday/agent/gmail-refresh-token`
+- active Phase 1 path: `/friday/agent/gmail-account-email` + Google OAuth secrets + Gmail Pub/Sub verification token
+- canonical OAuth secret names: `/friday/agent/google-client-id`, `/friday/agent/google-client-secret`, `/friday/agent/google-refresh-token`
+- compatibility aliases may still exist in local env or older SSM layouts, but the active mailbox runtime should mint short-lived Gmail access tokens from the Google OAuth refresh token
+- Gmail App Password and IMAP/SMTP mailbox polling are no longer the intended active runtime path
 
 ## Current Hands Stack
 
@@ -167,6 +170,8 @@ Friday's intended heavy-task execution stack now is:
 - a Friday-owned workspace helper MCP server for preview, markdown conversion, and PDF generation
 - `MarkItDown`-backed workspace document conversion
 - workspace file tools for PDF/text/table generation and shell/Python execution
+- Gmail API watch/history plus GCP Pub/Sub push for mailbox verification events
+- Telegram Login for the operator dashboard session surface
 
 Additional repo-wired MCP candidates now exist behind settings/secrets for evaluation:
 
@@ -175,14 +180,14 @@ Additional repo-wired MCP candidates now exist behind settings/secrets for evalu
 - Google Maps / Places / Routes via OpenAPI MCP
 - Resy MCP runtime hook
 - OpenTable MCP runtime hook
-- Gmail IMAP/SMTP MCP candidate for a dedicated Friday mailbox
+- legacy Gmail MCP toggles retained only for compatibility; they are not the active mailbox design
 
 Current live proof on the dedicated worker:
 
 - Firecrawl-backed research has completed real file/report tasks
 - cablate Google Maps has completed real map/planning tasks
 - direct Skiplagged travel tools have completed real flights, hotels, and rental-car tasks
-- Gmail remains intentionally disabled because the dedicated Friday mailbox was blocked by Google; email/OTP steps should currently fall back to pause/resume plus operator input
+- the mailbox verification substrate in repo is now Gmail OAuth + Pub/Sub push + Temporal signal, but it still needs live end-to-end validation before it should be treated as production-proven
 
 This is now meant to be a Temporal-orchestrated, Stagehand-first heavy-task substrate. The older claim-loop broker and Browser-use-first path remain in repo only as explicit legacy fallbacks and migration references.
 
@@ -217,7 +222,7 @@ The screenshot-suppression default is deployed live as part of the same rollout,
 The remaining acceptance gap is operator validation:
 - pause/resume has been live-tested by Codex, but the operator has not yet accepted it through normal use
 - login-wall and sign-in/sign-up gate pausing is still a backlog item, not a finished behavior
-- the old OAuth-style Gmail MCP path is no longer the intended direction; use a headless IMAP/App Password MCP path for the Friday mailbox instead
+- the old Gmail MCP/app-password path is no longer the intended direction; use the Gmail OAuth + Pub/Sub + Temporal signal path instead
 
 `/friday/agent/logfire-token` is only required when `LOGFIRE_ENABLED=true`.
 

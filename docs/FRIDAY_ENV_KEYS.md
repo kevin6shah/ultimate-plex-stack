@@ -1,6 +1,6 @@
 # Friday Environment Keys
 
-Last updated: `2026-05-22`
+Last updated: `2026-05-23`
 
 This file is the key-only inventory for the local Friday `.env` file and the SSM sync map.
 
@@ -66,10 +66,13 @@ Rules:
 
 Notes:
 
-- `GMAIL_ACCOUNT_PASSWORD` still exists in the local env inventory for compatibility with older flows.
-- `GMAIL_APP_PASSWORD` remains only for legacy Gmail MCP / app-password paths and is not part of the active mailbox event pipeline.
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REFRESH_TOKEN` are now the canonical active mailbox OAuth contract.
-- `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` remain documented only as compatibility aliases that still point at the same SSM paths.
+- The checked-in local `.env` currently still uses `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` as the Gmail OAuth alias names.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REFRESH_TOKEN` are the canonical active mailbox OAuth contract in the Phase 1 runtime and should be preferred in new env/SSM wiring.
+- `GMAIL_ACCOUNT_PASSWORD` and `GMAIL_APP_PASSWORD` still appear in the local env inventory for compatibility and migration continuity only.
+- `GMAIL_APP_PASSWORD` is not part of the active mailbox event-driven pipeline and should not be used as the primary mailbox runtime credential path.
+- `GMAIL_ACCOUNT_PASSWORD` is not part of the active mailbox event-driven pipeline either; keep it documented only until the local env and secret map are fully normalized.
+
+The separate repo-local `.friday-ops.env` inventory is documented in `docs/FRIDAY_OPS_ENV_KEYS.md` so this file can remain aligned with `./scripts/check-env-key-docs.sh`.
 
 ## Messaging
 

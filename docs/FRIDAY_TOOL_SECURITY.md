@@ -97,7 +97,7 @@ Current repo-wired candidate classes behind settings/secrets:
 - L4:
   - Resy MCP path with session-token secrets
   - OpenTable MCP path with credential secrets
-  - Gmail IMAP/SMTP MCP candidate for the dedicated Friday mailbox
+  - Gmail OAuth + Pub/Sub mailbox verification path for the dedicated Friday mailbox
 
 Current limitation:
 - these MCP tools currently run inside the already-isolated worker container, not yet in separate per-tool containers
@@ -179,7 +179,7 @@ For account creation / sign-up gates:
 4. keep password entry outside the model prompt path and inside a secure operator surface backed by SSM or equivalent
 
 For mailbox tools specifically:
-1. prefer a headless IMAP/SMTP MCP plus Gmail App Password over desktop-browser OAuth flows inside the worker
+1. prefer Gmail OAuth plus Gmail API watch/history and GCP Pub/Sub push over any always-on IMAP/SMTP poller inside the worker
 2. use the dedicated Friday mailbox only, not the operator's primary inbox
 3. keep outbound send-email capability disabled or approval-gated by default
 

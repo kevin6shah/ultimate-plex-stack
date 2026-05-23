@@ -64,7 +64,7 @@ Examples:
 | Resy integration path | connector / MCP-like remote integration | L4 | Disabled candidate | High-value restaurant availability and booking target in NYC | Current runtime candidate hung in this stack; replacement source still needed |
 | OpenTable extraction/booking path | connector / MCP | L4 | Disabled candidate | High-value restaurant availability and booking target in NYC | Current runtime candidate did not provide a clean MCP-backed success in this stack |
 | Unified restaurant reservation MCPs | MCP | L4 | Candidate | Could provide Resy/OpenTable fallback and comparison path | Need maintenance/security review and real output comparison |
-| Dedicated Friday mailbox via Gmail/email MCP | MCP | L4 | Repo-wired selected candidate | Agent-owned inbox for verification emails, confirmations, OTP fallback, and operator-visible account workflows | Needs Gmail App Password setup, IMAP enablement, deployment, and live mailbox validation |
+| Dedicated Friday mailbox via Gmail OAuth + Pub/Sub push | mailbox event substrate | L4 | Repo-wired selected candidate | Agent-owned inbox for verification emails, confirmations, OTP fallback, and operator-visible account workflows | Needs Gmail OAuth secret wiring, Pub/Sub push validation, and live workflow-resume validation |
 | Temp-mail / burner identity MCP | MCP | L4 | Candidate | Burner signup and verification support | Identity/password/dashboard flow is not ready yet |
 | Browser-use | browser substrate | separate browser tier | Active | Interaction fallback for unsupported flows | Must not remain the only path for maps/booking/files |
 
@@ -81,7 +81,7 @@ Examples:
 | Resy MCP / connector | Disabled for now | Do not keep the current broken runtime candidate active; only reintroduce when there is a real runnable source with validation |
 | TempMail MCP | Deferred, not rejected | Add only as part of the broader account-gated identity program |
 | Brave Search | Already active | Keep as the safest first-step search path |
-| Gmail / email MCPs | Selected target | Use a dedicated Friday mailbox and prefer a headless IMAP/SMTP MCP with Gmail App Password authentication over browser-loop OAuth servers in the worker |
+| Gmail / mailbox event path | Selected target | Use a dedicated Friday mailbox with Gmail OAuth, Gmail API watch/history, and GCP Pub/Sub push into AWS/Temporal |
 
 ## Selected Next Evaluation Set
 
@@ -102,7 +102,7 @@ Current repo state for this set:
 - cablate Google Maps MCP can now be mounted by worker settings.
 - Google Maps / Places / Routes via OpenAPI MCP can now be mounted by worker settings using a spec URL plus `BASE_URL` / `HEADERS`.
 - The older Resy/OpenTable runtime candidates remain in repo for reference but should stay disabled until replaced or rehabilitated.
-- Gmail MCP candidate support is being switched to a headless IMAP/SMTP Gmail MCP using `EMAIL_ADDRESS` plus a Gmail App Password.
+- Gmail mailbox support is being switched to a Gmail OAuth + watch/history + Pub/Sub push design, not an IMAP/App Password poller.
 
 ## Dedicated Friday Mailbox Direction
 
@@ -121,11 +121,14 @@ Preferred operating model:
 
 Current implementation direction:
 
-- The earlier OAuth-based Gmail MCP path is being retired for this stack because desktop-browser OAuth consent loops are a poor fit for a headless Docker worker.
-- The selected replacement direction is a Gmail IMAP/SMTP MCP using:
+- The selected direction is Gmail OAuth plus Gmail API watch/history and GCP Pub/Sub push into AWS/Temporal.
+- Canonical runtime secrets:
   - `GMAIL_ACCOUNT_EMAIL`
-  - `GMAIL_APP_PASSWORD`
-- For safety, Friday should only get read/search mailbox tools by default; sending email remains approval-gated future work.
+  - `GOOGLE_CLIENT_ID`
+  - `GOOGLE_CLIENT_SECRET`
+  - `GOOGLE_REFRESH_TOKEN`
+  - `GMAIL_PUBSUB_VERIFICATION_TOKEN`
+- For safety, Friday should keep mailbox automation read/verification-oriented by default; sending email remains approval-gated future work.
 
 ## Isolation Harness Plan
 

@@ -75,7 +75,7 @@ Future Codex/Friday sessions should read this early and keep it current.
   - Skiplagged MCP
   - cablate Google Maps MCP
   - Google Maps / Places / Routes via OpenAPI MCP
-  - dedicated Friday mailbox via Gmail/email MCP
+  - dedicated Friday mailbox via Gmail OAuth + Pub/Sub push
 - Add account identity / sign-up gating flow:
   - pause at sign-in/sign-up gates during booking/commerce tasks
   - ask whether to use a cached identity or a new email
@@ -83,10 +83,10 @@ Future Codex/Friday sessions should read this early and keep it current.
   - support a dedicated Friday-owned mailbox identity
   - create secure password-entry placeholders for dashboard-backed SSM storage
   - require explicit approval before account creation submits
-- Replace the OAuth-style Gmail MCP path with a headless IMAP/SMTP Gmail MCP using the dedicated Friday mailbox plus a Gmail App Password.
+- Keep the dedicated Friday mailbox on the Gmail OAuth + Pub/Sub push path and do not reintroduce always-on IMAP/SMTP polling.
 - If the dedicated Friday mailbox is blocked or unavailable, continue booking/account work with Gmail disabled and fall back to pause-for-input plus operator-provided email/verification steps.
 - Add login-wall pause/resume handling on top of the new `paused_for_input` substrate before attempting autonomous account creation.
-- Keep Gmail disabled until a safer mailbox strategy is ready; use operator-assisted pause/resume for email/OTP gates in the meantime.
+- Validate the Gmail OAuth + Pub/Sub path end to end before treating mailbox-driven login/booking automation as production-proven; until then, keep operator-assisted pause/resume as the fallback.
 - Improve Browser-use behavior on hostile domains without drifting back into the old selector-hardening detour.
 - Finish the current Stagehand migration and validate it live as the primary interactive browser fallback ahead of Browser-use.
 - Review common-use connectors only after security review and only where they materially beat deterministic search/fetch plus browser fallback.
@@ -107,7 +107,7 @@ Future Codex/Friday sessions should read this early and keep it current.
 - Reservations: do not assume any specific OpenTable/Resy MCP is production-worthy until it is reviewed and tested in this stack.
 - Web extraction: hosted Firecrawl-style services may help, but they are candidates, not committed architecture.
 - Temporary/burner identity services are not approved by default and must go through the same security review as any other connector.
-- Gmail/email MCPs are part of the selected evaluation set, but the exact server choice should be based on real implementation quality, not on unverified claims of "official" status.
+- Gmail/email integrations should stay aligned with the active Gmail OAuth + Pub/Sub mailbox architecture unless a materially better event-driven option appears.
 - Add multiple candidates where uncertainty is high; compare them instead of forcing a premature single winner.
 
 ## Recently Completed
