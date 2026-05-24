@@ -644,6 +644,25 @@ def _looks_like_natural_input_reply(query: str) -> bool:
     return len(normalized) <= 220
 
 
+def _job_result_looks_like_booking_clarification(job: AgentJob) -> bool:
+    if task_routing_profile(job.query).name != "booking_commerce":
+        return False
+    normalized = _plain_text_message(job.result_preview or "")
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    triggers = (
+        "which would you prefer",
+        "which do you prefer",
+        "which would you like",
+        "which seating preference",
+        "let me confirm with you first",
+    )
+    if not any(trigger in lowered for trigger in triggers):
+        return False
+    return bool(re.search(r"^\s*[-*•]", normalized, flags=re.MULTILINE)) or normalized.endswith("?")
+
+
 def _is_status_request(query: str) -> bool:
     normalized = query.strip().lower()
     if not normalized:
@@ -948,6 +967,25 @@ def _latest_paused_input_job_for_user(state: StateStore, *, source: JobSource, u
     )
 
 
+def _latest_completed_clarification_job_for_user(state: StateStore, *, source: JobSource, user_id: str) -> Optional[AgentJob]:
+    candidates = state.list_jobs_for_user(
+        source=source.value,
+        user_id=user_id,
+        statuses=(JobStatus.COMPLETED,),
+        limit=10,
+    )
+    now = datetime.now(timezone.utc)
+    for job in candidates:
+        if str((job.metadata or {}).get("execution_backend", "")).strip().lower() != "temporal":
+            continue
+        created_at = _parse_job_timestamp(job.created_at)
+        if created_at is None or now - created_at > timedelta(hours=1):
+            continue
+        if _job_result_looks_like_booking_clarification(job):
+            return job
+    return None
+
+
 def _checkpoint_input_prompt(checkpoint: Optional[CheckpointPayload]) -> tuple[str, str]:
     if checkpoint is None:
         return "", ""
@@ -1174,6 +1212,9 @@ def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
     if job.status == JobStatus.PAUSED_BUDGET:
         return f"Your latest task is paused because of budget limits.{step_line}{summary_line}".strip()
     if job.status == JobStatus.COMPLETED:
+        if _job_result_looks_like_booking_clarification(job):
+            prompt = (job.result_preview or "").strip()
+            return f"Your latest task is waiting for your choice.\nWhat I need: {prompt[:1200]}".strip()
         result = (job.result_preview or "").strip()
         result_line = f"\nResult: {result[:800]}" if result else ""
         files_line = f"\nFiles: {', '.join(job.output_files[:5])}" if job.output_files else ""
@@ -2250,7 +2291,13 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
         return {"status": "stop_requested"}
 
     paused_job = _latest_paused_input_job_for_user(state, source=JobSource.TELEGRAM, user_id=user_id)
-    paused_checkpoint = state.get_latest_checkpoint(paused_job.job_id) if paused_job is not None else None
+    clarification_job = None if paused_job is not None else _latest_completed_clarification_job_for_user(
+        state,
+        source=JobSource.TELEGRAM,
+        user_id=user_id,
+    )
+    resume_job = paused_job or clarification_job
+    paused_checkpoint = state.get_latest_checkpoint(resume_job.job_id) if resume_job is not None else None
     paused_job_uses_temporal = paused_job is not None and str((paused_job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
     if (
         paused_job is not None
@@ -2267,15 +2314,15 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
             state.update_job_status(paused_job.job_id, status=JobStatus.RUNNING, current_step="resuming task")
             await TelegramClient(settings).send_message(chat_id, "I resumed that and will notify you in Telegram.")
             return {"status": "resumed", "job_id": paused_job.job_id}
-    if paused_job is not None:
+    if resume_job is not None:
         if message.document is not None or (query and (_is_input_reply(query) or _looks_like_natural_input_reply(query))):
             effective_query = _build_paused_input_resume_query(
-                paused_job,
+                resume_job,
                 paused_checkpoint,
                 _strip_input_reply_prefix(query or ""),
                 has_attachment=message.document is not None,
             )
-            resume_from_job_id = paused_job.job_id
+            resume_from_job_id = resume_job.job_id
             task_class = TaskClass.HEAVY
             if query:
                 state.record_turn(
@@ -2485,7 +2532,13 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
     allowed_chat_id = settings.secret(settings.telegram_allowed_chat_id_param)
     conversation_id = "siri"
     paused_job = _latest_paused_input_job_for_user(state, source=JobSource.SIRI, user_id="siri")
-    paused_checkpoint = state.get_latest_checkpoint(paused_job.job_id) if paused_job is not None else None
+    clarification_job = None if paused_job is not None else _latest_completed_clarification_job_for_user(
+        state,
+        source=JobSource.SIRI,
+        user_id="siri",
+    )
+    resume_job = paused_job or clarification_job
+    paused_checkpoint = state.get_latest_checkpoint(resume_job.job_id) if resume_job is not None else None
     paused_job_uses_temporal = paused_job is not None and str((paused_job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
     if paused_job is not None and paused_job_uses_temporal and (_is_input_reply(query) or _looks_like_natural_input_reply(query)):
         from .temporal_client import signal_answer_heavy_job
@@ -2494,12 +2547,12 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
         if resumed:
             state.update_job_status(paused_job.job_id, status=JobStatus.RUNNING, current_step="resuming task")
             return SiriResponse(response="I resumed that and will notify you in Telegram.", queued=True, job_id=paused_job.job_id)
-    if paused_job is not None:
+    if resume_job is not None:
         if _is_input_reply(query) or _looks_like_natural_input_reply(query):
             task_class = TaskClass.HEAVY
-            resume_from_job_id = paused_job.job_id
+            resume_from_job_id = resume_job.job_id
             effective_query = _build_paused_input_resume_query(
-                paused_job,
+                resume_job,
                 paused_checkpoint,
                 _strip_input_reply_prefix(query),
             )

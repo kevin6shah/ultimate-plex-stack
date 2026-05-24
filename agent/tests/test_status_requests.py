@@ -13,6 +13,7 @@ from app.main import (
     _is_input_reply,
     _is_stop_all_request,
     _is_status_request,
+    _job_result_looks_like_booking_clarification,
     _job_indicates_user_stop,
     _job_accepts_live_worker_updates,
     _looks_like_natural_input_reply,
@@ -148,6 +149,28 @@ def test_format_status_message_for_paused_input_job() -> None:
     assert "Current step: waiting for your reply" in text
     assert "**" not in text
     assert "\n\nWhat I need:\n" in text
+
+
+def test_completed_booking_clarification_is_treated_like_waiting_for_input() -> None:
+    job = AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Okay book junoon for 1pm for 2 people",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.COMPLETED,
+        result_preview=(
+            "I have a saved identity. Let me proceed to book. I'll pick the 1:00 PM Main Dining Room slot. "
+            "Let me confirm with you first which seating preference you'd like:\n\n"
+            "- Main Dining Room at 1:00 PM\n"
+            "- Outdoor Seating at 1:00 PM\n\n"
+            "Which would you prefer?"
+        ),
+    )
+    state = SimpleNamespace(get_latest_checkpoint=lambda _job_id: None)
+    assert _job_result_looks_like_booking_clarification(job) is True
+    text = _format_status_message(state, job)
+    assert "waiting for your choice" in text
+    assert "Which would you prefer?" in text
+    assert "Your latest task completed." not in text
 
 
 def test_paused_input_reply_prefix_is_detected_and_removed() -> None:

@@ -324,8 +324,47 @@ def _phase1_booking_runtime_guidance(query: str, routing_profile_name: str) -> s
         "- If you return to a known site, prefer browser_restore_session before signing in again.\n"
         "- Before any terminal booking submission, call browser_assert_zero_dollar_checkout unless the browser tool already blocked the action.\n"
         "- Once a $0 booking is confirmed, call record_zero_dollar_booking with the site, venue, session, and any confirmation reference.\n"
+        "- If you need the user to choose between booking options such as seating sections, time slots, or date variants, call pause_for_input instead of returning the question as a final answer.\n"
         "- If SMS OTP, CAPTCHA, device verification, or any non-zero checkout appears, pause instead of improvising."
     )
+
+
+def _booking_choice_pause_payload(output_text: str, routing_profile_name: str) -> Optional[dict[str, str]]:
+    if routing_profile_name != "booking_commerce":
+        return None
+    normalized = str(output_text or "").strip()
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    triggers = (
+        "which would you prefer",
+        "which do you prefer",
+        "which would you like",
+        "which option would you like",
+        "which seating preference",
+        "let me confirm with you first",
+        "reply with your preferred",
+    )
+    if not any(trigger in lowered for trigger in triggers):
+        return None
+    option_lines = [line.strip() for line in normalized.splitlines() if re.match(r"^\s*[-*•]", line)]
+    question = ""
+    for line in reversed([line.strip() for line in normalized.splitlines() if line.strip()]):
+        if line.endswith("?"):
+            question = line
+            break
+    if not question:
+        question = "I need your choice between the available booking options before I can continue."
+    details_parts = option_lines[:8]
+    if not details_parts:
+        details_parts.append(normalized[:800])
+    return {
+        "question": question[:500],
+        "details": "\n".join(details_parts)[:1500],
+        "summary": "waiting for your choice between the available booking options",
+        "current_step": "waiting_for_user_input",
+        "resume_instructions": "Use the user's selected booking option to continue the same reservation flow without asking again for the same choice.",
+    }
 
 
 def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -> list[str]:
@@ -1664,4 +1703,9 @@ async def run_agent(
         cost,
     )
     output = getattr(result, "output", None)
-    return AgentResult(text=str(output or ""), cost_usd=str(cost.quantize(Decimal("0.000001"))))
+    output_text = str(output or "")
+    if mode == "heavy":
+        pause_payload = _booking_choice_pause_payload(output_text, routing_profile.name)
+        if pause_payload is not None:
+            raise PauseForInputRequested(**pause_payload)
+    return AgentResult(text=output_text, cost_usd=str(cost.quantize(Decimal("0.000001"))))

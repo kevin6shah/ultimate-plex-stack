@@ -4,6 +4,7 @@ import pytest
 
 from app.agent_core import (
     PauseForInputRequested,
+    _booking_choice_pause_payload,
     _ensure_default_mailbox_identity,
     _enforce_automation_policy,
     _find_automation_policy,
@@ -168,3 +169,20 @@ def test_restaurant_booking_missing_details_accepts_complete_prompt() -> None:
     )
 
     assert missing == []
+
+
+def test_booking_choice_pause_payload_detects_slot_selection_question() -> None:
+    payload = _booking_choice_pause_payload(
+        (
+            "I have a saved identity. Let me proceed to book. Let me confirm with you first which seating preference you'd like:\n\n"
+            "- Main Dining Room at 1:00 PM\n"
+            "- Outdoor Seating at 1:00 PM\n\n"
+            "Which would you prefer?"
+        ),
+        "booking_commerce",
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "waiting_for_user_input"
+    assert "Which would you prefer?" in payload["question"]
+    assert "Outdoor Seating" in payload["details"]
