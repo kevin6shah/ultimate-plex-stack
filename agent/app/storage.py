@@ -401,6 +401,20 @@ class StateStore:
         )
         return payload
 
+    def get_booking_record(self, booking_id: str) -> Optional[BookingRecord]:
+        item = self.table.get_item(Key={"PK": "BOOKING", "SK": f"BOOKING#{booking_id}"}).get("Item")
+        if not item:
+            return None
+        return BookingRecord.model_validate(item.get("record", {}))
+
+    def list_booking_records(self, limit: int = 50) -> list[BookingRecord]:
+        response = self.table.query(
+            KeyConditionExpression=Key("PK").eq("BOOKING") & Key("SK").begins_with("BOOKING#"),
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        return [BookingRecord.model_validate(item.get("record", {})) for item in response.get("Items", [])]
+
     def claim_pubsub_delivery(self, delivery_id: str) -> bool:
         expires_at = int((utc_now() + timedelta(days=7)).timestamp())
         try:

@@ -622,6 +622,8 @@ def _humanize_step(step: str) -> str:
         "stopped by user": "stopped by you",
         "approval received": "approval received",
         "waiting_worker": "waiting for the worker",
+        "card_entry_required": "waiting for your approval on a card-on-file step",
+        "payment_blocked": "blocked on a payment step",
     }
     if normalized in known:
         return known[normalized]

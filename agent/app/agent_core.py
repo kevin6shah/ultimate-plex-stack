@@ -215,6 +215,19 @@ def _raise_non_zero_checkout_pause(*, details: str) -> None:
     )
 
 
+def _raise_card_on_file_pause(*, details: str) -> None:
+    _raise_phase1_pause(
+        question="This looks like a $0 booking, but the site requires a card on file before it will confirm anything.",
+        details=details,
+        summary="waiting for approval before adding or using a card on file for a $0 booking",
+        current_step="card_entry_required",
+        resume_instructions=(
+            "Do not continue past the card-entry step until the operator explicitly approves the card-on-file action "
+            "or confirms that the payment method is already set up."
+        ),
+    )
+
+
 def _enforce_automation_policy(
     store: StateStore,
     *,
@@ -271,13 +284,24 @@ def _handle_phase1_blocking_error(exc: Exception, *, action: str) -> None:
     if "payment method on file" in lowered or (
         "payment method" in lowered and any(token in lowered for token in ("required", "missing", "needed", "before booking"))
     ):
-        _raise_non_zero_checkout_pause(details=f"Action: {action}\nReason: {message}")
+        _raise_card_on_file_pause(details=f"Action: {action}\nReason: {message}")
 
 
 def _should_expose_browser_tools(query: str, routing_profile_name: str) -> bool:
     lowered = query.lower()
     if routing_profile_name == "booking_commerce":
-        return False
+        browser_needed_tokens = (
+            "cancel",
+            "reschedule",
+            "login",
+            "sign in",
+            "account",
+            "verify",
+            "verification",
+            "otp",
+            "code",
+        )
+        return any(token in lowered for token in browser_needed_tokens)
     if routing_profile_name == "itinerary_maps":
         travel_tokens = (
             "flight",
@@ -327,6 +351,7 @@ def _direct_tool_mode_summary(query: str, routing_profile_name: str) -> str:
                 "This is a structured reservation task for restaurants. Use restaurant_search first to find the venue, "
                 "prefer restaurant_find_availability for the full search-plus-slots flow, and only use restaurant_book_or_handoff for an approved booking or manual handoff step. "
                 "For read-only availability checks, stay on the structured restaurant tools. "
+                "If the user asks to cancel or modify an existing reservation, first inspect saved bookings and current reservations, then use the saved browser session or a fresh login flow only if the structured tools cannot finish the account step cleanly. "
                 "If the structured path cannot verify live availability, return the structured result plus a clean handoff path instead of drifting into browser automation."
             )
         if any(token in lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "car rental", "car rentals")):
@@ -368,6 +393,8 @@ def _phase1_booking_runtime_guidance(query: str, routing_profile_name: str) -> s
         "- If you return to a known site, prefer browser_restore_session before signing in again.\n"
         "- Before any terminal booking submission, call browser_assert_zero_dollar_checkout unless the browser tool already blocked the action.\n"
         "- Once a $0 booking is confirmed, call record_zero_dollar_booking with the site, venue, session, and any confirmation reference.\n"
+        "- If the user asks to cancel or replace an existing booking, call list_saved_bookings first so the follow-up is tied to a real saved reservation instead of guessing.\n"
+        "- If a $0 booking requires a card on file, pause and ask for explicit confirmation before using or adding any card.\n"
         "- If you need the user to choose between booking options such as seating sections, time slots, or date variants, call pause_for_input instead of returning the question as a final answer.\n"
         "- If SMS OTP, CAPTCHA, device verification, or any non-zero checkout appears, pause instead of improvising."
     )
@@ -409,6 +436,75 @@ def _booking_choice_pause_payload(output_text: str, routing_profile_name: str) -
         "current_step": "waiting_for_user_input",
         "resume_instructions": "Use the user's selected booking option to continue the same reservation flow without asking again for the same choice.",
     }
+
+
+def _is_booking_cancellation_followup(query: str, routing_profile_name: str) -> bool:
+    if routing_profile_name != "booking_commerce":
+        return False
+    lowered = query.lower()
+    return "cancel" in lowered and any(
+        token in lowered for token in ("booking", "reservation", "restaurant", "resy", "opentable", "seating", "table")
+    )
+
+
+def _latest_relevant_booking_record(store: StateStore, query: str) -> Optional[BookingRecord]:
+    lowered = query.lower()
+    records = store.list_booking_records(limit=25)
+    active_records = [
+        record for record in records if str(record.status or "").lower() not in {"cancelled", "canceled", "cancel_completed"}
+    ]
+    for record in active_records:
+        venue = (record.venue_name or "").lower()
+        site = (record.site_key or "").lower()
+        external_reference = (record.external_reference or "").lower()
+        if any(token and token in lowered for token in (venue, site, external_reference)):
+            return record
+    return active_records[0] if active_records else None
+
+
+def _has_active_browser_session_for_site(store: StateStore, site_scope: str) -> bool:
+    normalized_site = (site_scope or "").strip().lower()
+    if not normalized_site:
+        return False
+    for record in store.list_browser_sessions(limit=100):
+        if record.status != "active":
+            continue
+        if (record.site_scope or "").strip().lower() == normalized_site:
+            return True
+    return False
+
+
+def _maybe_raise_booking_cancellation_pause(store: StateStore, query: str, routing_profile_name: str) -> None:
+    if not _is_booking_cancellation_followup(query, routing_profile_name):
+        return
+    record = _latest_relevant_booking_record(store, query)
+    if record is None:
+        _raise_phase1_pause(
+            question="I could not find a saved booking to cancel yet.",
+            details=(
+                "I do not see a saved reservation record for this request.\n"
+                "Please tell me the restaurant name or reservation reference, or cancel it manually and then ask me to book the replacement."
+            ),
+            summary="waiting for a concrete reservation to cancel",
+            current_step="cancel_pending",
+            resume_instructions="Use the provided restaurant name or reservation reference to continue the cancellation or replacement flow.",
+        )
+    if not _has_active_browser_session_for_site(store, record.site_key):
+        _raise_phase1_pause(
+            question="I found the booking, but I do not have a reusable login session to cancel it autonomously yet.",
+            details=(
+                f"Venue: {record.venue_name or '(unknown)'}\n"
+                f"Site: {record.site_key or '(unknown)'}\n"
+                f"Booked time: {record.booking_time or '(unknown)'}\n"
+                f"Reference: {record.external_reference or '(none)'}\n"
+                "I can still search for a replacement, but I cannot safely auto-cancel this reservation until a reusable site session exists."
+            ),
+            summary="waiting for a reusable login session before cancelling the existing booking",
+            current_step="cancel_pending",
+            resume_instructions=(
+                "Once a reusable login session exists for this site, continue the cancellation first and only then place the replacement booking."
+            ),
+        )
 
 
 def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -> list[str]:
@@ -726,6 +822,7 @@ async def run_agent(
 
     if mode == "heavy":
         _ensure_default_mailbox_identity(settings, store)
+        _maybe_raise_booking_cancellation_pause(store, query, routing_profile.name)
         if missing_restaurant_booking_details:
             missing_text = ", ".join(missing_restaurant_booking_details)
             raise PauseForInputRequested(
@@ -1376,6 +1473,36 @@ async def run_agent(
             return "\n".join(lines)
 
         @agent.tool
+        async def list_saved_bookings(ctx: RunContext[AgentDependencies], limit: int = 10, active_only: bool = True) -> str:
+            """List recent saved bookings so follow-up cancel or rebook requests can target a real reservation."""
+            records = ctx.deps.store.list_booking_records(limit=max(1, min(limit * 5, 100)))
+            filtered: list[BookingRecord] = []
+            current_source = ctx.deps.current_job.source.value if ctx.deps.current_job is not None else ""
+            current_user = ctx.deps.current_job.user_id if ctx.deps.current_job is not None else ""
+            for record in records:
+                if active_only and str(record.status or "").lower() in {"cancelled", "canceled", "cancel_completed"}:
+                    continue
+                job = ctx.deps.store.get_job(record.job_id)
+                if current_source and job is not None and job.source.value != current_source:
+                    continue
+                if current_user and job is not None and (job.user_id or "") != current_user:
+                    continue
+                filtered.append(record)
+                if len(filtered) >= limit:
+                    break
+            if not filtered:
+                return "No saved bookings matched this user yet."
+            lines = []
+            for record in filtered:
+                cancel_marker = "cancelable" if record.can_cancel else "cancel status unknown"
+                lines.append(
+                    f"- {record.booking_id[:8]} | {record.venue_name or record.site_key} | "
+                    f"{record.booking_time or '(time unknown)'} | ref={record.external_reference or '(none)'} | "
+                    f"{record.status} | {cancel_marker}"
+                )
+            return "\n".join(lines)
+
+        @agent.tool
         async def wait_for_email_verification(
             ctx: RunContext[AgentDependencies],
             site_key: str,
@@ -1642,12 +1769,33 @@ async def run_agent(
                 venue_name=venue_name.strip(),
                 booking_time=booking_time.strip(),
                 booking_total_cents=0,
-                can_cancel=can_cancel,
+                can_cancel=can_cancel or ("resy" in site_key.strip().lower() and bool(external_reference.strip())),
                 status="created",
             )
             ctx.deps.store.put_booking_record(record)
             return sanitize_tool_output(
                 f"Recorded $0 booking {record.booking_id[:8]} for {record.venue_name or record.site_key}."
+            )
+
+        @agent.tool
+        async def mark_booking_cancelled(
+            ctx: RunContext[AgentDependencies],
+            booking_id: str,
+            external_reference: str = "",
+        ) -> str:
+            """Mark a previously saved booking as cancelled after a structured or browser cancellation succeeds."""
+            record = ctx.deps.store.get_booking_record(booking_id.strip())
+            if record is None:
+                return "No saved booking matched that booking id."
+            updated = record.model_copy(
+                update={
+                    "status": "cancelled",
+                    "external_reference": external_reference.strip() or record.external_reference,
+                }
+            )
+            ctx.deps.store.put_booking_record(updated)
+            return sanitize_tool_output(
+                f"Marked booking {updated.booking_id[:8]} for {updated.venue_name or updated.site_key} as cancelled."
             )
 
         if workspace is not None:

@@ -9,10 +9,13 @@ from app.agent_core import (
     _enforce_automation_policy,
     _find_automation_policy,
     _handle_phase1_blocking_error,
+    _is_booking_cancellation_followup,
     _is_retryable_model_error,
+    _maybe_raise_booking_cancellation_pause,
     _restaurant_booking_missing_details,
+    _should_expose_browser_tools,
 )
-from app.jobs import AutomationPolicyRecord, IdentityRecord
+from app.jobs import AutomationPolicyRecord, BookingRecord, BrowserSessionRecord, IdentityRecord
 from app.settings import Settings
 
 
@@ -21,10 +24,14 @@ class _FakeStore:
         self,
         existing: list[IdentityRecord] | None = None,
         policies: list[AutomationPolicyRecord] | None = None,
+        bookings: list[BookingRecord] | None = None,
+        browser_sessions: list[BrowserSessionRecord] | None = None,
     ) -> None:
         self.records = list(existing or [])
         self.created: list[IdentityRecord] = []
         self.policies = list(policies or [])
+        self.bookings = list(bookings or [])
+        self.browser_sessions = list(browser_sessions or [])
 
     def list_identities(self, limit: int = 100):
         return self.records[:limit]
@@ -36,6 +43,12 @@ class _FakeStore:
 
     def list_automation_policies(self, limit: int = 200):
         return self.policies[:limit]
+
+    def list_booking_records(self, limit: int = 50):
+        return self.bookings[:limit]
+
+    def list_browser_sessions(self, limit: int = 50):
+        return self.browser_sessions[:limit]
 
 
 def test_ensure_default_mailbox_identity_creates_one_when_missing() -> None:
@@ -148,8 +161,8 @@ def test_handle_phase1_blocking_error_turns_missing_payment_method_into_pause() 
             action="restaurant_book_or_handoff(resy)",
         )
 
-    assert excinfo.value.current_step == "payment_blocked"
-    assert "payment" in excinfo.value.question.lower()
+    assert excinfo.value.current_step == "card_entry_required"
+    assert "card on file" in excinfo.value.question.lower()
 
 
 def test_restaurant_booking_missing_details_detects_missing_fields() -> None:
@@ -199,3 +212,94 @@ def test_retryable_model_error_detects_deepseek_internal_error() -> None:
 def test_retryable_model_error_ignores_user_input_pause() -> None:
     exc = RuntimeError("I need party size before I can continue.")
     assert _is_retryable_model_error(exc) is False
+
+
+def test_booking_cancellation_followup_detection() -> None:
+    assert _is_booking_cancellation_followup(
+        "Cancel the booking for junoon & instead make a booking for an Italian restaurant for 2 tomorrow at 9pm",
+        "booking_commerce",
+    ) is True
+    assert _is_booking_cancellation_followup("Cancel that reservation and find me another one", "booking_commerce") is True
+    assert _is_booking_cancellation_followup("cancel this task", "booking_commerce") is False
+
+
+def test_booking_cancellation_pause_when_no_saved_booking_exists() -> None:
+    store = _FakeStore()
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _maybe_raise_booking_cancellation_pause(
+            store,
+            "Cancel that booking and find me an Italian restaurant for tomorrow at 9pm",
+            "booking_commerce",
+        )
+    assert excinfo.value.current_step == "cancel_pending"
+    assert "could not find a saved booking" in excinfo.value.question.lower()
+
+
+def test_booking_cancellation_pause_when_session_missing() -> None:
+    store = _FakeStore(
+        bookings=[
+            BookingRecord(
+                job_id="job-1",
+                site_key="resy.com",
+                venue_name="Junoon",
+                booking_time="2026-05-24T13:00:00-04:00",
+                external_reference="879699798",
+                can_cancel=True,
+                status="created",
+            )
+        ]
+    )
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _maybe_raise_booking_cancellation_pause(
+            store,
+            "Cancel the booking for Junoon and find me another Italian place tomorrow at 9pm",
+            "booking_commerce",
+        )
+    assert excinfo.value.current_step == "cancel_pending"
+    assert "reusable login session" in excinfo.value.question.lower()
+
+
+def test_booking_cancellation_allows_flow_when_session_exists() -> None:
+    store = _FakeStore(
+        bookings=[
+            BookingRecord(
+                job_id="job-1",
+                site_key="resy.com",
+                venue_name="Junoon",
+                booking_time="2026-05-24T13:00:00-04:00",
+                external_reference="879699798",
+                can_cancel=True,
+                status="created",
+            )
+        ],
+        browser_sessions=[
+            BrowserSessionRecord(
+                site_scope="resy.com",
+                session_s3_key="browser-sessions/test.json",
+                user_agent="Mozilla/5.0",
+                viewport_width=1280,
+                viewport_height=800,
+                fingerprint_seed="seed-1",
+                status="active",
+            )
+        ],
+    )
+    _maybe_raise_booking_cancellation_pause(
+        store,
+        "Cancel the booking for Junoon and find me another Italian place tomorrow at 9pm",
+        "booking_commerce",
+    )
+
+
+def test_booking_cancel_queries_enable_browser_tools() -> None:
+    assert _should_expose_browser_tools(
+        "Cancel the booking for junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm",
+        "booking_commerce",
+    ) is True
+
+
+def test_basic_restaurant_lookup_query_keeps_browser_tools_off() -> None:
+    assert _should_expose_browser_tools(
+        "Find Italian restaurants tomorrow at 9pm for 2 people",
+        "booking_commerce",
+    ) is False
