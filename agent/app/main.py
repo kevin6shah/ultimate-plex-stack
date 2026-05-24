@@ -950,6 +950,13 @@ def _job_sort_timestamp(job: AgentJob) -> str:
 
 
 async def _latest_status_job_for_user_async(state: StateStore, *, source: JobSource, user_id: str) -> Optional[AgentJob]:
+    return await _latest_status_job_for_pairs_async(state, [(source, user_id)])
+
+
+async def _latest_status_job_for_pairs_async(
+    state: StateStore,
+    source_user_pairs: list[tuple[JobSource, str]],
+) -> Optional[AgentJob]:
     active_statuses = (
         JobStatus.RUNNING,
         JobStatus.WAITING_WORKER,
@@ -961,15 +968,25 @@ async def _latest_status_job_for_user_async(state: StateStore, *, source: JobSou
         JobStatus.PAUSED_BUDGET,
         JobStatus.TIMED_OUT,
     )
-    active_jobs = await _reconcile_temporal_jobs(
-        state,
-        state.list_jobs_for_user(source=source.value, user_id=user_id, statuses=active_statuses, limit=10),
-    )
+    active_jobs: list[AgentJob] = []
+    recent_jobs: list[AgentJob] = []
+    for source, user_id in source_user_pairs:
+        active_jobs.extend(state.list_jobs_for_user(source=source.value, user_id=user_id, statuses=active_statuses, limit=10))
+        recent_jobs.extend(
+            state.list_jobs_for_user(
+                source=source.value,
+                user_id=user_id,
+                statuses=(JobStatus.COMPLETED, JobStatus.FAILED),
+                limit=10,
+            )
+        )
+    active_jobs = await _reconcile_temporal_jobs(state, active_jobs)
     recent_statuses = (
         JobStatus.COMPLETED,
         JobStatus.FAILED,
     )
-    recent_jobs = state.list_jobs_for_user(source=source.value, user_id=user_id, statuses=recent_statuses, limit=10)
+    if not recent_statuses:
+        recent_jobs = []
     candidates = active_jobs + recent_jobs
     if not candidates:
         return None
@@ -982,18 +999,29 @@ def _active_jobs_for_user(state: StateStore, *, source: JobSource, user_id: str)
 
 
 async def _active_jobs_for_user_async(state: StateStore, *, source: JobSource, user_id: str) -> list[AgentJob]:
-    jobs = state.list_jobs_for_user(
-        source=source.value,
-        user_id=user_id,
-        statuses=(
-            JobStatus.RUNNING,
-            JobStatus.WAITING_WORKER,
-            JobStatus.QUEUED,
-            JobStatus.WAITING_APPROVAL,
-            JobStatus.PAUSED_FOR_INPUT,
-        ),
-        limit=10,
-    )
+    return await _active_jobs_for_pairs_async(state, [(source, user_id)])
+
+
+async def _active_jobs_for_pairs_async(
+    state: StateStore,
+    source_user_pairs: list[tuple[JobSource, str]],
+) -> list[AgentJob]:
+    jobs: list[AgentJob] = []
+    for source, user_id in source_user_pairs:
+        jobs.extend(
+            state.list_jobs_for_user(
+                source=source.value,
+                user_id=user_id,
+                statuses=(
+                    JobStatus.RUNNING,
+                    JobStatus.WAITING_WORKER,
+                    JobStatus.QUEUED,
+                    JobStatus.WAITING_APPROVAL,
+                    JobStatus.PAUSED_FOR_INPUT,
+                ),
+                limit=10,
+            )
+        )
     refreshed = await _reconcile_temporal_jobs(state, jobs)
     return [
         job
@@ -1008,6 +1036,17 @@ def _latest_paused_input_job_for_user(state: StateStore, *, source: JobSource, u
         user_id=user_id,
         statuses=(JobStatus.PAUSED_FOR_INPUT,),
     )
+
+
+def _latest_paused_input_job_for_pairs(state: StateStore, source_user_pairs: list[tuple[JobSource, str]]) -> Optional[AgentJob]:
+    candidates: list[AgentJob] = []
+    for source, user_id in source_user_pairs:
+        job = _latest_paused_input_job_for_user(state, source=source, user_id=user_id)
+        if job is not None:
+            candidates.append(job)
+    if not candidates:
+        return None
+    return sorted(candidates, key=_job_sort_timestamp, reverse=True)[0]
 
 
 def _latest_completed_clarification_job_for_user(state: StateStore, *, source: JobSource, user_id: str) -> Optional[AgentJob]:
@@ -1027,6 +1066,28 @@ def _latest_completed_clarification_job_for_user(state: StateStore, *, source: J
         if _job_result_looks_like_booking_clarification(job):
             return job
     return None
+
+
+def _latest_completed_clarification_job_for_pairs(
+    state: StateStore,
+    source_user_pairs: list[tuple[JobSource, str]],
+) -> Optional[AgentJob]:
+    candidates: list[AgentJob] = []
+    for source, user_id in source_user_pairs:
+        job = _latest_completed_clarification_job_for_user(state, source=source, user_id=user_id)
+        if job is not None:
+            candidates.append(job)
+    if not candidates:
+        return None
+    return sorted(candidates, key=_job_sort_timestamp, reverse=True)[0]
+
+
+def _siri_owner_source_pairs() -> list[tuple[JobSource, str]]:
+    pairs: list[tuple[JobSource, str]] = [(JobSource.SIRI, "siri")]
+    allowed_chat_id = settings.secret(settings.telegram_allowed_chat_id_param)
+    if allowed_chat_id:
+        pairs.append((JobSource.TELEGRAM, str(allowed_chat_id)))
+    return pairs
 
 
 def _checkpoint_input_prompt(checkpoint: Optional[CheckpointPayload]) -> tuple[str, str]:
@@ -2484,7 +2545,7 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             text=query,
             task_class=TaskClass.LIGHT,
         )
-        jobs = await _active_jobs_for_user_async(state, source=JobSource.SIRI, user_id="siri")
+        jobs = await _active_jobs_for_pairs_async(state, _siri_owner_source_pairs())
         status_text = _format_tasks_list(state, jobs)
         state.record_turn(
             channel="siri",
@@ -2507,7 +2568,7 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
         )
         status_text = _format_status_message(
             state,
-            await _latest_status_job_for_user_async(state, source=JobSource.SIRI, user_id="siri"),
+            await _latest_status_job_for_pairs_async(state, _siri_owner_source_pairs()),
         )
         state.record_turn(
             channel="siri",
@@ -2528,7 +2589,7 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
             text=query,
             task_class=TaskClass.LIGHT,
         )
-        jobs = await _active_jobs_for_user_async(state, source=JobSource.SIRI, user_id="siri")
+        jobs = await _active_jobs_for_pairs_async(state, _siri_owner_source_pairs())
         if _is_stop_all_request(query):
             stopped_now, signaled = await _stop_jobs_async(state, jobs)
             total = stopped_now + signaled
@@ -2574,11 +2635,10 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
 
     allowed_chat_id = settings.secret(settings.telegram_allowed_chat_id_param)
     conversation_id = "siri"
-    paused_job = _latest_paused_input_job_for_user(state, source=JobSource.SIRI, user_id="siri")
-    clarification_job = None if paused_job is not None else _latest_completed_clarification_job_for_user(
+    paused_job = _latest_paused_input_job_for_pairs(state, _siri_owner_source_pairs())
+    clarification_job = None if paused_job is not None else _latest_completed_clarification_job_for_pairs(
         state,
-        source=JobSource.SIRI,
-        user_id="siri",
+        _siri_owner_source_pairs(),
     )
     resume_job = paused_job or clarification_job
     paused_checkpoint = state.get_latest_checkpoint(resume_job.job_id) if resume_job is not None else None
