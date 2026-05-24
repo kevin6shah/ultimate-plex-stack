@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -327,6 +328,50 @@ def _phase1_booking_runtime_guidance(query: str, routing_profile_name: str) -> s
     )
 
 
+def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -> list[str]:
+    if routing_profile_name != "booking_commerce":
+        return []
+    lowered = query.lower()
+    booking_intent = any(
+        token in lowered
+        for token in (
+            "book ",
+            "book me",
+            "reserve",
+            "reservation for",
+            "make a reservation",
+            "get me a table",
+            "secure a table",
+        )
+    )
+    restaurant_context = any(token in lowered for token in ("restaurant", "resy", "opentable", "table", "dinner", "lunch", "brunch", "breakfast"))
+    if not booking_intent or not restaurant_context:
+        return []
+
+    missing: list[str] = []
+    if not re.search(r"\b(?:party of|table for|for)\s+\d+\b", lowered) and not re.search(r"\b\d+\s+(?:people|persons|person|guests)\b", lowered):
+        missing.append("party size")
+
+    has_date = bool(
+        re.search(r"\b(today|tomorrow|tonight|this (?:morning|afternoon|evening)|next (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", lowered)
+        or re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lowered)
+        or re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered)
+        or re.search(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", lowered)
+        or re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", lowered)
+    )
+    if not has_date:
+        missing.append("date")
+
+    has_time = bool(
+        re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", lowered)
+        or re.search(r"\b\d{1,2}:\d{2}\b", lowered)
+        or re.search(r"\b(noon|midnight)\b", lowered)
+    )
+    if not has_time:
+        missing.append("time")
+    return missing
+
+
 def _select_model(query: str, settings: Settings) -> str:
     lowered = query.lower()
     if any(token in lowered for token in ("think deeply", "reason", "plan carefully", "complex")):
@@ -582,6 +627,7 @@ async def run_agent(
     allow_browser_tools = _should_expose_browser_tools(query, routing_profile.name)
     allow_travel_browser_fallback = _should_expose_travel_browser_fallback(query, routing_profile.name)
     structured_restaurant_task = _is_structured_restaurant_task(query, routing_profile.name)
+    missing_restaurant_booking_details = _restaurant_booking_missing_details(query, routing_profile.name)
     effective_query = _render_user_query(
         query,
         settings=settings,
@@ -597,6 +643,20 @@ async def run_agent(
 
     if mode == "heavy":
         _ensure_default_mailbox_identity(settings, store)
+        if missing_restaurant_booking_details:
+            missing_text = ", ".join(missing_restaurant_booking_details)
+            raise PauseForInputRequested(
+                question=f"I need the missing booking details before I can make the reservation: {missing_text}.",
+                details=(
+                    "Please reply with the missing details in one message, for example:\n"
+                    "- party size: 2\n"
+                    "- date: 2026-05-24\n"
+                    "- time: 7:30 PM"
+                ),
+                summary="waiting for the missing booking details before making the reservation",
+                current_step="waiting_for_user_input",
+                resume_instructions="Use the provided booking details to continue the same reservation flow without asking again for the same fields.",
+            )
 
     deps = AgentDependencies(
         settings=settings,

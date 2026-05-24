@@ -8,6 +8,7 @@ from app.agent_core import (
     _enforce_automation_policy,
     _find_automation_policy,
     _handle_phase1_blocking_error,
+    _restaurant_booking_missing_details,
 )
 from app.jobs import AutomationPolicyRecord, IdentityRecord
 from app.settings import Settings
@@ -147,3 +148,23 @@ def test_handle_phase1_blocking_error_turns_missing_payment_method_into_pause() 
 
     assert excinfo.value.current_step == "payment_blocked"
     assert "payment" in excinfo.value.question.lower()
+
+
+def test_restaurant_booking_missing_details_detects_missing_fields() -> None:
+    missing = _restaurant_booking_missing_details(
+        "Book Rubirosa for me on Resy tomorrow",
+        "booking_commerce",
+    )
+
+    assert "party size" in missing
+    assert "time" in missing
+    assert "date" not in missing
+
+
+def test_restaurant_booking_missing_details_accepts_complete_prompt() -> None:
+    missing = _restaurant_booking_missing_details(
+        "Book Rubirosa on Resy for 2 people on 2026-05-24 at 7:30 pm",
+        "booking_commerce",
+    )
+
+    assert missing == []
