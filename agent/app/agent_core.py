@@ -4,6 +4,7 @@ import json
 import os
 import logging
 import re
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -66,6 +67,49 @@ class PauseForInputRequested(RuntimeError):
         self.summary = (summary.strip() or normalized_question)[:2000]
         self.current_step = (current_step.strip() or "waiting_for_user_input")[:500]
         self.resume_instructions = resume_instructions.strip()
+
+
+def _is_retryable_model_error(exc: Exception) -> bool:
+    normalized = str(exc or "").strip().lower()
+    if not normalized:
+        return False
+    retry_markers = (
+        "status_code: 500",
+        "internal server error",
+        "internal_error",
+        "model_name: deepseek-chat",
+        "model_name: deepseek/deepseek-chat",
+        "gateway timeout",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "upstream connect error",
+    )
+    return any(marker in normalized for marker in retry_markers)
+
+
+async def _run_agent_with_model_retries(agent: Agent, effective_query: str, *, deps: "AgentDependencies"):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            return await agent.run(effective_query, deps=deps)
+        except PauseForInputRequested:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 3 or not _is_retryable_model_error(exc):
+                raise
+            delay = float(attempt)
+            logger.warning(
+                "agent model retry attempt=%s/3 delay=%.1fs error=%s",
+                attempt,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 @dataclass
@@ -1680,7 +1724,7 @@ async def run_agent(
                 return ctx.deps.workspace.workspace_snapshot()
 
     try:
-        result = await agent.run(effective_query, deps=deps)
+        result = await _run_agent_with_model_retries(agent, effective_query, deps=deps)
     finally:
         if deps.browser is not None:
             await deps.browser.close()

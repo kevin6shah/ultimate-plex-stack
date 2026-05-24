@@ -9,6 +9,7 @@ from app.agent_core import (
     _enforce_automation_policy,
     _find_automation_policy,
     _handle_phase1_blocking_error,
+    _is_retryable_model_error,
     _restaurant_booking_missing_details,
 )
 from app.jobs import AutomationPolicyRecord, IdentityRecord
@@ -186,3 +187,15 @@ def test_booking_choice_pause_payload_detects_slot_selection_question() -> None:
     assert payload["current_step"] == "waiting_for_user_input"
     assert "Which would you prefer?" in payload["question"]
     assert "Outdoor Seating" in payload["details"]
+
+
+def test_retryable_model_error_detects_deepseek_internal_error() -> None:
+    exc = RuntimeError(
+        "status_code: 500, model_name: deepseek-chat, body: {'message': 'Internal Server Error', 'type': 'internal_error'}"
+    )
+    assert _is_retryable_model_error(exc) is True
+
+
+def test_retryable_model_error_ignores_user_input_pause() -> None:
+    exc = RuntimeError("I need party size before I can continue.")
+    assert _is_retryable_model_error(exc) is False
