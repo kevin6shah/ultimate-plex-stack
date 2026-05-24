@@ -710,9 +710,30 @@ def _is_list_tasks_request(query: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in patterns)
 
 
+def _looks_like_booking_cancel_request(query: str) -> bool:
+    normalized = query.strip().lower()
+    if not normalized or "cancel" not in normalized:
+        return False
+    if re.search(r"\b(task|job|agent)\b", normalized):
+        return False
+    booking_markers = (
+        "booking",
+        "reservation",
+        "restaurant",
+        "resy",
+        "opentable",
+        "table",
+        "seating",
+        "venue",
+    )
+    return any(marker in normalized for marker in booking_markers)
+
+
 def _is_stop_request(query: str) -> bool:
     normalized = query.strip().lower()
     if not normalized:
+        return False
+    if _looks_like_booking_cancel_request(normalized):
         return False
     patterns = (
         r"^\s*(stop|cancel|abort)\b",

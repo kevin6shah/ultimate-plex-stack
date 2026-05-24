@@ -11,6 +11,7 @@ from app.main import (
     _format_tasks_list,
     _humanize_worker_failure,
     _is_input_reply,
+    _looks_like_booking_cancel_request,
     _is_stop_all_request,
     _is_status_request,
     _job_result_looks_like_booking_clarification,
@@ -46,6 +47,14 @@ def test_stop_request_detection_catches_stop_the_agent_and_stop_it() -> None:
 
     assert _is_stop_request("Any findings? Stop the agent and reveal the findings")
     assert _is_stop_request("stop it")
+    assert not _is_stop_request("Cancel that booking and find me one that has reservation for the night for Italian")
+    assert not _is_stop_request("Cancel the booking for junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm")
+
+
+def test_booking_cancel_detection_distinguishes_domain_action_from_task_stop() -> None:
+    assert _looks_like_booking_cancel_request("Cancel that booking and find me one that has reservation for the night for Italian")
+    assert _looks_like_booking_cancel_request("Cancel the booking for junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm")
+    assert not _looks_like_booking_cancel_request("cancel this task")
 
 
 def test_format_status_message_for_running_job() -> None:
