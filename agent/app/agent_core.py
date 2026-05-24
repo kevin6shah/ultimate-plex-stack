@@ -222,6 +222,11 @@ def _handle_phase1_blocking_error(exc: Exception, *, action: str) -> None:
     message = str(exc or "").strip()
     if "NON_ZERO_CHECKOUT_BLOCKED" in message:
         _raise_non_zero_checkout_pause(details=f"Action: {action}\nReason: {message}")
+    lowered = message.lower()
+    if "payment method on file" in lowered or (
+        "payment method" in lowered and any(token in lowered for token in ("required", "missing", "needed", "before booking"))
+    ):
+        _raise_non_zero_checkout_pause(details=f"Action: {action}\nReason: {message}")
 
 
 def _should_expose_browser_tools(query: str, routing_profile_name: str) -> bool:
@@ -1142,6 +1147,7 @@ async def run_agent(
                         timeout_seconds=45,
                     )
                 except Exception as exc:
+                    _handle_phase1_blocking_error(exc, action=f"restaurant_book_or_handoff({normalized_provider}, venue={venue_id}, date={date}, time={time})")
                     logger.warning("restaurant_book_or_handoff degraded venue_id=%s provider=%s error=%s", venue_id, provider, exc)
                     return sanitize_tool_output(
                         f"RESTAURANT_TOOL_UNAVAILABLE: booking failed because {exc}."

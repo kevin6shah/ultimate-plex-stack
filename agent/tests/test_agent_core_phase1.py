@@ -136,3 +136,14 @@ def test_handle_phase1_blocking_error_turns_non_zero_checkout_into_pause() -> No
 
     assert excinfo.value.current_step == "payment_blocked"
     assert "stopped before submitting" in excinfo.value.question.lower()
+
+
+def test_handle_phase1_blocking_error_turns_missing_payment_method_into_pause() -> None:
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _handle_phase1_blocking_error(
+            RuntimeError("No payment method on file for this Resy account. Add one at resy.com before booking."),
+            action="restaurant_book_or_handoff(resy)",
+        )
+
+    assert excinfo.value.current_step == "payment_blocked"
+    assert "payment" in excinfo.value.question.lower()
