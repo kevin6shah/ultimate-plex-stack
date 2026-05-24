@@ -19,6 +19,7 @@ from .jobs import (
     AgentConfig,
     AgentJob,
     AgentResult,
+    AutomationPolicyRecord,
     BookingRecord,
     BrowserSessionRecord,
     CheckpointPayload,
@@ -104,6 +105,123 @@ def _ensure_default_mailbox_identity(settings: Settings, store: StateStore) -> O
     )
     store.put_identity(identity)
     return identity
+
+
+def _site_scope_matches(policy_scope: str, target_scope: str) -> bool:
+    normalized_policy = policy_scope.strip().lower()
+    normalized_target = target_scope.strip().lower()
+    if not normalized_policy:
+        return True
+    if not normalized_target:
+        return False
+    if normalized_policy == normalized_target:
+        return True
+    return normalized_target.endswith("." + normalized_policy)
+
+
+def _policy_category_for_site(site_scope: str, *, fallback: str = "general") -> str:
+    normalized = site_scope.strip().lower()
+    if any(token in normalized for token in ("resy", "opentable", "restaurant")):
+        return "restaurant"
+    return fallback
+
+
+def _find_automation_policy(store: StateStore, *, site_scope: str, category: str) -> Optional[AutomationPolicyRecord]:
+    normalized_site = site_scope.strip().lower()
+    normalized_category = category.strip().lower() or "general"
+    candidates: list[tuple[int, AutomationPolicyRecord]] = []
+    for record in store.list_automation_policies(limit=200):
+        site_match = _site_scope_matches(record.site_scope, normalized_site)
+        category_match = not record.category.strip() or record.category.strip().lower() == normalized_category
+        if not site_match or not category_match:
+            continue
+        score = 0
+        if record.category.strip().lower() == normalized_category:
+            score += 2
+        if record.site_scope.strip():
+            score += 4 + len(record.site_scope.strip())
+        candidates.append((score, record))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _raise_phase1_pause(*, question: str, details: str, summary: str, current_step: str, resume_instructions: str = "") -> None:
+    raise PauseForInputRequested(
+        question=question,
+        details=details,
+        summary=summary,
+        current_step=current_step,
+        resume_instructions=resume_instructions,
+    )
+
+
+def _raise_non_zero_checkout_pause(*, details: str) -> None:
+    _raise_phase1_pause(
+        question="I hit a payment or non-zero checkout wall, so I stopped before submitting anything.",
+        details=details,
+        summary="blocked by a payment or non-zero checkout wall",
+        current_step="payment_blocked",
+        resume_instructions=(
+            "Do not keep clicking through the checkout flow. Wait for the operator to decide whether to stop, "
+            "switch to a different venue, or handle the booking manually."
+        ),
+    )
+
+
+def _enforce_automation_policy(
+    store: StateStore,
+    *,
+    site_scope: str,
+    category: str,
+    action: str,
+) -> AutomationPolicyRecord:
+    record = _find_automation_policy(store, site_scope=site_scope, category=category)
+    if record is None:
+        _raise_phase1_pause(
+            question="I need an automation policy before I can continue this account or booking flow.",
+            details=(
+                f"Site: {site_scope or '(unknown)'}\n"
+                f"Category: {category}\n"
+                f"Action requested: {action}\n"
+                "No matching automation policy is configured yet."
+            ),
+            summary="waiting for an automation policy before continuing",
+            current_step="waiting_for_user_input",
+            resume_instructions="Once a matching policy exists, continue the same login or booking flow from the last stable page.",
+        )
+    allowed = False
+    if action == "zero_dollar_booking":
+        allowed = record.allow_zero_dollar_booking
+    elif action == "login_reuse":
+        allowed = record.allow_login_reuse
+    elif action == "account_creation":
+        allowed = record.allow_account_creation
+    else:
+        allowed = False
+    if allowed:
+        return record
+    _raise_phase1_pause(
+        question="I stopped because this site is not approved for that automated action yet.",
+        details=(
+            f"Site: {site_scope or '(unknown)'}\n"
+            f"Category: {category}\n"
+            f"Action requested: {action}\n"
+            f"Policy: {record.label}\n"
+            "The configured automation policy does not allow this step."
+        ),
+        summary="blocked by the current automation policy",
+        current_step="waiting_for_user_input",
+        resume_instructions="Wait for the operator to update the automation policy or take over the task manually.",
+    )
+    return record
+
+
+def _handle_phase1_blocking_error(exc: Exception, *, action: str) -> None:
+    message = str(exc or "").strip()
+    if "NON_ZERO_CHECKOUT_BLOCKED" in message:
+        _raise_non_zero_checkout_pause(details=f"Action: {action}\nReason: {message}")
 
 
 def _should_expose_browser_tools(query: str, routing_profile_name: str) -> bool:
@@ -990,6 +1108,13 @@ async def run_agent(
                             }
                         )
                     )
+                site_scope = "resy.com" if normalized_provider == "resy" else normalized_provider
+                _enforce_automation_policy(
+                    ctx.deps.store,
+                    site_scope=site_scope,
+                    category="restaurant",
+                    action="zero_dollar_booking",
+                )
                 args = [
                     "book",
                     "--venue",
@@ -1167,6 +1292,7 @@ async def run_agent(
                 try:
                     return await ctx.deps.browser.goto(url)
                 except Exception as exc:
+                    _handle_phase1_blocking_error(exc, action=f"browser_navigate({url})")
                     return _browser_tool_warning(f"browser_navigate({url})", exc)
 
             @agent.tool
@@ -1176,6 +1302,7 @@ async def run_agent(
                 try:
                     return await ctx.deps.browser.click(selector)
                 except Exception as exc:
+                    _handle_phase1_blocking_error(exc, action=f"browser_click({selector})")
                     return _browser_tool_warning(f"browser_click({selector})", exc)
 
             @agent.tool
@@ -1185,6 +1312,7 @@ async def run_agent(
                 try:
                     return await ctx.deps.browser.type_text(selector, text, submit=submit)
                 except Exception as exc:
+                    _handle_phase1_blocking_error(exc, action=f"browser_type({selector}, submit={submit})")
                     return _browser_tool_warning(f"browser_type({selector})", exc)
 
             @agent.tool
@@ -1194,6 +1322,7 @@ async def run_agent(
                 try:
                     return await ctx.deps.browser.press(selector, key)
                 except Exception as exc:
+                    _handle_phase1_blocking_error(exc, action=f"browser_press({selector}, {key})")
                     return _browser_tool_warning(f"browser_press({selector}, {key})", exc)
 
             @agent.tool
@@ -1304,6 +1433,12 @@ async def run_agent(
                 normalized_site = site_scope.strip()
                 if not normalized_site and not session_id.strip():
                     raise RuntimeError("site_scope or session_id is required to restore a browser session")
+                _enforce_automation_policy(
+                    ctx.deps.store,
+                    site_scope=normalized_site,
+                    category=_policy_category_for_site(normalized_site),
+                    action="login_reuse",
+                )
                 candidates = ctx.deps.store.list_browser_sessions(limit=100)
                 chosen = None
                 requested_id = session_id.strip()
@@ -1327,8 +1462,12 @@ async def run_agent(
             async def browser_assert_zero_dollar_checkout(ctx: RunContext[AgentDependencies], selector: str = "body", limit: int = 8000) -> str:
                 """Inspect the current page text and stop if a payment form, deposit, or non-zero total is visible."""
                 assert ctx.deps.browser is not None
-                page_text = await ctx.deps.browser.read(selector=selector, limit=limit)
-                enforce_zero_dollar_booking(page_text)
+                try:
+                    page_text = await ctx.deps.browser.read(selector=selector, limit=limit)
+                    enforce_zero_dollar_booking(page_text)
+                except Exception as exc:
+                    _handle_phase1_blocking_error(exc, action=f"browser_assert_zero_dollar_checkout({selector})")
+                    raise
                 return "No payment form or non-zero total was detected in the inspected page text."
 
         @agent.tool

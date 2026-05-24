@@ -1,14 +1,27 @@
 from __future__ import annotations
 
-from app.agent_core import _ensure_default_mailbox_identity
-from app.jobs import IdentityRecord
+import pytest
+
+from app.agent_core import (
+    PauseForInputRequested,
+    _ensure_default_mailbox_identity,
+    _enforce_automation_policy,
+    _find_automation_policy,
+    _handle_phase1_blocking_error,
+)
+from app.jobs import AutomationPolicyRecord, IdentityRecord
 from app.settings import Settings
 
 
 class _FakeStore:
-    def __init__(self, existing: list[IdentityRecord] | None = None) -> None:
+    def __init__(
+        self,
+        existing: list[IdentityRecord] | None = None,
+        policies: list[AutomationPolicyRecord] | None = None,
+    ) -> None:
         self.records = list(existing or [])
         self.created: list[IdentityRecord] = []
+        self.policies = list(policies or [])
 
     def list_identities(self, limit: int = 100):
         return self.records[:limit]
@@ -17,6 +30,9 @@ class _FakeStore:
         self.records.append(record)
         self.created.append(record)
         return record
+
+    def list_automation_policies(self, limit: int = 200):
+        return self.policies[:limit]
 
 
 def test_ensure_default_mailbox_identity_creates_one_when_missing() -> None:
@@ -57,3 +73,66 @@ def test_ensure_default_mailbox_identity_reuses_existing_record() -> None:
 
     assert identity == existing
     assert store.created == []
+
+
+def test_find_automation_policy_prefers_exact_site_and_category() -> None:
+    store = _FakeStore(
+        policies=[
+            AutomationPolicyRecord(label="generic", category="general", site_scope=""),
+            AutomationPolicyRecord(label="restaurant-default", category="restaurant", site_scope=""),
+            AutomationPolicyRecord(label="resy-restaurant", category="restaurant", site_scope="resy.com", allow_zero_dollar_booking=True),
+        ]
+    )
+
+    record = _find_automation_policy(store, site_scope="bookings.resy.com", category="restaurant")
+
+    assert record is not None
+    assert record.label == "resy-restaurant"
+
+
+def test_enforce_automation_policy_pauses_without_matching_policy() -> None:
+    store = _FakeStore()
+
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _enforce_automation_policy(
+            store,
+            site_scope="resy.com",
+            category="restaurant",
+            action="zero_dollar_booking",
+        )
+
+    assert "automation policy" in excinfo.value.question.lower()
+
+
+def test_enforce_automation_policy_pauses_when_action_not_allowed() -> None:
+    store = _FakeStore(
+        policies=[
+            AutomationPolicyRecord(
+                label="resy-read-only",
+                site_scope="resy.com",
+                category="restaurant",
+                allow_zero_dollar_booking=False,
+            )
+        ]
+    )
+
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _enforce_automation_policy(
+            store,
+            site_scope="resy.com",
+            category="restaurant",
+            action="zero_dollar_booking",
+        )
+
+    assert "not approved" in excinfo.value.question.lower()
+
+
+def test_handle_phase1_blocking_error_turns_non_zero_checkout_into_pause() -> None:
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _handle_phase1_blocking_error(
+            RuntimeError("NON_ZERO_CHECKOUT_BLOCKED: deposit $25.00 required"),
+            action="browser_click(button[type=submit])",
+        )
+
+    assert excinfo.value.current_step == "payment_blocked"
+    assert "stopped before submitting" in excinfo.value.question.lower()
