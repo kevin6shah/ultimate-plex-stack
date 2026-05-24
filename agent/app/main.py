@@ -579,6 +579,25 @@ def _humanize_worker_failure(query: str, error_message: str, status: JobStatus) 
         return "I hit an internal step limit, so this run did not finish cleanly."
     if "worker exited without reporting a terminal state" in lowered:
         return "I hit an internal worker problem before the task finished."
+    if any(
+        token in lowered
+        for token in (
+            "status_code: 500",
+            "status_code: 502",
+            "status_code: 503",
+            "status_code: 504",
+            "internal_error",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
+            "upstream connect error",
+            "model_name: deepseek-chat",
+            "model_name: deepseek/deepseek-chat",
+        )
+    ):
+        if any(token in query_lowered for token in ("restaurant", "reservation", "resy", "opentable", "booking", "book ")):
+            return "The model provider had a transient failure while I was working through the reservation flow."
+        return "The model provider had a transient failure before the task finished."
     if any(token in lowered for token in ("429", "1015", "rate limit", "rate-limited", "rate limited", "captcha", "access denied", "forbidden", "403")):
         if any(token in query_lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "google flights", "google travel")):
             return "Some live travel sources temporarily blocked or rate-limited access during this run, and the fallback paths still did not fully complete."
@@ -668,6 +687,7 @@ def _is_status_request(query: str) -> bool:
     if not normalized:
         return False
     patterns = (
+        r"^\s*(status|stats|stat|start|starts|started|still)\s*\??\s*$",
         r"\b(status|progress|update|updates)\b",
         r"\b(how'?s it going|how is it going|where is it at|where's it at|how far along)\b",
         r"\b(is it done|did it finish|did that finish|still working)\b",
@@ -1332,7 +1352,7 @@ async def run_and_notify(job: AgentJob) -> None:
         return
     except Exception as exc:
         logger.exception("light job failed job_id=%s", job.job_id)
-        failure_message = f"That task failed before completion: {exc}"
+        failure_message = _humanize_worker_failure(job.query, str(exc), JobStatus.FAILED)
         state.record_turn(
             channel=job.source.value,
             user_id=job.user_id or "unknown",

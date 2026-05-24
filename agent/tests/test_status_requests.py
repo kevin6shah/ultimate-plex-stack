@@ -29,6 +29,8 @@ def test_status_request_detection() -> None:
     assert _is_status_request("what's the status on that task?")
     assert _is_status_request("any update?")
     assert _is_status_request("did it finish?")
+    assert _is_status_request("Starts")
+    assert _is_status_request("started?")
     assert not _is_status_request("find restaurant reservations for Sunday")
 
 
@@ -109,6 +111,15 @@ def test_humanize_worker_failure_for_activity_cancelled_stop() -> None:
         JobStatus.INTERRUPTED,
     )
     assert text == "I stopped that task."
+
+
+def test_humanize_worker_failure_for_transient_model_provider_error() -> None:
+    text = _humanize_worker_failure(
+        "Book junoon now 2ppl 1pm outside",
+        "status_code: 504, model_name: deepseek-chat, body: gateway timeout",
+        JobStatus.FAILED,
+    )
+    assert text == "The model provider had a transient failure while I was working through the reservation flow."
 
 
 def test_job_indicates_user_stop_for_existing_interrupted_job() -> None:
