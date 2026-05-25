@@ -5,6 +5,7 @@ from app.heavy_job_runtime import progress_notification_text, progress_summary_f
 from app.jobs import AgentJob, CheckpointPayload, JobSource, JobStatus, TaskClass
 from app.main import (
     _active_job_is_stale,
+    _booking_clarification_prompt_from_result,
     _build_paused_input_resume_query,
     _clean_user_facing_result,
     _format_status_message,
@@ -191,6 +192,18 @@ def test_completed_booking_clarification_is_treated_like_waiting_for_input() -> 
     assert "waiting for your choice" in text
     assert "Which would you prefer?" in text
     assert "Your latest task completed." not in text
+
+
+def test_booking_clarification_prompt_parser_handles_alternative_question_style() -> None:
+    result = (
+        "Unfortunately, Junoon has no 9 PM slots available on Tuesday, May 26.\n\n"
+        "Would you like me to:\n"
+        "1. Book one of the available 5:30–6:15 PM slots at Junoon instead, or\n"
+        "2. Search for another restaurant that has 9 PM availability tomorrow?"
+    )
+    question, details = _booking_clarification_prompt_from_result(result)
+    assert "Would you like me to:" in question
+    assert "1. Book one of the available" in details
 
 
 def test_paused_input_reply_prefix_is_detected_and_removed() -> None:

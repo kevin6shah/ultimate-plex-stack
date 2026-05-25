@@ -5,9 +5,11 @@ import json
 import os
 import signal
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from .settings import Settings
 from .workspace import Workspace
@@ -95,6 +97,165 @@ def normalize_restaurant_provider(provider: str, *, default: str = "resy") -> st
     if not normalized:
         return default
     return normalized
+
+
+@dataclass(frozen=True)
+class RestaurantSlotPolicy:
+    provider: str
+    slot_token: str
+    time: str
+    slot_type: str = ""
+    payment_is_paid: Optional[bool] = None
+    cancellation_fee: Optional[float] = None
+    deposit_fee: Optional[float] = None
+    service_charge: Optional[float] = None
+    secs_cancel_cut_off: Optional[int] = None
+    secs_change_cut_off: Optional[int] = None
+    free_cancellation: bool = False
+    requires_manual_confirmation: bool = False
+    policy_text: str = ""
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hours_from_seconds(seconds: Optional[int]) -> Optional[int]:
+    if not seconds or seconds <= 0:
+        return None
+    return max(1, round(seconds / 3600))
+
+
+def _format_resy_slot_policy(slot: dict[str, Any]) -> RestaurantSlotPolicy:
+    config = slot.get("config") or {}
+    payment = slot.get("payment") or {}
+    token = str(config.get("token") or "").strip()
+    slot_type = str(config.get("type") or "").strip()
+    time_value = ""
+    start_raw = str((slot.get("date") or {}).get("start") or "").strip()
+    match = re.search(r"\b(\d{2}:\d{2})(?::\d{2})?\b", start_raw)
+    if match:
+        time_value = match.group(1)
+    cancellation_fee = _coerce_optional_float(payment.get("cancellation_fee"))
+    deposit_fee = _coerce_optional_float(payment.get("deposit_fee"))
+    service_charge = _coerce_optional_float(payment.get("service_charge"))
+    secs_cancel_cut_off = _coerce_optional_int(payment.get("secs_cancel_cut_off"))
+    secs_change_cut_off = _coerce_optional_int(payment.get("secs_change_cut_off"))
+    payment_is_paid = payment.get("is_paid")
+    has_nonzero_cancellation_fee = cancellation_fee is not None and cancellation_fee > 0
+    has_nonzero_deposit = deposit_fee is not None and deposit_fee > 0
+    has_nonzero_service_charge = service_charge is not None and service_charge > 0
+    requires_manual_confirmation = has_nonzero_cancellation_fee or has_nonzero_deposit or has_nonzero_service_charge
+    free_cancellation = not requires_manual_confirmation
+    policy_parts: list[str] = []
+    cutoff_hours = _hours_from_seconds(secs_cancel_cut_off)
+    if has_nonzero_cancellation_fee:
+        if cutoff_hours is not None:
+            policy_parts.append(f"Cancellation fee: ${cancellation_fee:.2f} if cancelled within {cutoff_hours} hours.")
+        else:
+            policy_parts.append(f"Cancellation fee: ${cancellation_fee:.2f}.")
+    elif cancellation_fee == 0:
+        policy_parts.append("Free cancellation: no cancellation fee shown.")
+    elif payment_is_paid:
+        policy_parts.append("No cancellation fee is shown, but the slot still uses a card-on-file payment policy.")
+    else:
+        policy_parts.append("No cancellation fee is shown in the current Resy slot data.")
+    if has_nonzero_deposit:
+        policy_parts.append(f"Deposit required: ${deposit_fee:.2f}.")
+    if has_nonzero_service_charge:
+        policy_parts.append(f"Service charge required: ${service_charge:.2f}.")
+    if secs_change_cut_off and secs_change_cut_off > 0:
+        change_hours = _hours_from_seconds(secs_change_cut_off)
+        if change_hours is not None:
+            policy_parts.append(f"Changes lock within {change_hours} hours of the reservation.")
+    return RestaurantSlotPolicy(
+        provider="resy",
+        slot_token=token,
+        time=time_value,
+        slot_type=slot_type,
+        payment_is_paid=payment_is_paid if isinstance(payment_is_paid, bool) else None,
+        cancellation_fee=cancellation_fee,
+        deposit_fee=deposit_fee,
+        service_charge=service_charge,
+        secs_cancel_cut_off=secs_cancel_cut_off,
+        secs_change_cut_off=secs_change_cut_off,
+        free_cancellation=free_cancellation,
+        requires_manual_confirmation=requires_manual_confirmation,
+        policy_text=" ".join(part for part in policy_parts if part).strip(),
+    )
+
+
+def _fetch_resy_slot_policies_sync(
+    settings: Settings,
+    *,
+    venue_id: str,
+    date: str,
+    party_size: int,
+) -> dict[str, RestaurantSlotPolicy]:
+    auth_token = settings.secret(settings.resy_auth_token_param)
+    if not auth_token:
+        raise RuntimeError("Missing Resy auth token for slot policy inspection.")
+    api_key = settings.secret(settings.resy_api_key_param) or "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"
+    query = urlencode(
+        {
+            "lat": "0",
+            "long": "0",
+            "day": date,
+            "party_size": str(max(1, party_size)),
+            "venue_id": venue_id,
+        }
+    )
+    req = Request(
+        f"https://api.resy.com/4/find?{query}",
+        headers={
+            "Authorization": f'ResyAPI api_key="{api_key}"',
+            "X-Resy-Auth-Token": auth_token,
+            "X-Resy-Universal-Auth": auth_token,
+            "User-Agent": "restaurant-cli/0.1.0 (+https://github.com/omarshahine/restaurant-cli)",
+            "Accept": "application/json, text/plain, */*",
+        },
+        method="GET",
+    )
+    with urlopen(req, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    venues = ((payload or {}).get("results") or {}).get("venues") or []
+    policies: dict[str, RestaurantSlotPolicy] = {}
+    for venue in venues:
+        for slot in venue.get("slots") or []:
+            policy = _format_resy_slot_policy(slot)
+            if policy.slot_token:
+                policies[policy.slot_token] = policy
+    return policies
+
+
+async def fetch_resy_slot_policies(
+    settings: Settings,
+    *,
+    venue_id: str,
+    date: str,
+    party_size: int,
+) -> dict[str, RestaurantSlotPolicy]:
+    return await asyncio.to_thread(
+        _fetch_resy_slot_policies_sync,
+        settings,
+        venue_id=venue_id,
+        date=date,
+        party_size=party_size,
+    )
 
 
 async def run_restaurant_cli(

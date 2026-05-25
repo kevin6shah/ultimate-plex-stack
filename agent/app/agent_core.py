@@ -35,7 +35,9 @@ from .research import fetch_page_content, sanitize_tool_output, search_web
 from .restaurant_cli import (
     build_opentable_booking_url,
     choose_best_restaurant_result,
+    fetch_resy_slot_policies,
     normalize_restaurant_provider,
+    RestaurantSlotPolicy,
     run_restaurant_cli,
     run_restaurant_cli_json,
 )
@@ -474,6 +476,22 @@ def _has_active_browser_session_for_site(store: StateStore, site_scope: str) -> 
     return False
 
 
+def _can_structurally_cancel_booking(record: BookingRecord) -> bool:
+    normalized_site = (record.site_key or "").strip().lower()
+    if normalized_site in {"resy", "resy.com"} and record.external_reference.strip():
+        return True
+    return False
+
+
+def _canonical_booking_site_key(site_key: str) -> str:
+    normalized = (site_key or "").strip().lower()
+    if normalized in {"resy", "resy.com"}:
+        return "resy.com"
+    if normalized in {"opentable", "opentable.com"}:
+        return "opentable.com"
+    return site_key.strip() or "generic-booking"
+
+
 def _maybe_raise_booking_cancellation_pause(store: StateStore, query: str, routing_profile_name: str) -> None:
     if not _is_booking_cancellation_followup(query, routing_profile_name):
         return
@@ -489,6 +507,8 @@ def _maybe_raise_booking_cancellation_pause(store: StateStore, query: str, routi
             current_step="cancel_pending",
             resume_instructions="Use the provided restaurant name or reservation reference to continue the cancellation or replacement flow.",
         )
+    if _can_structurally_cancel_booking(record):
+        return
     if not _has_active_browser_session_for_site(store, record.site_key):
         _raise_phase1_pause(
             question="I found the booking, but I do not have a reusable login session to cancel it autonomously yet.",
@@ -505,6 +525,130 @@ def _maybe_raise_booking_cancellation_pause(store: StateStore, query: str, routi
                 "Once a reusable login session exists for this site, continue the cancellation first and only then place the replacement booking."
             ),
         )
+
+
+def _format_optional_currency(amount: Optional[float]) -> str:
+    if amount is None:
+        return ""
+    return f"${amount:.2f}"
+
+
+async def _lookup_resy_slot_policy(
+    settings: Settings,
+    *,
+    venue_id: str,
+    date: str,
+    party_size: int,
+    slot_token: str = "",
+    time: str = "",
+) -> Optional[RestaurantSlotPolicy]:
+    try:
+        policy_map = await fetch_resy_slot_policies(
+            settings,
+            venue_id=venue_id,
+            date=date,
+            party_size=max(1, party_size),
+        )
+    except Exception as exc:
+        logger.warning(
+            "resy_slot_policy_lookup_failed venue_id=%s date=%s party_size=%s error=%s",
+            venue_id,
+            date,
+            party_size,
+            exc,
+        )
+        return None
+    normalized_token = slot_token.strip()
+    if normalized_token and normalized_token in policy_map:
+        return policy_map[normalized_token]
+    normalized_time = time.strip()
+    if normalized_time:
+        for policy in policy_map.values():
+            if policy.time == normalized_time:
+                return policy
+    return None
+
+
+def _render_resy_slot_policy(policy: Optional[RestaurantSlotPolicy]) -> str:
+    if policy is None:
+        return "Cancellation policy: unavailable from the current Resy slot data."
+    return f"Cancellation policy: {policy.policy_text or 'unavailable from the current Resy slot data.'}"
+
+
+def _render_resy_policy_slot_lines(
+    policy_map: dict[str, RestaurantSlotPolicy],
+    *,
+    date: str,
+    party_size: int,
+    venue_name: str,
+    venue_city: str,
+    venue_url: str,
+) -> str:
+    lines = [
+        f"Matched venue: {venue_name}"
+        + (f" ({venue_city})" if venue_city else "")
+        + " on Resy",
+    ]
+    if venue_url:
+        lines.append(f"Booking page: {venue_url}")
+    ordered = sorted(
+        (policy for policy in policy_map.values() if policy.time),
+        key=lambda policy: (policy.time, policy.slot_type.lower(), policy.slot_token),
+    )
+    if not ordered:
+        lines.append(f"No live slots were returned for {date} for {max(1, party_size)} people.")
+        return "\n".join(lines)
+    lines.append(f"Live availability for {date} for {max(1, party_size)} people:")
+    for policy in ordered[:12]:
+        line = f"- {policy.time}" + (f" ({policy.slot_type})" if policy.slot_type else "")
+        if policy.policy_text:
+            line += f" — {policy.policy_text}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _maybe_raise_nonfree_resy_confirmation(
+    policy: Optional[RestaurantSlotPolicy],
+    *,
+    venue_id: str,
+    date: str,
+    time: str,
+    party_size: int,
+) -> None:
+    if policy is not None and policy.free_cancellation:
+        return
+    details_lines = [
+        f"Provider: resy",
+        f"Venue id: {venue_id}",
+        f"Date: {date}",
+        f"Time: {time}",
+        f"Party size: {max(1, party_size)}",
+        _render_resy_slot_policy(policy),
+    ]
+    if policy is not None and policy.deposit_fee is not None and policy.deposit_fee > 0:
+        details_lines.append(f"Deposit fee: {_format_optional_currency(policy.deposit_fee)}")
+    if policy is not None and policy.service_charge is not None and policy.service_charge > 0:
+        details_lines.append(f"Service charge: {_format_optional_currency(policy.service_charge)}")
+    question = "I need your explicit confirmation before booking this Resy slot."
+    if policy is None:
+        question = (
+            "I could not verify whether this Resy slot has free cancellation, so I need your explicit confirmation before booking it."
+        )
+    elif policy.policy_text:
+        question = (
+            "This Resy slot is not free to cancel, so I need your explicit confirmation before booking it. "
+            + policy.policy_text
+        ).strip()
+    _raise_phase1_pause(
+        question=question,
+        details="\n".join(line for line in details_lines if line).strip(),
+        summary="waiting for your confirmation because this booking is not free to cancel",
+        current_step="waiting_for_confirmation",
+        resume_instructions=(
+            "Only continue if the user explicitly confirms that Friday should proceed despite the cancellation policy. "
+            "Otherwise, look for a free-cancellation alternative."
+        ),
+    )
 
 
 def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -> list[str]:
@@ -1224,15 +1368,60 @@ async def run_agent(
                         provider,
                         exc,
                     )
+                    if normalized_provider == "resy":
+                        try:
+                            resy_policy_by_token = await fetch_resy_slot_policies(
+                                ctx.deps.settings,
+                                venue_id=venue_id,
+                                date=date,
+                                party_size=max(1, party_size),
+                            )
+                        except Exception as policy_exc:
+                            logger.warning(
+                                "restaurant_find_availability direct resy fallback failed query=%s venue_id=%s error=%s",
+                                query,
+                                venue_id,
+                                policy_exc,
+                            )
+                        else:
+                            return sanitize_tool_output(
+                                _render_resy_policy_slot_lines(
+                                    resy_policy_by_token,
+                                    date=date,
+                                    party_size=party_size,
+                                    venue_name=venue_name,
+                                    venue_city=venue_city,
+                                    venue_url=venue_url,
+                                )
+                            )
                     return sanitize_tool_output(
                         (
+                            "RESTAURANT_PROVIDER_UNAVAILABLE: "
                             f"I matched {venue_name}"
                             + (f" in {venue_city}" if venue_city else "")
-                            + f" on {normalized_provider.title()}, but I could not verify live availability for {date}."
+                            + f" on {normalized_provider.title()}, but the provider returned repeated errors while checking live availability for {date}. "
+                            "Do not keep retrying the same provider request. Ask the user whether to try another date, another restaurant, or a different booking source."
                             + (f"\nBooking page: {venue_url}" if venue_url else "")
                         )
                     )
                 slots = slots_payload if isinstance(slots_payload, list) else []
+                resy_policy_by_token: dict[str, RestaurantSlotPolicy] = {}
+                if normalized_provider == "resy" and slots:
+                    try:
+                        resy_policy_by_token = await fetch_resy_slot_policies(
+                            ctx.deps.settings,
+                            venue_id=venue_id,
+                            date=date,
+                            party_size=max(1, party_size),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "restaurant_find_availability policy degraded query=%s venue_id=%s provider=%s error=%s",
+                            query,
+                            venue_id,
+                            provider,
+                            exc,
+                        )
                 lines = [
                     f"Matched venue: {venue_name}"
                     + (f" ({venue_city})" if venue_city else "")
@@ -1246,7 +1435,12 @@ async def run_agent(
                         slot_time = str(slot.get('time') or '').strip()
                         slot_type = str(slot.get('type') or '').strip()
                         if slot_time:
-                            lines.append(f"- {slot_time}" + (f" ({slot_type})" if slot_type else ""))
+                            line = f"- {slot_time}" + (f" ({slot_type})" if slot_type else "")
+                            slot_token = str(slot.get("token") or "").strip()
+                            policy = resy_policy_by_token.get(slot_token)
+                            if policy is not None and policy.policy_text:
+                                line += f" — {policy.policy_text}"
+                            lines.append(line)
                 else:
                     lines.append(f"No live slots were returned for {date} for {max(1, party_size)} people.")
                 if failures:
@@ -1308,19 +1502,47 @@ async def run_agent(
                         normalized_provider,
                         "--agent",
                     ]
-                    try:
-                        result = await run_restaurant_cli(
-                            ctx.deps.settings,
-                            ctx.deps.workspace,
-                            *args,
-                            timeout_seconds=35,
-                        )
-                    except Exception as exc:
-                        logger.warning("restaurant_availability degraded venue_id=%s provider=%s error=%s", venue_id, provider, exc)
-                        return sanitize_tool_output(
-                            f"RESTAURANT_TOOL_UNAVAILABLE: availability lookup failed because {exc}."
-                        )
-                    return sanitize_tool_output(result)
+                try:
+                    result = await run_restaurant_cli(
+                        ctx.deps.settings,
+                        ctx.deps.workspace,
+                        *args,
+                        timeout_seconds=35,
+                    )
+                except Exception as exc:
+                    logger.warning("restaurant_availability degraded venue_id=%s provider=%s error=%s", venue_id, provider, exc)
+                    if normalized_provider == "resy":
+                        try:
+                            policy_map = await fetch_resy_slot_policies(
+                                ctx.deps.settings,
+                                venue_id=venue_id,
+                                date=date,
+                                party_size=max(1, party_size),
+                            )
+                        except Exception as policy_exc:
+                            logger.warning(
+                                "restaurant_availability direct resy fallback failed venue_id=%s provider=%s error=%s",
+                                venue_id,
+                                provider,
+                                policy_exc,
+                            )
+                        else:
+                            return sanitize_tool_output(
+                                _render_resy_policy_slot_lines(
+                                    policy_map,
+                                    date=date,
+                                    party_size=party_size,
+                                    venue_name=f"venue {venue_id}",
+                                    venue_city="",
+                                    venue_url="",
+                                )
+                            )
+                    return sanitize_tool_output(
+                        "RESTAURANT_PROVIDER_UNAVAILABLE: "
+                        f"availability lookup failed because {exc}. "
+                        "Do not keep retrying the same provider request. Ask the user whether to try another date, another restaurant, or a different booking source."
+                    )
+                return sanitize_tool_output(result)
 
             @agent.tool
             async def restaurant_book_or_handoff(
@@ -1379,6 +1601,23 @@ async def run_agent(
                     args.extend(["--slot-token", slot_token.strip()])
                 if notes.strip():
                     args.extend(["--notes", notes.strip()])
+                policy: Optional[RestaurantSlotPolicy] = None
+                if normalized_provider == "resy":
+                    policy = await _lookup_resy_slot_policy(
+                        ctx.deps.settings,
+                        venue_id=venue_id,
+                        date=date,
+                        party_size=max(1, party_size),
+                        slot_token=slot_token.strip(),
+                        time=time.strip(),
+                    )
+                    _maybe_raise_nonfree_resy_confirmation(
+                        policy,
+                        venue_id=venue_id,
+                        date=date,
+                        time=time,
+                        party_size=party_size,
+                    )
                 try:
                     result = await run_restaurant_cli(
                         ctx.deps.settings,
@@ -1392,7 +1631,10 @@ async def run_agent(
                     return sanitize_tool_output(
                         f"RESTAURANT_TOOL_UNAVAILABLE: booking failed because {exc}."
                     )
-                return sanitize_tool_output(result)
+                rendered = result.strip()
+                if normalized_provider == "resy":
+                    rendered = (rendered + "\n" + _render_resy_slot_policy(policy)).strip()
+                return sanitize_tool_output(rendered)
 
             @agent.tool
             async def restaurant_list_reservations(
@@ -1418,6 +1660,81 @@ async def run_agent(
                         f"RESTAURANT_TOOL_UNAVAILABLE: reservation list failed because {exc}."
                     )
                 return sanitize_tool_output(result)
+
+            @agent.tool
+            async def restaurant_cancel_reservation(
+                ctx: RunContext[AgentDependencies],
+                reservation_id: str,
+                provider: str = "resy",
+                booking_id: str = "",
+            ) -> str:
+                """Cancel an existing restaurant reservation by provider reservation id. Confirm with the user before using this."""
+                assert ctx.deps.workspace is not None
+                normalized_provider = normalize_restaurant_provider(provider)
+                args = ["cancel", reservation_id.strip(), "--provider", normalized_provider, "--agent"]
+                result: dict[str, object] | None = None
+                try:
+                    raw_result = await run_restaurant_cli_json(
+                        ctx.deps.settings,
+                        ctx.deps.workspace,
+                        *args,
+                        timeout_seconds=30,
+                    )
+                except Exception as exc:
+                    if normalized_provider == "resy" and "Resy cancel returned no confirmation" in str(exc):
+                        try:
+                            listed = await run_restaurant_cli_json(
+                                ctx.deps.settings,
+                                ctx.deps.workspace,
+                                "list",
+                                "--provider",
+                                normalized_provider,
+                                "--upcoming",
+                                "--json",
+                                timeout_seconds=30,
+                            )
+                        except Exception:
+                            listed = []
+                        rows = listed if isinstance(listed, list) else []
+                        still_present = any(str(row.get("id") or "").strip() == reservation_id.strip() for row in rows if isinstance(row, dict))
+                        if not still_present:
+                            result = {
+                                "ok": True,
+                                "provider": normalized_provider,
+                                "reservationId": reservation_id.strip(),
+                                "message": "Cancellation completed even though Resy returned no explicit confirmation token.",
+                            }
+                        else:
+                            logger.warning("restaurant_cancel_reservation degraded provider=%s reservation_id=%s error=%s", provider, reservation_id, exc)
+                            return sanitize_tool_output(
+                                f"RESTAURANT_TOOL_UNAVAILABLE: reservation cancel failed because {exc}."
+                            )
+                    else:
+                        logger.warning("restaurant_cancel_reservation degraded provider=%s reservation_id=%s error=%s", provider, reservation_id, exc)
+                        return sanitize_tool_output(
+                            f"RESTAURANT_TOOL_UNAVAILABLE: reservation cancel failed because {exc}."
+                        )
+                else:
+                    result = raw_result if isinstance(raw_result, dict) else {"ok": True, "raw": raw_result}
+                if result is None:
+                    logger.warning("restaurant_cancel_reservation degraded provider=%s reservation_id=%s empty_result=true", provider, reservation_id)
+                    return sanitize_tool_output(
+                        "RESTAURANT_TOOL_UNAVAILABLE: reservation cancel failed because the provider returned an empty response."
+                    )
+                if result.get("ok"):
+                    target_record = None
+                    if booking_id.strip():
+                        target_record = ctx.deps.store.get_booking_record(booking_id.strip())
+                    if target_record is None:
+                        for record in ctx.deps.store.list_booking_records(limit=50):
+                            if (record.external_reference or "").strip() == reservation_id.strip():
+                                target_record = record
+                                break
+                    if target_record is not None:
+                        ctx.deps.store.put_booking_record(
+                            target_record.model_copy(update={"status": "cancelled"})
+                        )
+                return sanitize_tool_output(json.dumps(result))
 
         if allow_browser_tools:
 
@@ -1760,16 +2077,17 @@ async def run_agent(
             """Persist a confirmed $0 booking so it can be reused for later status or cancellation flows."""
             if ctx.deps.current_job is None:
                 raise RuntimeError("recording a booking requires a heavy job context")
+            normalized_site_key = _canonical_booking_site_key(site_key)
             record = BookingRecord(
                 job_id=ctx.deps.current_job.job_id,
-                site_key=site_key.strip() or "generic-booking",
+                site_key=normalized_site_key,
                 identity_id=identity_id.strip(),
                 session_id=session_id.strip(),
                 external_reference=external_reference.strip(),
                 venue_name=venue_name.strip(),
                 booking_time=booking_time.strip(),
                 booking_total_cents=0,
-                can_cancel=can_cancel or ("resy" in site_key.strip().lower() and bool(external_reference.strip())),
+                can_cancel=can_cancel or ("resy" in normalized_site_key and bool(external_reference.strip())),
                 status="created",
             )
             ctx.deps.store.put_booking_record(record)
@@ -1812,6 +2130,11 @@ async def run_agent(
                 assert ctx.deps.workspace is not None
                 try:
                     return ctx.deps.workspace.read_text(relative_path, limit=limit)
+                except ValueError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_PATH_INVALID: {relative_path} escapes the allowed workspace. "
+                        "Use a relative path inside the current workspace."
+                    )
                 except FileNotFoundError:
                     return sanitize_tool_output(
                         f"WORKSPACE_FILE_NOT_FOUND: {relative_path} does not exist yet. "
@@ -1824,6 +2147,11 @@ async def run_agent(
                 assert ctx.deps.workspace is not None
                 try:
                     return ctx.deps.workspace.preview_table(relative_path, rows=rows)
+                except ValueError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_PATH_INVALID: {relative_path} escapes the allowed workspace. "
+                        "Use a relative path inside the current workspace."
+                    )
                 except FileNotFoundError:
                     return sanitize_tool_output(
                         f"WORKSPACE_FILE_NOT_FOUND: {relative_path} does not exist yet. "
@@ -1839,19 +2167,37 @@ async def run_agent(
                 """Convert a workspace document or image into markdown using the wrapped MarkItDown file tool."""
                 assert ctx.deps.workspace is not None
                 normalized_output = output_relative_path.strip() or None
-                return ctx.deps.workspace.convert_to_markdown(relative_path, normalized_output)
+                try:
+                    return ctx.deps.workspace.convert_to_markdown(relative_path, normalized_output)
+                except ValueError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_PATH_INVALID: {relative_path} escapes the allowed workspace. "
+                        "Use a relative path inside the current workspace."
+                    )
 
             @agent.tool
             async def workspace_write_text_file(ctx: RunContext[AgentDependencies], relative_path: str, content: str) -> str:
                 """Write or overwrite a text file inside the workspace."""
                 assert ctx.deps.workspace is not None
-                return ctx.deps.workspace.write_text(relative_path, content)
+                try:
+                    return ctx.deps.workspace.write_text(relative_path, content)
+                except ValueError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_PATH_INVALID: {relative_path} escapes the allowed workspace. "
+                        "Use a relative path inside the current workspace."
+                    )
 
             @agent.tool
             async def workspace_write_pdf_report(ctx: RunContext[AgentDependencies], relative_path: str, title: str, body_text: str) -> str:
                 """Create a simple PDF report inside the workspace."""
                 assert ctx.deps.workspace is not None
-                return ctx.deps.workspace.write_pdf(relative_path, title, body_text)
+                try:
+                    return ctx.deps.workspace.write_pdf(relative_path, title, body_text)
+                except ValueError:
+                    return sanitize_tool_output(
+                        f"WORKSPACE_PATH_INVALID: {relative_path} escapes the allowed workspace. "
+                        "Use a relative path inside the current workspace."
+                    )
 
             @agent.tool
             async def workspace_run_shell(ctx: RunContext[AgentDependencies], command: str, timeout_seconds: int = 60) -> str:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from temporalio import activity
 
 from .heavy_job_runtime import (
@@ -40,6 +42,62 @@ def _message_indicates_interruption(message: str) -> bool:
     } or "cancelled" in normalized or "canceled" in normalized
 
 
+def _stop_reason_from_control_signal(state: StateStore, job_id: str) -> tuple[str, str]:
+    signal = state.get_latest_control_signal(job_id)
+    note = (signal.note if signal else "").strip()
+    lowered = note.lower()
+    if "auto-stopped" in lowered or "no meaningful progress" in lowered or "stuck" in lowered:
+        return (
+            "auto-stopped after repeated identical steps",
+            "I stopped this task because it appeared stuck on the same step without meaningful progress.",
+        )
+    return ("stopped by user", "stopped by user")
+
+
+def _result_looks_like_booking_clarification(query: str, result_text: str) -> bool:
+    normalized = clean_user_facing_result(result_text or "")
+    if not normalized:
+        return False
+    lowered_query = (query or "").lower()
+    if not any(token in lowered_query for token in ("book", "reservation", "table", "restaurant", "resy", "opentable")):
+        return False
+    lowered = normalized.lower()
+    triggers = (
+        "which would you prefer",
+        "which do you prefer",
+        "which would you like",
+        "which seating preference",
+        "let me confirm with you first",
+        "would you like me to",
+    )
+    if not any(trigger in lowered for trigger in triggers):
+        return False
+    return bool(re.search(r"^\s*(?:[-*•]|\d+\.)", normalized, flags=re.MULTILINE)) or normalized.endswith("?")
+
+
+def _booking_clarification_prompt_from_result(result_text: str) -> tuple[str, str]:
+    normalized = clean_user_facing_result(result_text or "")
+    if not normalized:
+        return "", ""
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    question = ""
+    for line in lines:
+        lowered = line.lower()
+        if "would you like me to" in lowered or "which would you" in lowered or "which do you" in lowered:
+            question = line
+            break
+    for line in reversed(lines):
+        if question:
+            break
+        if line.endswith("?"):
+            question = line
+            break
+    detail_lines = [line for line in lines if re.match(r"^\s*(?:[-*•]|\d+\.)", line)]
+    if not question:
+        question = "I need your choice between the available booking options before I can continue."
+    return question[:500], "\n".join(detail_lines[:12])[:1500]
+
+
 @activity.defn
 async def prepare_heavy_job_claim(job_id: str) -> dict:
     state = _store()
@@ -70,6 +128,35 @@ async def finalize_heavy_job_completed(job_id: str, result_text: str, output_fil
     if job is None:
         raise RuntimeError(f"job not found: {job_id}")
     cleaned_result = clean_user_facing_result(result_text)
+    if _result_looks_like_booking_clarification(job.query, cleaned_result):
+        input_question, input_details = _booking_clarification_prompt_from_result(cleaned_result)
+        payload = CheckpointPayload(
+            summary="waiting for your choice between the available booking options",
+            current_step="waiting_for_user_input",
+            resume_instructions="Use the user's selected booking option to continue the same reservation flow without asking again for the same choice.",
+            metadata={
+                "input_question": input_question,
+                "input_details": input_details,
+            },
+        )
+        state.save_checkpoint(job_id, payload)
+        state.update_job_status(
+            job_id,
+            status=JobStatus.PAUSED_FOR_INPUT,
+            current_step="waiting_for_user_input",
+            result_preview=cleaned_result,
+            output_files=output_files,
+            artifact_keys=artifact_keys,
+        )
+        paused_job = state.get_job(job_id) or job
+        message = paused_input_reply_text(state, paused_job)
+        record_job_assistant_turn(state, job, message)
+        if job.chat_id:
+            from .telegram import TelegramClient
+
+            await TelegramClient(settings).send_message(job.chat_id, message)
+        maybe_stop_dedicated_worker_if_idle(settings, state)
+        return
     state.update_job_status(
         job_id,
         status=JobStatus.COMPLETED,
@@ -134,7 +221,8 @@ async def finalize_heavy_job_stop(job_id: str) -> None:
     job = state.get_job(job_id)
     if job is None:
         return
-    state.update_job_status(job_id, status=JobStatus.INTERRUPTED, current_step="stopped by user", error_message="stopped by user")
+    current_step, error_message = _stop_reason_from_control_signal(state, job_id)
+    state.update_job_status(job_id, status=JobStatus.INTERRUPTED, current_step=current_step, error_message=error_message)
     maybe_stop_dedicated_worker_if_idle(settings, state)
 
 
