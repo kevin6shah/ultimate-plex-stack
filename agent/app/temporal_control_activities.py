@@ -46,12 +46,17 @@ def _stop_reason_from_control_signal(state: StateStore, job_id: str) -> tuple[st
     signal = state.get_latest_control_signal(job_id)
     note = (signal.note if signal else "").strip()
     lowered = note.lower()
+    if "stopped by user" in lowered:
+        return ("stopped by user", "stopped by user")
     if "auto-stopped" in lowered or "no meaningful progress" in lowered or "stuck" in lowered:
         return (
             "auto-stopped after repeated identical steps",
             "I stopped this task because it appeared stuck on the same step without meaningful progress.",
         )
-    return ("stopped by user", "stopped by user")
+    return (
+        "interrupted",
+        "This task was interrupted before it finished. Say 'resume that task' if you want me to continue from the last checkpoint.",
+    )
 
 
 def _result_looks_like_booking_clarification(query: str, result_text: str) -> bool:
@@ -204,8 +209,11 @@ async def finalize_heavy_job_failed(
         status = JobStatus.INTERRUPTED
     elif timed_out:
         status = JobStatus.TIMED_OUT
-    user_error = humanize_worker_failure(job.query, error_message, status)
-    current_step = "stopped by user" if status == JobStatus.INTERRUPTED else "failed"
+    if status == JobStatus.INTERRUPTED:
+        current_step, user_error = _stop_reason_from_control_signal(state, job_id)
+    else:
+        user_error = humanize_worker_failure(job.query, error_message, status)
+        current_step = "failed"
     state.update_job_status(job_id, status=status, current_step=current_step, error_message=user_error)
     record_job_assistant_turn(state, job, user_error)
     if job.chat_id:
