@@ -15,6 +15,7 @@ from app.agent_core import (
     _is_retryable_model_error,
     _maybe_raise_booking_cancellation_pause,
     _maybe_raise_nonfree_resy_confirmation,
+    _raise_restaurant_provider_unavailable_pause,
     _restaurant_booking_missing_details,
     _render_resy_slot_policy,
     _should_skip_booking_cancellation_precheck,
@@ -378,6 +379,22 @@ def test_unknown_resy_policy_requires_manual_confirmation() -> None:
     assert excinfo.value.current_step == "waiting_for_confirmation"
     assert "could not verify" in excinfo.value.question.lower()
     assert "Cancellation policy: unavailable" in excinfo.value.details
+
+
+def test_restaurant_provider_unavailable_raises_pause() -> None:
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _raise_restaurant_provider_unavailable_pause(
+            provider="resy",
+            venue_name="Rubirosa (New York)",
+            date="2026-05-26",
+            party_size=2,
+            details="The provider returned repeated errors while checking live availability.",
+            venue_url="https://resy.com/cities/ny/rubirosa",
+        )
+
+    assert excinfo.value.current_step == "provider_unavailable"
+    assert "try another time" in excinfo.value.question.lower()
+    assert "Booking page: https://resy.com/cities/ny/rubirosa" in excinfo.value.details
 
 
 def test_render_resy_slot_policy_handles_missing_policy() -> None:

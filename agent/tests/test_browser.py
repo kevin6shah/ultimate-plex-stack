@@ -5,6 +5,7 @@ from app.browser import (
     _extract_page_text,
     _extract_search_result_links_from_html,
     _guard_zero_dollar_before_action,
+    _select_value_via_locator,
     _run_with_retries,
     _selector_or_text_suggests_terminal_action,
 )
@@ -17,6 +18,10 @@ class FakeLocator:
         self._count = count
         self.first = self
         self.attributes: dict[str, str] = {}
+        self.tag_name = ""
+        self.parent: "FakeLocator | None" = None
+        self.selected_labels: list[str] = []
+        self.selected_values: list[str] = []
 
     async def count(self) -> int:
         return self._count
@@ -28,6 +33,26 @@ class FakeLocator:
 
     async def get_attribute(self, name: str) -> Optional[str]:
         return self.attributes.get(name)
+
+    async def evaluate(self, script: str) -> str:
+        return self.tag_name
+
+    def locator(self, selector: str) -> "FakeLocator":
+        if selector == "xpath=ancestor::select[1]" and self.parent is not None:
+            return self.parent
+        return FakeLocator(count=0)
+
+    async def select_option(
+        self,
+        *,
+        label: Optional[str] = None,
+        value: Optional[str] = None,
+        timeout: int = 0,
+    ) -> None:
+        if label is not None:
+            self.selected_labels.append(label)
+        if value is not None:
+            self.selected_values.append(value)
 
 
 class FakePage:
@@ -138,3 +163,27 @@ def test_guard_zero_dollar_before_action_blocks_non_zero_terminal_submit() -> No
 def test_guard_zero_dollar_before_action_skips_non_terminal_controls() -> None:
     page = FakePage({"input.search": FakeLocator("Search")}, js_text="Find restaurants near me")
     asyncio.run(_guard_zero_dollar_before_action(page, selector="input.search", locator=page.locator("input.search")))
+
+
+def test_select_value_via_locator_uses_select_label_for_select_elements() -> None:
+    locator = FakeLocator()
+    locator.tag_name = "select"
+
+    selected = asyncio.run(_select_value_via_locator(locator, "9:00 PM"))
+
+    assert selected is True
+    assert locator.selected_labels == ["9:00 PM"]
+
+
+def test_select_value_via_locator_uses_parent_select_for_option_elements() -> None:
+    parent = FakeLocator()
+    parent.tag_name = "select"
+    option = FakeLocator("11:00 AM")
+    option.tag_name = "option"
+    option.parent = parent
+    option.attributes["value"] = "1100"
+
+    selected = asyncio.run(_select_value_via_locator(option, "text=11:00 AM"))
+
+    assert selected is True
+    assert parent.selected_values == ["1100"]

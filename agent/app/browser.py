@@ -172,6 +172,41 @@ async def _run_with_retries(
     raise last_exc
 
 
+async def _locator_tag_name(locator: object) -> str:
+    try:
+        value = await locator.evaluate("(el) => (el && el.tagName ? el.tagName.toLowerCase() : '')")
+    except Exception:
+        return ""
+    return str(value or "").strip().lower()
+
+
+async def _select_value_via_locator(locator: object, text: str) -> bool:
+    tag_name = await _locator_tag_name(locator)
+    normalized_text = " ".join(str(text or "").split())
+    if not tag_name:
+        return False
+    if tag_name == "select":
+        if not normalized_text:
+            return False
+        await locator.select_option(label=normalized_text, timeout=10000)
+        return True
+    if tag_name != "option":
+        return False
+    parent = locator.locator("xpath=ancestor::select[1]").first
+    option_value = str((await locator.get_attribute("value")) or "").strip()
+    option_label = str((await locator.inner_text(timeout=2000)) or "").strip()
+    if option_value:
+        await parent.select_option(value=option_value, timeout=10000)
+        return True
+    if option_label:
+        await parent.select_option(label=option_label, timeout=10000)
+        return True
+    if normalized_text:
+        await parent.select_option(label=normalized_text, timeout=10000)
+        return True
+    return False
+
+
 def _selector_candidates(selector: str) -> list[str]:
     parts = [part.strip() for part in selector.split(",")]
     return [part for part in parts if part] or [selector]
@@ -397,7 +432,8 @@ class BrowserSession:
         logger.info("browser click selector=%s", selector)
         locator = self._page.locator(selector).first
         await _guard_zero_dollar_before_action(self._page, selector=selector, locator=locator)
-        await locator.click(timeout=10000)
+        if not await _select_value_via_locator(locator, selector):
+            await locator.click(timeout=10000)
         await self._page.wait_for_timeout(800)
         return await self.describe()
 
@@ -405,7 +441,8 @@ class BrowserSession:
         await self.ensure_started()
         logger.info("browser type selector=%s submit=%s", selector, submit)
         locator = self._page.locator(selector).first
-        await locator.fill(text, timeout=10000)
+        if not await _select_value_via_locator(locator, text):
+            await locator.fill(text, timeout=10000)
         if submit:
             enforce_zero_dollar_booking(await self.read(limit=8000))
             await locator.press("Enter")

@@ -230,6 +230,38 @@ def _raise_card_on_file_pause(*, details: str) -> None:
     )
 
 
+def _raise_restaurant_provider_unavailable_pause(
+    *,
+    provider: str,
+    venue_name: str,
+    date: str,
+    party_size: int,
+    details: str = "",
+    venue_url: str = "",
+) -> None:
+    normalized_provider = provider.strip().title() or "provider"
+    extra_lines = [line for line in [details.strip(), f"Booking page: {venue_url}" if venue_url.strip() else ""] if line]
+    _raise_phase1_pause(
+        question=(
+            f"I could not verify live availability on {normalized_provider} for {venue_name} because the provider kept returning errors. "
+            "Do you want me to try another time, another restaurant, or a different booking source?"
+        ),
+        details="\n".join(
+            [
+                f"Venue: {venue_name}",
+                f"Date: {date}",
+                f"Party: {max(1, party_size)}",
+                *extra_lines,
+            ]
+        ),
+        summary=f"{normalized_provider} availability is currently unavailable for {venue_name}",
+        current_step="provider_unavailable",
+        resume_instructions=(
+            "Do not keep retrying the same provider request. Use the user's next reply to switch time, venue, or booking source."
+        ),
+    )
+
+
 def _enforce_automation_policy(
     store: StateStore,
     *,
@@ -1477,15 +1509,13 @@ async def run_agent(
                                     venue_url=venue_url,
                                 )
                             )
-                    return sanitize_tool_output(
-                        (
-                            "RESTAURANT_PROVIDER_UNAVAILABLE: "
-                            f"I matched {venue_name}"
-                            + (f" in {venue_city}" if venue_city else "")
-                            + f" on {normalized_provider.title()}, but the provider returned repeated errors while checking live availability for {date}. "
-                            "Do not keep retrying the same provider request. Ask the user whether to try another date, another restaurant, or a different booking source."
-                            + (f"\nBooking page: {venue_url}" if venue_url else "")
-                        )
+                    _raise_restaurant_provider_unavailable_pause(
+                        provider=normalized_provider,
+                        venue_name=venue_name + (f" ({venue_city})" if venue_city else ""),
+                        date=date,
+                        party_size=party_size,
+                        details=f"The provider returned repeated errors while checking live availability.",
+                        venue_url=venue_url,
                     )
                 slots = slots_payload if isinstance(slots_payload, list) else []
                 resy_policy_by_token: dict[str, RestaurantSlotPolicy] = {}
@@ -1620,10 +1650,12 @@ async def run_agent(
                                     venue_url="",
                                 )
                             )
-                    return sanitize_tool_output(
-                        "RESTAURANT_PROVIDER_UNAVAILABLE: "
-                        f"availability lookup failed because {exc}. "
-                        "Do not keep retrying the same provider request. Ask the user whether to try another date, another restaurant, or a different booking source."
+                    _raise_restaurant_provider_unavailable_pause(
+                        provider=normalized_provider,
+                        venue_name=f"venue {venue_id}",
+                        date=date,
+                        party_size=party_size,
+                        details=f"Availability lookup failed because {exc}.",
                     )
                 return sanitize_tool_output(result)
 
