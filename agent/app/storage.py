@@ -718,7 +718,7 @@ class StateStore:
             stale_threshold = max(120, int(self.settings.worker_running_stall_seconds))
         else:
             stale_threshold = max(60, int(self.settings.worker_preflight_stall_seconds))
-        return stale_seconds >= max(stale_threshold, interval_seconds)
+        return stale_seconds >= stale_threshold
 
     def mark_loop_stop_requested(self, job_id: str) -> None:
         timestamp = utc_now().isoformat()
