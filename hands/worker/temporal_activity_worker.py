@@ -22,7 +22,7 @@ if str(AGENT_ROOT) not in sys.path:
 from app.agent_core import PauseForInputRequested, run_agent
 from app.artifacts import is_browser_step_screenshot, query_requests_browser_images
 from app.heavy_job_runtime import artifact_key, progress_notification_text, progress_summary_for_step, status_summary_for_query
-from app.jobs import AgentConfig, AgentJob, CheckpointPayload, ThreadTurn
+from app.jobs import AgentConfig, AgentJob, CheckpointPayload, ControlCommand, ThreadTurn
 from app.settings import Settings
 from app.storage import StateStore
 from app.telegram import TelegramClient
@@ -124,9 +124,26 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             summary=current_summary,
             elapsed_seconds=elapsed_seconds,
         )
-        state.update_job_heartbeat(job.job_id, current_step=current_step, summary=heartbeat_summary)
+        updated_job = state.update_job_heartbeat(job.job_id, current_step=current_step, summary=heartbeat_summary)
+        config = state.get_config()
+        if state.should_stop_for_stall(job.job_id, interval_seconds=config.status_update_interval_seconds):
+            state.record_control_signal(
+                job.job_id,
+                command=ControlCommand.STOP,
+                note="auto-stopped after repeated identical worker heartbeats with no meaningful progress",
+            )
+            state.mark_loop_stop_requested(job.job_id)
+            if updated_job.chat_id:
+                await TelegramClient(settings).send_message(
+                    updated_job.chat_id,
+                    "I stopped this task because it appeared stuck on the same step without meaningful progress. "
+                    "If you want, I can resume it or try a different approach.",
+                )
+            interrupted.set()
+            if main_task is not None:
+                main_task.cancel()
+            return
         if notify and job.chat_id:
-            config = state.get_config()
             live_job = state.get_job(job.job_id) or job
             message = progress_notification_text(live_job, current_step=current_step, summary=heartbeat_summary)
             if state.should_send_status_update(job.job_id, interval_seconds=config.status_update_interval_seconds, text=message):
