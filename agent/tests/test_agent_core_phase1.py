@@ -462,3 +462,10 @@ def test_basic_restaurant_lookup_query_keeps_browser_tools_off() -> None:
         "Find Italian restaurants tomorrow at 9pm for 2 people",
         "booking_commerce",
     ) is False
+
+
+def test_free_cancel_booking_language_is_not_treated_as_cancel_followup() -> None:
+    assert not _is_booking_cancellation_followup(
+        "Find Italian restaurants in NYC tomorrow at 9pm for 2 and get ready to book the best free-cancel option",
+        "booking_commerce",
+    )

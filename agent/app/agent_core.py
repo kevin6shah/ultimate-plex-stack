@@ -444,7 +444,19 @@ def _is_booking_cancellation_followup(query: str, routing_profile_name: str) -> 
     if routing_profile_name != "booking_commerce":
         return False
     lowered = query.lower()
-    return "cancel" in lowered and any(
+    if not re.search(r"\bcancel(?:led|ing|ation)?\b", lowered):
+        return False
+    policy_contexts = (
+        "free cancel",
+        "free-cancel",
+        "free cancellation",
+        "cancellation policy",
+        "cancel policy",
+        "best free-cancel option",
+    )
+    if any(marker in lowered for marker in policy_contexts):
+        return False
+    return any(
         token in lowered for token in ("booking", "reservation", "restaurant", "resy", "opentable", "seating", "table")
     )
 
