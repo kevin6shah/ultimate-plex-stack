@@ -16,9 +16,10 @@ from app.agent_core import (
     _maybe_raise_nonfree_resy_confirmation,
     _restaurant_booking_missing_details,
     _render_resy_slot_policy,
+    _should_skip_booking_cancellation_precheck,
     _should_expose_browser_tools,
 )
-from app.jobs import AutomationPolicyRecord, BookingRecord, BrowserSessionRecord, IdentityRecord
+from app.jobs import AutomationPolicyRecord, BookingRecord, BrowserSessionRecord, CheckpointPayload, IdentityRecord
 from app.restaurant_cli import RestaurantSlotPolicy
 from app.settings import Settings
 
@@ -385,6 +386,51 @@ def test_render_resy_slot_policy_handles_missing_policy() -> None:
 def test_canonical_booking_site_key_normalizes_resy() -> None:
     assert _canonical_booking_site_key("resy") == "resy.com"
     assert _canonical_booking_site_key("resy.com") == "resy.com"
+
+
+def test_resume_checkpoint_can_skip_repeat_booking_cancellation_precheck() -> None:
+    checkpoint = CheckpointPayload(
+        summary="Which city are you looking for an Italian restaurant in tomorrow night at 9 PM?",
+        current_step="awaiting_city_and_restaurant_choice",
+        metadata={
+            "input_question": "Which city are you looking for an Italian restaurant in tomorrow night at 9 PM?",
+            "input_details": "Let's move forward with the Italian booking.",
+        },
+    )
+
+    assert (
+        _should_skip_booking_cancellation_precheck(
+            query="Cancel the booking for Junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm",
+            effective_query="Cancel the booking for Junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm",
+            routing_profile_name="booking_commerce",
+            resume_checkpoint=checkpoint,
+        )
+        is True
+    )
+
+
+def test_cancel_pending_checkpoint_can_resume_into_replacement_booking() -> None:
+    checkpoint = CheckpointPayload(
+        summary="waiting for a concrete reservation to cancel",
+        current_step="cancel_pending",
+        metadata={
+            "input_question": "I could not find a saved booking to cancel yet.",
+            "input_details": "Please tell me the restaurant name or reservation reference, or cancel it manually and then ask me to book the replacement.",
+        },
+    )
+
+    assert (
+        _should_skip_booking_cancellation_precheck(
+            query="Cancel the booking for Junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm",
+            effective_query=(
+                "Cancel the booking for Junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm\n\n"
+                "New user input:\nNYC, Bar Italia"
+            ),
+            routing_profile_name="booking_commerce",
+            resume_checkpoint=checkpoint,
+        )
+        is True
+    )
 
 
 def test_booking_cancel_queries_enable_browser_tools() -> None:

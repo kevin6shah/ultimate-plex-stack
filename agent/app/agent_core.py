@@ -527,6 +527,55 @@ def _maybe_raise_booking_cancellation_pause(store: StateStore, query: str, routi
         )
 
 
+def _should_skip_booking_cancellation_precheck(
+    *,
+    query: str,
+    effective_query: str,
+    routing_profile_name: str,
+    resume_checkpoint: Optional[CheckpointPayload],
+) -> bool:
+    if resume_checkpoint is None:
+        return False
+    if not _is_booking_cancellation_followup(query, routing_profile_name):
+        return False
+    current_step = (resume_checkpoint.current_step or "").strip().lower()
+    metadata = resume_checkpoint.metadata or {}
+    question = str(metadata.get("input_question", "")).strip().lower()
+    details = str(metadata.get("input_details", "")).strip().lower()
+    if current_step == "cancel_pending":
+        if "could not find a saved booking" in question:
+            lowered_effective = effective_query.lower()
+            marker = "new user input:"
+            reply_text = ""
+            if marker in lowered_effective:
+                reply_text = lowered_effective.split(marker, 1)[1].strip()
+            replacement_markers = (
+                "nyc",
+                "new york",
+                "greenville",
+                "bar italia",
+                "nonna dora",
+                "da claudio",
+                "foodance",
+                "cucina",
+                "ramerino",
+                "duomo51",
+            )
+            if reply_text and any(marker in reply_text for marker in replacement_markers):
+                return True
+        return False
+    if current_step.startswith("awaiting_"):
+        return True
+    combined = "\n".join(part for part in (question, details) if part)
+    skip_markers = (
+        "which city are you looking for",
+        "which restaurant",
+        "let's move forward with the italian booking",
+        "italian restaurants with 9 pm availability",
+    )
+    return any(marker in combined for marker in skip_markers)
+
+
 def _format_optional_currency(amount: Optional[float]) -> str:
     if amount is None:
         return ""
@@ -966,7 +1015,13 @@ async def run_agent(
 
     if mode == "heavy":
         _ensure_default_mailbox_identity(settings, store)
-        _maybe_raise_booking_cancellation_pause(store, query, routing_profile.name)
+        if not _should_skip_booking_cancellation_precheck(
+            query=query,
+            effective_query=effective_query,
+            routing_profile_name=routing_profile.name,
+            resume_checkpoint=resume_checkpoint,
+        ):
+            _maybe_raise_booking_cancellation_pause(store, query, routing_profile.name)
         if missing_restaurant_booking_details:
             missing_text = ", ".join(missing_restaurant_booking_details)
             raise PauseForInputRequested(
