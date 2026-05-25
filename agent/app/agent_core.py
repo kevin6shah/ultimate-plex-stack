@@ -449,6 +449,20 @@ def _is_booking_cancellation_followup(query: str, routing_profile_name: str) -> 
     )
 
 
+def _is_booking_replacement_request(query: str) -> bool:
+    lowered = query.lower()
+    replacement_markers = (
+        "instead make a booking",
+        "instead book",
+        "find me another",
+        "find another",
+        "replacement booking",
+        "replace it with",
+        "instead make me",
+    )
+    return any(marker in lowered for marker in replacement_markers)
+
+
 def _latest_relevant_booking_record(store: StateStore, query: str) -> Optional[BookingRecord]:
     lowered = query.lower()
     records = store.list_booking_records(limit=25)
@@ -497,6 +511,8 @@ def _maybe_raise_booking_cancellation_pause(store: StateStore, query: str, routi
         return
     record = _latest_relevant_booking_record(store, query)
     if record is None:
+        if _is_booking_replacement_request(query):
+            return
         _raise_phase1_pause(
             question="I could not find a saved booking to cancel yet.",
             details=(

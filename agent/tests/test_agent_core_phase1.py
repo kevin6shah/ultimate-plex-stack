@@ -11,6 +11,7 @@ from app.agent_core import (
     _find_automation_policy,
     _handle_phase1_blocking_error,
     _is_booking_cancellation_followup,
+    _is_booking_replacement_request,
     _is_retryable_model_error,
     _maybe_raise_booking_cancellation_pause,
     _maybe_raise_nonfree_resy_confirmation,
@@ -386,6 +387,22 @@ def test_render_resy_slot_policy_handles_missing_policy() -> None:
 def test_canonical_booking_site_key_normalizes_resy() -> None:
     assert _canonical_booking_site_key("resy") == "resy.com"
     assert _canonical_booking_site_key("resy.com") == "resy.com"
+
+
+def test_booking_replacement_request_detects_rebook_language() -> None:
+    assert _is_booking_replacement_request(
+        "Cancel the booking for Junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm"
+    )
+
+
+def test_cancel_and_replace_request_does_not_pause_when_no_saved_booking_exists() -> None:
+    store = _FakeStore()
+
+    _maybe_raise_booking_cancellation_pause(
+        store,
+        "Cancel the booking for Junoon and instead make a booking for an Italian restaurant for 2 tomorrow at 9pm",
+        "booking_commerce",
+    )
 
 
 def test_resume_checkpoint_can_skip_repeat_booking_cancellation_precheck() -> None:
