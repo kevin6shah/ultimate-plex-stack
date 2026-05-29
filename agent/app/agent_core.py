@@ -5,9 +5,11 @@ import os
 import logging
 import re
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
@@ -84,6 +86,8 @@ def _is_retryable_model_error(exc: Exception) -> bool:
     normalized = str(exc or "").strip().lower()
     if not normalized:
         return False
+    if "structured restaurant availability failed in api_direct mode" in normalized:
+        return False
     retry_markers = (
         "status_code: 500",
         "internal server error",
@@ -131,6 +135,8 @@ class AgentDependencies:
     browser: Optional[BrowserSession] = None
     current_job: Optional[AgentJob] = None
     strategy_mode: str = STRATEGY_API_DIRECT
+    restaurant_booking_prefill: Optional["RestaurantBookingPrefill"] = None
+    restaurant_booking_preflight: Optional["RestaurantBookingPreflightResult"] = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,46 @@ class RestaurantBookingPrefill:
     date: str
     time: str
     party_size: int
+
+
+@dataclass(frozen=True)
+class RestaurantBookingPreflightVenue:
+    venue_id: str
+    venue_name: str
+    venue_city: str
+    venue_url: str
+    provider: str
+
+
+@dataclass(frozen=True)
+class RestaurantBookingPreflightResult:
+    summary: str
+    matched_venue: Optional[RestaurantBookingPreflightVenue] = None
+
+
+@dataclass(frozen=True)
+class RestaurantDiscoveryPrefill:
+    search_query: str
+    city: str
+    provider: str
+    date: str
+    time: str
+    party_size: int
+
+
+@dataclass(frozen=True)
+class RestaurantDiscoveryCandidate:
+    venue_id: str
+    venue_name: str
+    venue_city: str
+    venue_url: str
+    provider: str
+
+
+@dataclass(frozen=True)
+class RestaurantDiscoveryPreflightResult:
+    summary: str
+    candidates: tuple[RestaurantDiscoveryCandidate, ...]
 
 
 @dataclass(frozen=True)
@@ -336,6 +382,8 @@ def _render_resy_browser_probe_summary(
     time: str,
     party_size: int,
 ) -> str:
+    normalized_requested_time = str(time or "").strip().lower()
+    flexible_requested_time = normalized_requested_time in {"", "(not specified)"} or normalized_requested_time == "any available"
     lines = [
         "BROWSER_RESY_PROBE:",
         f"Matched venue: {venue_name}" + (f" ({venue_city})" if venue_city else ""),
@@ -349,6 +397,8 @@ def _render_resy_browser_probe_summary(
         lines.append(f"Current browser URL: {probe.current_url}")
     if probe.selected_exact_time_label:
         lines.append(f"Exact requested time is selectable on the live venue page: {probe.selected_exact_time_label}.")
+    elif flexible_requested_time and probe.visible_time_labels:
+        lines.append("Live time options visible on the venue page:")
     elif probe.nearest_time_labels:
         lines.append("Exact requested time is not selectable on the live venue page.")
         lines.append("Closest live time options on the page:")
@@ -356,8 +406,11 @@ def _render_resy_browser_probe_summary(
             lines.append(f"- {label}")
     elif probe.visible_time_labels:
         lines.append("The live venue page exposed a time selector, but the requested time was not present.")
+    elif flexible_requested_time:
+        lines.append("The live venue page did not expose selectable time options.")
     if probe.visible_time_labels:
-        lines.append("Visible time selector options:")
+        if not flexible_requested_time:
+            lines.append("Visible time selector options:")
         for label in probe.visible_time_labels[:8]:
             lines.append(f"- {label}")
     if probe.venue_note:
@@ -369,6 +422,40 @@ def _render_resy_browser_probe_summary(
         "If the exact time is not selectable or the venue page says availability opens later, pause and ask the user whether to choose another time, venue, or source."
     )
     return sanitize_tool_output("\n".join(lines))
+
+
+async def _resy_availability_browser_probe_summary(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    venue_id: str,
+    venue_name: str,
+    venue_city: str,
+    venue_url: str,
+    date: str,
+    party_size: int,
+) -> Optional[str]:
+    probe = await _run_resy_browser_probe(
+        settings=settings,
+        workspace=workspace,
+        venue_url=venue_url,
+        venue_name=venue_name,
+        venue_city=venue_city,
+        date=date,
+        time="",
+        party_size=party_size,
+    )
+    if probe is None:
+        return None
+    return _render_resy_browser_probe_summary(
+        probe,
+        venue_id=venue_id,
+        venue_name=venue_name,
+        venue_city=venue_city,
+        date=date,
+        time="(not specified)",
+        party_size=party_size,
+    )
 
 
 def _ensure_default_mailbox_identity(settings: Settings, store: StateStore) -> Optional[IdentityRecord]:
@@ -926,6 +1013,7 @@ def _direct_tool_mode_summary(query: str, routing_profile_name: str) -> str:
                 return (
                     "This is a restaurant discovery task, not an approved booking task yet. "
                     "Use restaurant_search first to build a shortlist of candidate venues, then use restaurant_availability or restaurant_find_availability only after the user has picked a specific restaurant or clearly asked for a single best option. "
+                    "If preflight already listed concrete candidate venue ids, use restaurant_availability with those venue ids instead of rerunning a name-based search. "
                     "Do not call restaurant_book_or_handoff yet. "
                     "Do not stop on one venue's cancellation policy before you have named the venue and given the user a clear choice."
                 )
@@ -977,24 +1065,138 @@ _NUMBER_WORDS: dict[str, int] = {
     "twelve": 12,
 }
 
+_NUMBER_WORD_PATTERN = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+_WEEKDAY_ALIASES: dict[str, str] = {
+    "mon": "monday",
+    "monday": "monday",
+    "tue": "tuesday",
+    "tues": "tuesday",
+    "tuesday": "tuesday",
+    "wed": "wednesday",
+    "wednesday": "wednesday",
+    "thu": "thursday",
+    "thur": "thursday",
+    "thurs": "thursday",
+    "thursday": "thursday",
+    "fri": "friday",
+    "friday": "friday",
+    "sat": "saturday",
+    "saturday": "saturday",
+    "sun": "sunday",
+    "sunday": "sunday",
+}
+_WEEKDAY_PATTERN = r"(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
+_MONTH_PATTERN = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+_RELATIVE_DATE_PATTERN = rf"(?:today|tomorrow|tonight|this (?:morning|afternoon|evening|{_WEEKDAY_PATTERN})|next {_WEEKDAY_PATTERN}|{_WEEKDAY_PATTERN})"
+_MONTH_DAY_PATTERN = rf"(?:{_MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,\s*\d{{4}})?"
+_WEEKDAY_MONTH_DAY_PATTERN = rf"(?:{_WEEKDAY_PATTERN}),?\s+(?:{_MONTH_DAY_PATTERN})"
+_DATE_SLASH_PATTERN = r"\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+_TIME_VALUE_PATTERN = r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)"
+_FLEXIBLE_TIME_PATTERN = (
+    r"(?:any available time|any time|anytime|first available|earliest available|next available|"
+    r"closest available|flexible on time|whenever available)"
+)
+
+
+def _prioritized_query_segments(query: str) -> tuple[str, ...]:
+    normalized = str(query or "").strip()
+    if not normalized:
+        return tuple()
+    lowered = normalized.lower()
+    segments: list[str] = []
+    for marker in ("new user input:", "new user direction:"):
+        index = lowered.rfind(marker)
+        if index >= 0:
+            segment = normalized[index + len(marker) :].strip()
+            if segment:
+                segments.append(segment)
+    segments.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for segment in segments:
+        compact = segment.strip()
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        deduped.append(compact)
+    return tuple(deduped)
+
+
+def _search_query_segments(query: str, patterns: tuple[str, ...], *, flags: int = re.IGNORECASE) -> str:
+    for segment in _prioritized_query_segments(query):
+        for pattern in patterns:
+            match = re.search(pattern, segment, flags=flags)
+            if match:
+                return " ".join(match.group("value").strip(" ,.\n\t").split())
+    return ""
+
+
+def _normalize_restaurant_time_token(raw_value: str) -> str:
+    cleaned = " ".join(raw_value.strip().split())
+    lowered = cleaned.lower().replace(".", "")
+    if not lowered:
+        return ""
+    if re.fullmatch(_FLEXIBLE_TIME_PATTERN, lowered):
+        return "ANY AVAILABLE"
+    if lowered in {"noon", "midnight"}:
+        return lowered.upper()
+    match = re.fullmatch(r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<suffix>[ap]m)?", lowered)
+    if not match:
+        return cleaned.upper()
+    hour = int(match.group("hour"))
+    minute = match.group("minute")
+    suffix = (match.group("suffix") or "").upper()
+    if suffix:
+        return f"{hour}:{minute} {suffix}" if minute is not None else f"{hour} {suffix}"
+    return f"{hour}:{minute}" if minute is not None else str(hour)
+
+
+def _normalize_restaurant_date_phrase(raw_value: str) -> str:
+    cleaned = " ".join(raw_value.strip().split())
+    cleaned = re.sub(r"(\d{1,2})(st|nd|rd|th)\b", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bsept\b", "sep", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" ,.")
+
+
+def _parse_month_day_date(value: str, *, current: datetime) -> Optional[datetime]:
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d", "%b %d"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if fmt in {"%B %d", "%b %d"}:
+                parsed = parsed.replace(year=current.year)
+                if parsed.date() < current.date():
+                    parsed = parsed.replace(year=current.year + 1)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def _render_requested_time_phrase(time_value: str) -> str:
+    normalized = str(time_value or "").strip().upper()
+    if not normalized:
+        return ""
+    if normalized == "ANY AVAILABLE":
+        return "for any available time"
+    return f"around {time_value}"
+
 
 def _extract_party_size_value(query: str) -> Optional[int]:
-    lowered = query.lower()
-    party_match = re.search(r"\b(?:for|table for|party of)\s+(\d+)\b", lowered) or re.search(
-        r"\b(\d+)\s+(?:people|persons|person|guests)\b",
-        lowered,
+    raw_value = _search_query_segments(
+        query,
+        (
+            rf"\b(?:party size|party|size|guests|people|persons)\s*:\s*(?P<value>\d{{1,2}}|{_NUMBER_WORD_PATTERN})\b",
+            rf"\b(?:for|table for|party of|for a party of)\s+(?P<value>\d{{1,2}}|{_NUMBER_WORD_PATTERN})(?=\s*(?:people|persons|person|guests|diners|of us)\b|\s+(?:at|on|in|near|today|tomorrow|tonight)\b|[,.]|$)",
+            rf"\b(?P<value>\d{{1,2}}|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests|diners)\b",
+        ),
     )
-    if party_match:
-        return max(1, int(party_match.group(1)))
-    word_match = re.search(
-        r"\b(?:for|table for|party of)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b",
-        lowered,
-    ) or re.search(
-        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:people|persons|person|guests)\b",
-        lowered,
-    )
-    if word_match:
-        return _NUMBER_WORDS.get(word_match.group(1))
+    if raw_value.isdigit():
+        return max(1, int(raw_value))
+    if raw_value:
+        return _NUMBER_WORDS.get(raw_value.lower())
     return None
 
 
@@ -1454,28 +1656,64 @@ def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -
     if _extract_party_size_value(query) is None:
         missing.append("party size")
 
-    has_date = bool(
-        re.search(r"\b(today|tomorrow|tonight|this (?:morning|afternoon|evening)|next (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", lowered)
-        or re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lowered)
-        or re.search(r"\b\d{4}-\d{2}-\d{2}\b", lowered)
-        or re.search(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", lowered)
-        or re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", lowered)
-    )
-    if not has_date:
+    if not _extract_restaurant_date_value(query):
         missing.append("date")
 
-    has_time = bool(
-        re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", lowered)
-        or re.search(r"\b\d{1,2}:\d{2}\b", lowered)
-        or re.search(r"\b(noon|midnight)\b", lowered)
-    )
+    has_time = bool(_extract_restaurant_time_value(query))
     if not has_time:
         missing.append("time")
     return missing
 
 
+def _extract_restaurant_time_value(query: str) -> str:
+    raw_value = _search_query_segments(
+        query,
+        (
+            rf"\btime\s*:\s*(?P<value>{_FLEXIBLE_TIME_PATTERN})\b",
+            rf"\btime\s*:\s*(?P<value>{_TIME_VALUE_PATTERN})\b",
+            r"\btime\s*:\s*(?P<value>\d{1,2}:\d{2})\b",
+            r"\btime\s*:\s*(?P<value>noon|midnight)\b",
+            rf"\b(?:at|around)\s+(?P<value>{_TIME_VALUE_PATTERN})\b",
+            r"\b(?:at|around)\s+(?P<value>\d{1,2}:\d{2})\b",
+            rf"\b(?P<value>{_TIME_VALUE_PATTERN})\b",
+            r"\b(?P<value>\d{1,2}:\d{2})\b",
+            r"\b(?P<value>noon|midnight)\b",
+            rf"\b(?P<value>{_FLEXIBLE_TIME_PATTERN})\b",
+        ),
+    )
+    return _normalize_restaurant_time_token(raw_value)
+
+
+def _extract_restaurant_date_value(query: str) -> str:
+    raw_value = _search_query_segments(
+        query,
+        (
+            rf"\bdate\s*:\s*(?P<value>{_WEEKDAY_MONTH_DAY_PATTERN})\b",
+            rf"\bdate\s*:\s*(?P<value>{_MONTH_DAY_PATTERN})\b",
+            r"\bdate\s*:\s*(?P<value>\d{4}-\d{2}-\d{2})\b",
+            rf"\bdate\s*:\s*(?P<value>{_DATE_SLASH_PATTERN})\b",
+            rf"\bdate\s*:\s*(?P<value>{_RELATIVE_DATE_PATTERN})\b",
+            rf"\b(?P<value>{_WEEKDAY_MONTH_DAY_PATTERN})\b",
+            rf"\b(?P<value>{_MONTH_DAY_PATTERN})\b",
+            r"\b(?P<value>\d{4}-\d{2}-\d{2})\b",
+            rf"\b(?P<value>{_DATE_SLASH_PATTERN})\b",
+            rf"\b(?P<value>{_RELATIVE_DATE_PATTERN})\b",
+        ),
+    )
+    return _normalize_restaurant_date_phrase(raw_value)
+
+
+def _extract_restaurant_venue_query(query: str) -> str:
+    patterns = (
+        rf"\bfor\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\s+at\s+(?P<value>[A-Za-z][A-Za-z0-9 .'\-&]+?)(?=\s+in\s+[A-Za-z0-9 .'-]+?(?:\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b)|\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b|\s+on\s+(?:{_RELATIVE_DATE_PATTERN}|{_MONTH_PATTERN}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}})\b|\s+at\s+\d|\s*,?\s*but\b|\s*$)",
+        rf"\bat\s+(?P<value>[A-Za-z][A-Za-z0-9 .'\-&]+?)(?=\s+in\s+[A-Za-z0-9 .'-]+?(?:\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b)|\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b|\s+on\s+(?:{_RELATIVE_DATE_PATTERN}|{_MONTH_PATTERN}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}})\b|\s+at\s+\d|\s*,?\s*but\b|\s*$)",
+        rf"\b(?:book|book me|reserve|secure a table at|make a reservation at|get me a table at)\s+(?P<value>.+?)(?=\s+in\s+[A-Za-z0-9 .'-]+?(?:\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b)|\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b|\s+on\s+(?:{_RELATIVE_DATE_PATTERN}|{_MONTH_PATTERN}|\d{{4}}-\d{{2}}-\d{{2}}|\d{{1,2}}/\d{{1,2}})\b|\s+at\s+\d|\s*$)",
+    )
+    return _search_query_segments(query, patterns)
+
+
 def _normalize_restaurant_booking_date(raw_date: str, *, settings: Settings) -> str:
-    value = raw_date.strip()
+    value = _normalize_restaurant_date_phrase(raw_date)
     if not value:
         return ""
     lowered = value.lower()
@@ -1486,12 +1724,55 @@ def _normalize_restaurant_booking_date(raw_date: str, *, settings: Settings) -> 
         current = datetime.now(timezone.utc)
     if lowered in {"today", "tonight"}:
         return current.date().isoformat()
+    if lowered in {"this morning", "this afternoon", "this evening"}:
+        return current.date().isoformat()
     if lowered == "tomorrow":
         return (current.date() + timedelta(days=1)).isoformat()
-    for fmt in ("%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%A, %B %d, %Y", "%A, %b %d, %Y"):
-        with_value = value
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    if lowered.startswith("next "):
+        weekday_name = _WEEKDAY_ALIASES.get(lowered.split(" ", 1)[1].strip(), "")
+        if weekday_name in weekdays:
+            delta = (weekdays[weekday_name] - current.weekday()) % 7
+            delta = 7 if delta == 0 else delta
+            return (current.date() + timedelta(days=delta)).isoformat()
+    if lowered.startswith("this "):
+        weekday_name = _WEEKDAY_ALIASES.get(lowered.split(" ", 1)[1].strip(), "")
+        if weekday_name in weekdays:
+            delta = (weekdays[weekday_name] - current.weekday()) % 7
+            return (current.date() + timedelta(days=delta)).isoformat()
+    weekday_name = _WEEKDAY_ALIASES.get(lowered, "")
+    if weekday_name in weekdays:
+        delta = (weekdays[weekday_name] - current.weekday()) % 7
+        return (current.date() + timedelta(days=delta)).isoformat()
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m/%d"):
         try:
-            return datetime.strptime(with_value, fmt).date().isoformat()
+            parsed = datetime.strptime(value, fmt)
+            if fmt == "%m/%d":
+                parsed = parsed.replace(year=current.year)
+                if parsed.date() < current.date():
+                    parsed = parsed.replace(year=current.year + 1)
+            return parsed.date().isoformat()
+        except ValueError:
+            continue
+    weekday_prefix_match = re.fullmatch(rf"(?P<weekday>{_WEEKDAY_PATTERN}),?\s+(?P<rest>{_MONTH_DAY_PATTERN})", value, flags=re.IGNORECASE)
+    if weekday_prefix_match:
+        parsed = _parse_month_day_date(weekday_prefix_match.group("rest"), current=current)
+        if parsed is not None:
+            return parsed.date().isoformat()
+    parsed = _parse_month_day_date(value, current=current)
+    if parsed is not None:
+        return parsed.date().isoformat()
+    for fmt in ("%Y-%m-%d",):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
             continue
     return value
@@ -1514,45 +1795,22 @@ def _extract_restaurant_booking_prefill(query: str, *, settings: Settings, routi
     if party_size is None:
         return None
 
-    time_match = re.search(r"\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lowered) or re.search(
-        r"\bat\s+(\d{1,2}:\d{2})\b",
-        lowered,
-    )
-    if not time_match:
+    time_value = _extract_restaurant_time_value(query)
+    if not time_value:
         return None
-    time_value = time_match.group(1).strip()
 
-    date_value = ""
-    date_patterns = (
-        r"\b(today|tomorrow|tonight)\b",
-        r"\b\d{4}-\d{2}-\d{2}\b",
-        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\b",
-        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\b",
-    )
-    for pattern in date_patterns:
-        match = re.search(pattern, lowered)
-        if match:
-            date_value = match.group(0)
-            break
+    date_value = _extract_restaurant_date_value(query)
     if not date_value:
         return None
 
-    city = ""
-    city_match = re.search(
-        r"\bin\s+([a-z0-9 .'-]+?)(?=\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b|\s+on\s+(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|\d{4}-\d{2}-\d{2})\b|\s+at\s+\d|\s*$)",
-        lowered,
-    )
-    if city_match:
-        city = city_match.group(1).strip(" ,.")
-
-    venue_query = query.strip()
-    venue_match = re.search(
-        r"\b(?:book|reserve|get me a table at|get me a table for|secure a table at|make a reservation at)\s+(.+?)(?=\s+in\s+[A-Za-z0-9 .'-]+?(?:\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b)|\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b|\s+on\s+(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|\d{4}-\d{2}-\d{2})\b|\s+at\s+\d|\s*$)",
+    city = _search_query_segments(
         query,
-        flags=re.IGNORECASE,
+        (
+            rf"\bin\s+(?P<value>[A-Za-z0-9 .'-]+?)(?=\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b|\s+on\s+(?:{_RELATIVE_DATE_PATTERN}|{_MONTH_PATTERN}|\d{{4}}-\d{{2}}-\d{{2}})\b|\s+at\s+\d|\s*,?\s*but\b|\s*$)",
+        ),
     )
-    if venue_match:
-        venue_query = venue_match.group(1).strip(" ,.")
+
+    venue_query = _extract_restaurant_venue_query(query)
     if not venue_query:
         return None
 
@@ -1561,6 +1819,56 @@ def _extract_restaurant_booking_prefill(query: str, *, settings: Settings, routi
         return None
     return RestaurantBookingPrefill(
         venue_query=venue_query,
+        city=city.title() if city else "",
+        provider=provider,
+        date=normalized_date,
+        time=time_value.upper(),
+        party_size=party_size,
+    )
+
+
+def _extract_restaurant_discovery_prefill(
+    query: str,
+    *,
+    settings: Settings,
+    routing_profile_name: str,
+) -> Optional[RestaurantDiscoveryPrefill]:
+    if routing_profile_name != "booking_commerce":
+        return None
+    if not _is_restaurant_discovery_request(query, routing_profile_name):
+        return None
+    lowered = query.lower()
+    provider = "resy" if "resy" in lowered else "opentable" if "opentable" in lowered else "resy"
+    party_size = _extract_party_size_value(query)
+    if party_size is None:
+        return None
+    time_value = _extract_restaurant_time_value(query)
+    if not time_value:
+        return None
+    date_value = _extract_restaurant_date_value(query)
+    if not date_value:
+        return None
+    city = _search_query_segments(
+        query,
+        (
+            rf"\b(?:near|in)\s+(?P<value>[A-Za-z0-9 .'-]+?)(?=\s+on\s+(?:resy|opentable)\b|\s+for\s+(?:\d+|{_NUMBER_WORD_PATTERN})\b|\s+for\s+(?:{_RELATIVE_DATE_PATTERN}|{_MONTH_PATTERN}|\d{{4}}-\d{{2}}-\d{{2}})\b|\s+(?:\d+|{_NUMBER_WORD_PATTERN})\s+(?:people|persons|person|guests)\b|\s+on\s+(?:{_RELATIVE_DATE_PATTERN}|{_MONTH_PATTERN}|\d{{4}}-\d{{2}}-\d{{2}})\b|\s+at\s+\d|\s*$)",
+        ),
+    )
+    search_query = query.strip()
+    search_match = re.search(
+        r"\b(?:find|show|list|suggest|recommend)(?:\s+me)?\s+(.+?)(?=\s+(?:near|in)\s+[A-Za-z0-9 .'-]+?(?:\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b)|\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b|\s+on\s+(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|\d{4}-\d{2}-\d{2})\b|\s+at\s+\d|\s*$)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if search_match:
+        search_query = search_match.group(1).strip(" ,.")
+    if not search_query:
+        return None
+    normalized_date = _normalize_restaurant_booking_date(date_value, settings=settings)
+    if not normalized_date:
+        return None
+    return RestaurantDiscoveryPrefill(
+        search_query=search_query,
         city=city.title() if city else "",
         provider=provider,
         date=normalized_date,
@@ -1625,6 +1933,14 @@ async def _restaurant_search_attempts(
     limit: int = 8,
     timeout_seconds: int = 25,
 ) -> list[RestaurantSearchAttempt]:
+    started_at = time.monotonic()
+    logger.warning(
+        "restaurant_search_attempts_start query=%s provider=%s city=%s limit=%s",
+        query,
+        provider,
+        city,
+        limit,
+    )
     attempts: list[RestaurantSearchAttempt] = []
     for provider_name in restaurant_provider_sequence(provider):
         try:
@@ -1653,7 +1969,47 @@ async def _restaurant_search_attempts(
                     error=str(exc),
                 )
             )
+    logger.warning(
+        "restaurant_search_attempts_complete query=%s provider=%s city=%s attempts=%s elapsed=%.2fs",
+        query,
+        provider,
+        city,
+        len(attempts),
+        max(0.0, time.monotonic() - started_at),
+    )
     return attempts
+
+
+async def _resolve_restaurant_venue_reference(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    venue_reference: str,
+    provider: str,
+    timeout_seconds: int = 25,
+) -> tuple[str, str, str, str]:
+    raw_reference = str(venue_reference or "").strip()
+    if not raw_reference:
+        return "", "", "", ""
+    if raw_reference.isdigit():
+        return raw_reference, "", "", ""
+    payload, best_match = await _restaurant_search_with_city_fallback(
+        settings=settings,
+        workspace=workspace,
+        query=raw_reference,
+        provider=provider,
+        city="",
+        limit=5,
+        timeout_seconds=timeout_seconds,
+    )
+    _ = payload
+    if not isinstance(best_match, dict):
+        return raw_reference, "", "", ""
+    resolved_id = str(best_match.get("id") or raw_reference).strip() or raw_reference
+    resolved_name = str(best_match.get("name") or raw_reference).strip()
+    resolved_city = str(best_match.get("city") or "").strip()
+    resolved_url = str(best_match.get("url") or "").strip()
+    return resolved_id, resolved_name, resolved_city, resolved_url
 
 
 def _render_restaurant_search_shortlist(
@@ -1696,12 +2052,129 @@ def _render_restaurant_search_shortlist(
     return sanitize_tool_output("\n".join(lines))
 
 
+def _restaurant_city_matches_request(requested_city: str, venue_city: str) -> bool:
+    requested = re.sub(r"[^a-z0-9]+", " ", requested_city.lower()).strip()
+    venue = re.sub(r"[^a-z0-9]+", " ", venue_city.lower()).strip()
+    if not requested or not venue:
+        return True
+    requested_tokens = {token for token in requested.split() if token}
+    venue_tokens = {token for token in venue.split() if token}
+    if requested_tokens & venue_tokens:
+        return True
+    nyc_tokens = {"nyc", "new", "york", "manhattan", "midtown", "brooklyn", "queens", "bronx"}
+    if requested_tokens & nyc_tokens and {"new", "york"} <= venue_tokens:
+        return True
+    return False
+
+
+def _normalize_restaurant_lookup_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _matching_booking_preflight_venue(
+    *,
+    query: str,
+    provider: str,
+    city: str = "",
+    prefill: Optional[RestaurantBookingPrefill],
+    preflight: Optional[RestaurantBookingPreflightResult],
+) -> Optional[RestaurantBookingPreflightVenue]:
+    if prefill is None or preflight is None or preflight.matched_venue is None:
+        return None
+    matched_venue = preflight.matched_venue
+    if normalize_restaurant_provider(provider) != normalize_restaurant_provider(matched_venue.provider):
+        return None
+    normalized_query = _normalize_restaurant_lookup_text(query)
+    candidate_values = {
+        _normalize_restaurant_lookup_text(prefill.venue_query),
+        _normalize_restaurant_lookup_text(matched_venue.venue_name),
+        _normalize_restaurant_lookup_text(matched_venue.venue_id),
+    }
+    candidate_values.discard("")
+    if normalized_query and candidate_values and not any(
+        normalized_query == candidate
+        or normalized_query in candidate
+        or candidate in normalized_query
+        for candidate in candidate_values
+    ):
+        return None
+    requested_city = city.strip()
+    if requested_city and prefill.city.strip():
+        if not (
+            _restaurant_city_matches_request(requested_city, matched_venue.venue_city)
+            or _restaurant_city_matches_request(requested_city, prefill.city)
+        ):
+            return None
+    return matched_venue
+
+
+async def _restaurant_find_availability_attempts(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    query: str,
+    provider: str,
+    city: str = "",
+    limit: int = 8,
+    timeout_seconds: int = 25,
+    booking_prefill: Optional[RestaurantBookingPrefill] = None,
+    booking_preflight: Optional[RestaurantBookingPreflightResult] = None,
+) -> list[RestaurantSearchAttempt]:
+    cached_venue = _matching_booking_preflight_venue(
+        query=query,
+        provider=provider,
+        city=city,
+        prefill=booking_prefill,
+        preflight=booking_preflight,
+    )
+    if cached_venue is not None:
+        logger.warning(
+            "restaurant_find_availability_using_preflight venue_query=%s venue_id=%s provider=%s city=%s",
+            query,
+            cached_venue.venue_id,
+            cached_venue.provider,
+            cached_venue.venue_city,
+        )
+        return [
+            RestaurantSearchAttempt(
+                provider=cached_venue.provider,
+                payload={
+                    "results": [
+                        {
+                            "id": cached_venue.venue_id,
+                            "name": cached_venue.venue_name,
+                            "city": cached_venue.venue_city,
+                            "url": cached_venue.venue_url,
+                        }
+                    ],
+                    "failures": [],
+                    "from_booking_preflight": True,
+                },
+                best_match={
+                    "id": cached_venue.venue_id,
+                    "name": cached_venue.venue_name,
+                    "city": cached_venue.venue_city,
+                    "url": cached_venue.venue_url,
+                },
+            )
+        ]
+    return await _restaurant_search_attempts(
+        settings=settings,
+        workspace=workspace,
+        query=query,
+        provider=provider,
+        city=city,
+        limit=limit,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _restaurant_booking_preflight(
     *,
     settings: Settings,
     workspace: Workspace,
     prefill: RestaurantBookingPrefill,
-) -> str:
+) -> RestaurantBookingPreflightResult:
     attempts = await _restaurant_search_attempts(
         settings=settings,
         workspace=workspace,
@@ -1711,7 +2184,7 @@ async def _restaurant_booking_preflight(
         limit=8,
         timeout_seconds=25,
     )
-    browser_probe_candidate: Optional[tuple[str, str, str, str, str]] = None
+    browser_probe_candidate: Optional[RestaurantBookingPreflightVenue] = None
     failure_lines: list[str] = []
     requested_time = prefill.time.lower().replace(" ", "")
     for attempt in attempts:
@@ -1729,11 +2202,18 @@ async def _restaurant_booking_preflight(
         venue_name = str(best_match.get("name") or prefill.venue_query).strip() or prefill.venue_query
         venue_city = str(best_match.get("city") or "").strip()
         venue_url = str(best_match.get("url") or "").strip()
+        matched_venue = RestaurantBookingPreflightVenue(
+            venue_id=venue_id,
+            venue_name=venue_name,
+            venue_city=venue_city,
+            venue_url=venue_url,
+            provider=normalized_provider,
+        )
         if not venue_id:
             failure_lines.append(f"{provider_label} matched {venue_name}, but returned no usable venue id.")
             continue
         if normalized_provider == "resy" and venue_url and browser_probe_candidate is None:
-            browser_probe_candidate = (venue_id, venue_name, venue_city, venue_url, normalized_provider)
+            browser_probe_candidate = matched_venue
         availability_args = [
             "availability",
             "--venue",
@@ -1836,41 +2316,138 @@ async def _restaurant_booking_preflight(
                         party_size=prefill.party_size,
                     )
                 )
-        return sanitize_tool_output("\n".join(lines))
+        return RestaurantBookingPreflightResult(
+            summary=sanitize_tool_output("\n".join(lines)),
+            matched_venue=matched_venue,
+        )
     if browser_probe_candidate is not None:
-        venue_id, venue_name, venue_city, venue_url, _provider_name = browser_probe_candidate
         probe = await _run_resy_browser_probe(
             settings=settings,
             workspace=workspace,
-            venue_url=venue_url,
-            venue_name=venue_name,
-            venue_city=venue_city,
+            venue_url=browser_probe_candidate.venue_url,
+            venue_name=browser_probe_candidate.venue_name,
+            venue_city=browser_probe_candidate.venue_city,
             date=prefill.date,
             time=prefill.time,
             party_size=prefill.party_size,
         )
         if probe is not None:
-            return _render_resy_browser_probe_summary(
-                probe,
-                venue_id=venue_id,
-                venue_name=venue_name,
-                venue_city=venue_city,
-                date=prefill.date,
-                time=prefill.time,
-                party_size=prefill.party_size,
+            return RestaurantBookingPreflightResult(
+                summary=_render_resy_browser_probe_summary(
+                    probe,
+                    venue_id=browser_probe_candidate.venue_id,
+                    venue_name=browser_probe_candidate.venue_name,
+                    venue_city=browser_probe_candidate.venue_city,
+                    date=prefill.date,
+                    time=prefill.time,
+                    party_size=prefill.party_size,
+                ),
+                matched_venue=browser_probe_candidate,
             )
     if failure_lines:
-        return sanitize_tool_output(
-            _restaurant_provider_browser_fallback_message(
-                provider=restaurant_provider_sequence(prefill.provider)[0],
-                venue_name=prefill.venue_query,
-                date=prefill.date,
-                party_size=prefill.party_size,
-                details="\n".join(failure_lines[:6]),
-            )
+        return RestaurantBookingPreflightResult(
+            summary=sanitize_tool_output(
+                _restaurant_provider_browser_fallback_message(
+                    provider=restaurant_provider_sequence(prefill.provider)[0],
+                    venue_name=prefill.venue_query,
+                    date=prefill.date,
+                    party_size=prefill.party_size,
+                    details="\n".join(failure_lines[:6]),
+                )
+            ),
+            matched_venue=browser_probe_candidate,
         )
-    return sanitize_tool_output(
-        f"RESTAURANT_PREFLIGHT_NO_MATCH: no structured venue match was found for {prefill.venue_query}."
+    return RestaurantBookingPreflightResult(
+        summary=sanitize_tool_output(
+            f"RESTAURANT_PREFLIGHT_NO_MATCH: no structured venue match was found for {prefill.venue_query}."
+        )
+    )
+
+
+async def _restaurant_discovery_preflight(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    prefill: RestaurantDiscoveryPrefill,
+) -> RestaurantDiscoveryPreflightResult:
+    try:
+        payload, best_match = await _restaurant_search_with_city_fallback(
+            settings=settings,
+            workspace=workspace,
+            query=prefill.search_query,
+            provider=prefill.provider,
+            city=prefill.city,
+            limit=4,
+            timeout_seconds=12,
+        )
+        attempts = [
+            RestaurantSearchAttempt(
+                provider=prefill.provider,
+                payload=payload if isinstance(payload, dict) else {"results": [], "failures": []},
+                best_match=best_match,
+            )
+        ]
+    except Exception as exc:
+        attempts = [
+            RestaurantSearchAttempt(
+                provider=prefill.provider,
+                payload={"results": [], "failures": []},
+                best_match=None,
+                error=str(exc),
+            )
+        ]
+    candidate_lines: list[str] = []
+    candidates: list[RestaurantDiscoveryCandidate] = []
+    for attempt in attempts:
+        payload = attempt.payload if isinstance(attempt.payload, dict) else {}
+        results = list(payload.get("results") or [])
+        filtered_results = [
+            item
+            for item in results
+            if _restaurant_city_matches_request(prefill.city, str(item.get("city") or ""))
+        ] or results
+        for item in filtered_results[:4]:
+            venue_id = str(item.get("id") or "").strip()
+            venue_name = str(item.get("name") or "").strip() or "Unknown venue"
+            venue_city = str(item.get("city") or "").strip()
+            venue_url = str(item.get("url") or "").strip()
+            candidates.append(
+                RestaurantDiscoveryCandidate(
+                    venue_id=venue_id,
+                    venue_name=venue_name,
+                    venue_city=venue_city,
+                    venue_url=venue_url,
+                    provider=attempt.provider,
+                )
+            )
+            candidate_lines.append(
+                "- "
+                + venue_name
+                + (f" ({venue_city})" if venue_city else "")
+                + f" | provider={attempt.provider} | venue_id={venue_id or '(missing)'}"
+            )
+        if candidate_lines:
+            break
+    rendered = _render_restaurant_search_shortlist(
+        query=prefill.search_query,
+        attempts=attempts,
+        city=prefill.city,
+        limit=4,
+    )
+    candidate_block = "Preflight candidates:\n" + ("\n".join(candidate_lines) if candidate_lines else "- none")
+    return RestaurantDiscoveryPreflightResult(
+        summary=(
+        "STRUCTURED_DISCOVERY_PREFLIGHT:\n"
+        f"Requested date: {prefill.date}\n"
+        f"Requested time: {prefill.time}\n"
+        f"Party size: {prefill.party_size}\n"
+        f"Preferred provider: {prefill.provider}\n"
+        + candidate_block
+        + "\n"
+        + rendered
+        + "\nUse these preflight candidates first. For live slot checks, prefer restaurant_availability with the listed venue_id instead of restaurant_find_availability with a candidate name. Do not run another broad restaurant search unless every candidate here fails the live slot check."
+        ),
+        candidates=tuple(candidates[:4]),
     )
 
 
@@ -1879,6 +2456,39 @@ def _select_model(query: str, settings: Settings) -> str:
     if any(token in lowered for token in ("think deeply", "reason", "plan carefully", "complex")):
         return settings.reasoner_model
     return settings.agent_model
+
+
+def _text_only_agent_result(text: str) -> SimpleNamespace:
+    return SimpleNamespace(text=sanitize_tool_output(text))
+
+
+def _render_restaurant_discovery_direct_response(
+    *,
+    prefill: RestaurantDiscoveryPrefill,
+    preflight: RestaurantDiscoveryPreflightResult,
+) -> str:
+    provider_label = _restaurant_provider_label(prefill.provider)
+    time_phrase = _render_requested_time_phrase(prefill.time)
+    lines = [
+        f"I found a few likely {provider_label} options for {max(1, prefill.party_size)} {time_phrase} on {prefill.date}.",
+    ]
+    if prefill.city:
+        lines[0] = (
+            f"I found a few likely {provider_label} options near {prefill.city} for {max(1, prefill.party_size)} {time_phrase} on {prefill.date}."
+        )
+    if not preflight.candidates:
+        lines.append(f"I couldn't find a clean shortlist yet for {prefill.search_query}.")
+        lines.append("Try another area, another cuisine, or a different provider.")
+        return sanitize_tool_output("\n".join(lines))
+    for candidate in preflight.candidates[:3]:
+        line = f"- {candidate.venue_name}"
+        if candidate.venue_city:
+            line += f" ({candidate.venue_city})"
+        if candidate.venue_id:
+            line += f" [venue {candidate.venue_id}]"
+        lines.append(line)
+    lines.append("If you want, I can check one of these first or try another area.")
+    return sanitize_tool_output("\n".join(lines))
 
 
 async def _run_travel_browser_fallback(
@@ -2035,6 +2645,73 @@ def _restaurant_browser_availability_task(
     )
 
 
+async def _restaurant_browser_availability_summary(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    venue_id: str,
+    venue_name: str,
+    venue_city: str,
+    venue_url: str,
+    provider: str,
+    date: str,
+    party_size: int,
+    requested_time: str = "",
+    strategy_mode: str = STRATEGY_API_DIRECT,
+) -> str:
+    normalized_provider = normalize_restaurant_provider(provider)
+    provider_label = _restaurant_provider_label(normalized_provider)
+    if normalized_provider == "resy" and venue_url:
+        probe = await _run_resy_browser_probe(
+            settings=settings,
+            workspace=workspace,
+            venue_url=venue_url,
+            venue_name=venue_name,
+            venue_city=venue_city,
+            date=date,
+            time=requested_time,
+            party_size=party_size,
+        )
+        if probe is not None:
+            return _render_resy_browser_probe_summary(
+                probe,
+                venue_id=venue_id,
+                venue_name=venue_name,
+                venue_city=venue_city,
+                date=date,
+                time=requested_time or "(not specified)",
+                party_size=party_size,
+            )
+    browser_booking_url = venue_url
+    if normalized_provider == "resy" and venue_url:
+        browser_booking_url = _build_resy_booking_page_url(
+            venue_url,
+            date=date,
+            party_size=max(1, party_size),
+        )
+    browser_summary = await _run_general_browser_task(
+        settings=settings,
+        workspace=workspace,
+        task=_restaurant_browser_availability_task(
+            booking_url=browser_booking_url,
+            venue_name=venue_name,
+            venue_city=venue_city,
+            provider_label=provider_label,
+            date=date,
+            party_size=max(1, party_size),
+        ),
+        max_pages=2,
+        max_steps=12,
+        strategy_mode=strategy_mode,
+    )
+    lines = [
+        f"Matched venue: {venue_name}" + (f" ({venue_city})" if venue_city else "") + f" on {provider_label}",
+        f"Booking page: {browser_booking_url}",
+        browser_summary.strip(),
+    ]
+    return sanitize_tool_output("\n".join(line for line in lines if line.strip()))
+
+
 def _render_user_query(
     query: str,
     *,
@@ -2136,6 +2813,8 @@ async def run_agent(
     allow_travel_browser_fallback = _should_expose_travel_browser_fallback(query, routing_profile.name) and strategy_mode != STRATEGY_API_DIRECT
     structured_restaurant_task = _is_structured_restaurant_task(query, routing_profile.name)
     missing_restaurant_booking_details = _restaurant_booking_missing_details(query, routing_profile.name)
+    prefill: Optional[RestaurantBookingPrefill] = None
+    booking_preflight: Optional[RestaurantBookingPreflightResult] = None
     effective_query = _render_user_query(
         query,
         settings=settings,
@@ -2153,6 +2832,20 @@ async def run_agent(
         strategy_note = strategy_guidance(strategy_mode)
         if strategy_note:
             effective_query += "\n\nExecution strategy:\n" + strategy_note
+        if structured_restaurant_task and not missing_restaurant_booking_details:
+            effective_query += (
+                "\n\nRestaurant execution directive:\n"
+                "This is a complete restaurant task. Start with the restaurant availability/search flow immediately. "
+                "Do not spend extra turns planning, narrating, or rephrasing the request before the first concrete tool call."
+            )
+        if structured_restaurant_task and strategy_mode != STRATEGY_API_DIRECT:
+            effective_query += (
+                "\n\nRestaurant fallback directive:\n"
+                "This restaurant run has already left the structured API_DIRECT lane. "
+                "Do not spend extra turns re-matching the same venue or retrying the same structured availability path. "
+                "Use the restaurant availability flow once to trigger the browser-backed provider path for the best venue match, "
+                "then summarize the concrete live result."
+            )
         _ensure_default_mailbox_identity(settings, store)
         if not _should_skip_booking_cancellation_precheck(
             query=query,
@@ -2177,16 +2870,78 @@ async def run_agent(
             )
         prefill = _extract_restaurant_booking_prefill(query, settings=settings, routing_profile_name=routing_profile.name)
         if prefill is not None and workspace is not None:
-            preflight_summary = await _restaurant_booking_preflight(
+            preflight_started_at = time.monotonic()
+            logger.warning(
+                "restaurant_booking_preflight_start venue_query=%s provider=%s city=%s date=%s time=%s party_size=%s",
+                prefill.venue_query,
+                prefill.provider,
+                prefill.city,
+                prefill.date,
+                prefill.time,
+                prefill.party_size,
+            )
+            booking_preflight = await _restaurant_booking_preflight(
                 settings=settings,
                 workspace=workspace,
                 prefill=prefill,
             )
+            logger.warning(
+                "restaurant_booking_preflight_complete venue_query=%s provider=%s elapsed=%.2fs",
+                prefill.venue_query,
+                prefill.provider,
+                max(0.0, time.monotonic() - preflight_started_at),
+            )
             effective_query += (
                 "\n\nStructured restaurant preflight:\n"
-                + preflight_summary
+                + booking_preflight.summary
                 + "\n\nStart from this preflight context. Do not spend extra turns re-matching the same venue before taking the next concrete action."
             )
+        discovery_prefill = _extract_restaurant_discovery_prefill(
+            query,
+            settings=settings,
+            routing_profile_name=routing_profile.name,
+        )
+        if prefill is None and discovery_prefill is not None and workspace is not None:
+            discovery_preflight_started_at = time.monotonic()
+            logger.warning(
+                "restaurant_discovery_preflight_start search_query=%s provider=%s city=%s date=%s time=%s party_size=%s",
+                discovery_prefill.search_query,
+                discovery_prefill.provider,
+                discovery_prefill.city,
+                discovery_prefill.date,
+                discovery_prefill.time,
+                discovery_prefill.party_size,
+            )
+            discovery_preflight = await _restaurant_discovery_preflight(
+                settings=settings,
+                workspace=workspace,
+                prefill=discovery_prefill,
+            )
+            logger.warning(
+                "restaurant_discovery_preflight_complete search_query=%s provider=%s elapsed=%.2fs",
+                discovery_prefill.search_query,
+                discovery_prefill.provider,
+                max(0.0, time.monotonic() - discovery_preflight_started_at),
+            )
+            if strategy_mode == STRATEGY_API_DIRECT:
+                return _text_only_agent_result(
+                    _render_restaurant_discovery_direct_response(
+                        prefill=discovery_prefill,
+                        preflight=discovery_preflight,
+                    )
+                )
+            effective_query += (
+                "\n\nStructured restaurant discovery kickoff:\n"
+                + discovery_preflight.summary
+                + "\n\nStart from this discovery context and continue directly to live slot checks or a concise shortlist. "
+                "Do not call another broad restaurant search while these preflight candidates remain usable."
+            )
+            if strategy_mode != STRATEGY_API_DIRECT:
+                effective_query += (
+                    "\n\nRestaurant discovery fallback directive:\n"
+                    "This retry run is already past API_DIRECT. Use only restaurant_availability with the venue_id values from the preflight candidates. "
+                    "Do not call restaurant_find_availability with candidate names in this run."
+                )
 
     deps = AgentDependencies(
         settings=settings,
@@ -2195,6 +2950,8 @@ async def run_agent(
         browser=BrowserSession(workspace=workspace, settings=settings) if mode == "heavy" else None,
         current_job=current_job,
         strategy_mode=strategy_mode,
+        restaurant_booking_prefill=prefill,
+        restaurant_booking_preflight=booking_preflight,
     )
     system_prompt = STATIC_SYSTEM_PROMPT
     if effective_config.agent_name.strip() and effective_config.agent_name.strip() != "Friday":
@@ -2512,7 +3269,7 @@ async def run_agent(
             ) -> str:
                 """Fetch live availability for a specific restaurant venue. Use restaurant_search first for cuisine discovery or multi-option venue research."""
                 assert ctx.deps.workspace is not None
-                attempts = await _restaurant_search_attempts(
+                attempts = await _restaurant_find_availability_attempts(
                     settings=ctx.deps.settings,
                     workspace=ctx.deps.workspace,
                     query=query,
@@ -2520,6 +3277,8 @@ async def run_agent(
                     city=city,
                     limit=limit,
                     timeout_seconds=25,
+                    booking_prefill=ctx.deps.restaurant_booking_prefill,
+                    booking_preflight=ctx.deps.restaurant_booking_preflight,
                 )
                 if _is_restaurant_discovery_request(query, "booking_commerce"):
                     return _render_restaurant_search_shortlist(
@@ -2563,36 +3322,19 @@ async def run_agent(
                                 f"{provider_label} matched {venue_name}, but there was no live booking page URL to inspect in {ctx.deps.strategy_mode} mode."
                             )
                             continue
-                        browser_booking_url = venue_url
-                        if normalized_provider == "resy":
-                            browser_booking_url = _build_resy_booking_page_url(
-                                venue_url,
-                                date=date,
-                                party_size=max(1, party_size),
-                            )
-                        browser_summary = await _run_general_browser_task(
+                        return await _restaurant_browser_availability_summary(
                             settings=ctx.deps.settings,
                             workspace=ctx.deps.workspace,
-                            task=_restaurant_browser_availability_task(
-                                booking_url=browser_booking_url,
-                                venue_name=venue_name,
-                                venue_city=venue_city,
-                                provider_label=provider_label,
-                                date=date,
-                                party_size=max(1, party_size),
-                            ),
-                            max_pages=2,
-                            max_steps=12,
+                            venue_id=venue_id,
+                            venue_name=venue_name,
+                            venue_city=venue_city,
+                            venue_url=venue_url,
+                            provider=normalized_provider,
+                            date=date,
+                            party_size=max(1, party_size),
+                            requested_time="",
                             strategy_mode=ctx.deps.strategy_mode,
                         )
-                        lines = [
-                            f"Matched venue: {venue_name}"
-                            + (f" ({venue_city})" if venue_city else "")
-                            + f" on {provider_label}",
-                            f"Booking page: {browser_booking_url}",
-                            browser_summary.strip(),
-                        ]
-                        return sanitize_tool_output("\n".join(line for line in lines if line.strip()))
                     availability_args = [
                         "availability",
                         "--venue",
@@ -2783,13 +3525,21 @@ async def run_agent(
                 party_size: int = 2,
                 provider: str = "resy",
             ) -> str:
-                """Look up restaurant reservation availability for a venue and date using restaurant-cli."""
+                """Look up restaurant reservation availability for a venue and date using a concrete venue id. Prefer this when discovery/preflight already provided a venue_id."""
                 assert ctx.deps.workspace is not None
                 normalized_provider = normalize_restaurant_provider(provider)
+                resolved_venue_id, resolved_venue_name, resolved_venue_city, resolved_venue_url = await _resolve_restaurant_venue_reference(
+                    settings=ctx.deps.settings,
+                    workspace=ctx.deps.workspace,
+                    venue_reference=venue_id,
+                    provider=normalized_provider,
+                    timeout_seconds=25,
+                )
+                venue_label = resolved_venue_name or f"venue {resolved_venue_id or venue_id}"
                 args = [
                     "availability",
                     "--venue",
-                    venue_id,
+                    resolved_venue_id or venue_id,
                     "--date",
                     date,
                     "--party",
@@ -2806,19 +3556,44 @@ async def run_agent(
                         timeout_seconds=35,
                     )
                 except Exception as exc:
-                    logger.warning("restaurant_availability degraded venue_id=%s provider=%s error=%s", venue_id, provider, exc)
+                    logger.warning(
+                        "restaurant_availability degraded venue_id=%s resolved_venue_id=%s provider=%s error=%s",
+                        venue_id,
+                        resolved_venue_id,
+                        provider,
+                        exc,
+                    )
+                    if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                        raise RuntimeError(
+                            "service unavailable: structured restaurant availability failed in api_direct mode. "
+                            f"provider={normalized_provider} venue={venue_label} venue_id={resolved_venue_id or venue_id} error={exc}"
+                        ) from exc
+                    if normalized_provider == "resy" and resolved_venue_url:
+                        browser_summary = await _resy_availability_browser_probe_summary(
+                            settings=ctx.deps.settings,
+                            workspace=ctx.deps.workspace,
+                            venue_id=resolved_venue_id or venue_id,
+                            venue_name=venue_label,
+                            venue_city=resolved_venue_city,
+                            venue_url=resolved_venue_url,
+                            date=date,
+                            party_size=party_size,
+                        )
+                        if browser_summary is not None:
+                            return browser_summary
                     if normalized_provider == "resy":
                         try:
                             policy_map = await fetch_resy_slot_policies(
                                 ctx.deps.settings,
-                                venue_id=venue_id,
+                                venue_id=resolved_venue_id or venue_id,
                                 date=date,
                                 party_size=max(1, party_size),
                             )
                         except Exception as policy_exc:
                             logger.warning(
-                                "restaurant_availability direct resy fallback failed venue_id=%s provider=%s error=%s",
+                                "restaurant_availability direct resy fallback failed venue_id=%s resolved_venue_id=%s provider=%s error=%s",
                                 venue_id,
+                                resolved_venue_id,
                                 provider,
                                 policy_exc,
                             )
@@ -2828,15 +3603,15 @@ async def run_agent(
                                     policy_map,
                                     date=date,
                                     party_size=party_size,
-                                    venue_name=f"venue {venue_id}",
-                                    venue_city="",
-                                    venue_url="",
+                                    venue_name=venue_label,
+                                    venue_city=resolved_venue_city,
+                                    venue_url=resolved_venue_url,
                                 )
                             )
                     return sanitize_tool_output(
                         _restaurant_provider_browser_fallback_message(
                             provider=normalized_provider,
-                            venue_name=f"venue {venue_id}",
+                            venue_name=venue_label,
                             date=date,
                             party_size=party_size,
                             details=f"Availability lookup failed because {exc}.",
@@ -3128,6 +3903,7 @@ async def run_agent(
                 scope = record.site_scope or "shared"
                 lines.append(f"- {record.identity_id[:8]} | {record.label} | {record.email} | {record.provider} | {scope}{default_marker}")
             return "\n".join(lines)
+
 
         @agent.tool
         async def list_saved_bookings(ctx: RunContext[AgentDependencies], limit: int = 10, active_only: bool = True) -> str:
@@ -3456,7 +4232,7 @@ async def run_agent(
                 f"Marked booking {updated.booking_id[:8]} for {updated.venue_name or updated.site_key} as cancelled."
             )
 
-        if workspace is not None:
+        if workspace is not None and not structured_restaurant_task:
 
             @agent.tool
             async def workspace_list_files(ctx: RunContext[AgentDependencies]) -> str:
@@ -3558,6 +4334,13 @@ async def run_agent(
                 return ctx.deps.workspace.workspace_snapshot()
 
     try:
+        logger.warning(
+            "agent_model_run_start mode=%s strategy_mode=%s routing_profile=%s structured_restaurant_task=%s",
+            mode,
+            strategy_mode,
+            routing_profile.name,
+            structured_restaurant_task,
+        )
         result = await _run_agent_with_model_retries(agent, effective_query, deps=deps)
     finally:
         if deps.browser is not None:

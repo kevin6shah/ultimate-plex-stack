@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 
-from app.heavy_job_runtime import progress_notification_text, progress_summary_for_step, status_summary_for_query
+from app.heavy_job_runtime import build_heavy_claim, progress_notification_text, progress_summary_for_step, status_summary_for_query
 from app.jobs import AgentJob, CheckpointPayload, JobSource, JobStatus, TaskClass
 from app.main import (
     _active_jobs_for_pairs_async,
@@ -688,6 +688,37 @@ def test_build_paused_input_resume_query_includes_new_input() -> None:
     assert "Find a restaurant and book it for me" in query
     assert "Two people at 7pm" in query
     assert "Do not ask the same question again" in query
+
+
+def test_build_heavy_claim_prefers_persisted_query_override() -> None:
+    job = AgentJob(
+        job_id="job-123",
+        source=JobSource.SIRI,
+        query="Book dinner tonight",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.RUNNING,
+        user_id="siri",
+        conversation_id="siri",
+        metadata={"query_override": "Book dinner tonight\n\nNew user input:\ntime: 7:30 PM"},
+    )
+
+    class FakeState:
+        def get_context_bundle(self, *, channel: str, user_id: str, conversation_id: str):
+            return ("", [], AgentConfig())
+
+        def list_memories(self, *, owner: str):
+            return []
+
+        def get_latest_checkpoint(self, job_id: str):
+            return None
+
+    claim = build_heavy_claim(
+        FakeState(),
+        SimpleNamespace(artifacts_bucket="bucket"),
+        job,
+    )
+
+    assert claim["job"]["query"] == "Book dinner tonight\n\nNew user input:\ntime: 7:30 PM"
 
 
 def test_humanize_worker_failure_for_worker_exit() -> None:

@@ -16,6 +16,7 @@ from app.agent_core import (
     _extract_party_size_value,
     _extract_resy_venue_note,
     _extract_restaurant_booking_prefill,
+    _extract_restaurant_discovery_prefill,
     _find_automation_policy,
     _handle_phase1_blocking_error,
     _is_booking_cancellation_followup,
@@ -249,6 +250,14 @@ def test_retryable_model_error_detects_deepseek_internal_error() -> None:
 
 def test_retryable_model_error_ignores_user_input_pause() -> None:
     exc = RuntimeError("I need party size before I can continue.")
+    assert _is_retryable_model_error(exc) is False
+
+
+def test_retryable_model_error_ignores_structured_restaurant_api_direct_failure() -> None:
+    exc = RuntimeError(
+        "service unavailable: structured restaurant availability failed in api_direct mode. "
+        "provider=resy venue=Indian Table venue_id=88720 error=500 Internal Server Error"
+    )
     assert _is_retryable_model_error(exc) is False
 
 
@@ -540,8 +549,177 @@ def test_extract_restaurant_booking_prefill_parses_explicit_resy_request() -> No
     assert prefill.party_size == 2
 
 
+def test_restaurant_booking_missing_details_accepts_flexible_time_language() -> None:
+    missing = _restaurant_booking_missing_details(
+        "Book the earliest available reservation tonight for 3 people at Angel Indian Restaurant on Resy, but only if it has free cancellation.",
+        "booking_commerce",
+    )
+
+    assert missing == []
+
+
+def test_extract_restaurant_booking_prefill_accepts_flexible_time_and_venue_after_party_size() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_booking_prefill(
+        "Book the earliest available reservation tonight for 3 people at Angel Indian Restaurant on Resy, but only if it has free cancellation.",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.venue_query == "Angel Indian Restaurant"
+    assert prefill.provider == "resy"
+    assert prefill.date == "2026-05-29"
+    assert prefill.time == "ANY AVAILABLE"
+    assert prefill.party_size == 3
+
+
+def test_extract_restaurant_booking_prefill_accepts_resumed_labeled_inputs() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_booking_prefill(
+        "Book the earliest available reservation tonight for 3 people at Angel Indian Restaurant on Resy, but only if it has free cancellation.\n\n"
+        "Resume the task from the prior paused-for-input checkpoint.\n\n"
+        "New user input:\nparty size: three\ndate: tomorrow\ntime: 2:30 AM\n\n"
+        "Continue from the saved workspace state. Do not ask the same question again unless the new input is still insufficient.",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.venue_query == "Angel Indian Restaurant"
+    assert prefill.date == "2026-05-30"
+    assert prefill.time == "2:30 AM"
+    assert prefill.party_size == 3
+
+
+def test_extract_restaurant_booking_prefill_accepts_slash_date_format() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_booking_prefill(
+        "Book Rubirosa on Resy for party size: 2 date: 05/30/2026 time: 7:30 PM",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.venue_query == "Rubirosa"
+    assert prefill.date == "2026-05-30"
+    assert prefill.time == "7:30 PM"
+    assert prefill.party_size == 2
+
+
+def test_extract_restaurant_booking_prefill_prefers_latest_resumed_inputs() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_booking_prefill(
+        "Book Rubirosa on Resy for 2 people tomorrow at 8 PM\n\n"
+        "Resume the task from the prior paused-for-input checkpoint.\n\n"
+        "New user input:\nparty size: four\ndate: 2026-05-31\ntime: 7:15 PM\n\n"
+        "Continue from the saved workspace state. Do not ask the same question again unless the new input is still insufficient.",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.venue_query == "Rubirosa"
+    assert prefill.date == "2026-05-31"
+    assert prefill.time == "7:15 PM"
+    assert prefill.party_size == 4
+
+
+def test_extract_restaurant_booking_prefill_accepts_ordinal_month_date_format() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_booking_prefill(
+        "Book Rubirosa on Resy for two people on May 31st, 2026 at 7 PM",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.venue_query == "Rubirosa"
+    assert prefill.date == "2026-05-31"
+    assert prefill.time == "7 PM"
+    assert prefill.party_size == 2
+
+
 def test_extract_party_size_value_accepts_number_words() -> None:
     assert _extract_party_size_value("find me restaurants tonight at 9:30 PM for three people") == 3
+
+
+def test_extract_restaurant_discovery_prefill_parses_complete_discovery_request() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_discovery_prefill(
+        "Find me an Indian restaurant on Resy near Midtown NYC for tonight at 8 PM for 3 people",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.search_query == "an Indian restaurant"
+    assert prefill.city == "Midtown Nyc"
+    assert prefill.provider == "resy"
+    assert prefill.time == "8 PM"
+    assert prefill.party_size == 3
+
+
+def test_extract_restaurant_discovery_prefill_accepts_flexible_time_language() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_discovery_prefill(
+        "Find me Indian restaurants on Resy near Midtown NYC for tomorrow any available time for two people",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.search_query == "Indian restaurants"
+    assert prefill.city == "Midtown Nyc"
+    assert prefill.provider == "resy"
+    assert prefill.time == "ANY AVAILABLE"
+    assert prefill.party_size == 2
+
+
+def test_render_restaurant_discovery_direct_response_lists_candidates() -> None:
+    prefill = agent_core.RestaurantDiscoveryPrefill(
+        search_query="an Indian restaurant",
+        city="Midtown NYC",
+        provider="resy",
+        date="2026-05-29",
+        time="8 PM",
+        party_size=3,
+    )
+    preflight = agent_core.RestaurantDiscoveryPreflightResult(
+        summary="STRUCTURED_DISCOVERY_PREFLIGHT",
+        candidates=(
+            agent_core.RestaurantDiscoveryCandidate(
+                venue_id="95147",
+                venue_name="Angel Indian Restaurant",
+                venue_city="New York",
+                venue_url="https://resy.com/cities/ny/angel-indian-restaurant",
+                provider="resy",
+            ),
+            agent_core.RestaurantDiscoveryCandidate(
+                venue_id="91940",
+                venue_name="Muna",
+                venue_city="New York",
+                venue_url="https://resy.com/cities/ny/muna",
+                provider="resy",
+            ),
+        ),
+    )
+
+    response = agent_core._render_restaurant_discovery_direct_response(
+        prefill=prefill,
+        preflight=preflight,
+    )
+
+    assert "near Midtown NYC" in response
+    assert "Angel Indian Restaurant" in response
+    assert "venue 95147" in response
+    assert "Muna" in response
+
+
+def test_restaurant_city_matches_request_handles_nyc_aliases() -> None:
+    assert agent_core._restaurant_city_matches_request("Midtown NYC", "New York") is True
+    assert agent_core._restaurant_city_matches_request("Midtown NYC", "Las Vegas") is False
+    assert agent_core._restaurant_city_matches_request("Flatiron Manhattan", "New York") is True
 
 
 def test_restaurant_discovery_request_overrides_stray_booking_words() -> None:
@@ -589,6 +767,41 @@ def test_extract_resy_venue_note_pulls_booking_window_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resy_availability_browser_probe_summary_uses_probe_result(monkeypatch) -> None:
+    async def fake_run_resy_browser_probe(**kwargs):
+        assert kwargs["venue_url"] == "https://resy.com/cities/ny/indian-table"
+        assert kwargs["date"] == "2026-05-29"
+        assert kwargs["party_size"] == 3
+        return agent_core.ResyBrowserProbeResult(
+            booking_url="https://resy.com/cities/ny/indian-table?date=2026-05-29&seats=3",
+            selected_exact_time_label="",
+            nearest_time_labels=("7:45 PM", "8:15 PM"),
+            visible_time_labels=("7:45 PM", "8:15 PM", "8:30 PM"),
+            venue_note="Reservations open up for dinner 14 days in advance via Resy.",
+            current_url="https://resy.com/cities/ny/indian-table?date=2026-05-29&seats=3",
+        )
+
+    monkeypatch.setattr(agent_core, "_run_resy_browser_probe", fake_run_resy_browser_probe)
+
+    summary = await agent_core._resy_availability_browser_probe_summary(
+        settings=Settings(),
+        workspace=object(),
+        venue_id="88720",
+        venue_name="Indian Table",
+        venue_city="New York",
+        venue_url="https://resy.com/cities/ny/indian-table",
+        date="2026-05-29",
+        party_size=3,
+    )
+
+    assert summary is not None
+    assert "BROWSER_RESY_PROBE:" in summary
+    assert "Venue id: 88720" in summary
+    assert "Live time options visible on the venue page:" in summary
+    assert "Reservations open up for dinner 14 days in advance via Resy." in summary
+
+
+@pytest.mark.asyncio
 async def test_restaurant_search_with_city_fallback_retries_without_city(monkeypatch) -> None:
     calls: list[list[str]] = []
 
@@ -624,6 +837,35 @@ async def test_restaurant_search_with_city_fallback_retries_without_city(monkeyp
     assert payload["city_filter_relaxed"] is True
     assert any("--city" in call for call in calls)
     assert any("--city" not in call for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_resolve_restaurant_venue_reference_uses_structured_search_for_nonnumeric_input(monkeypatch) -> None:
+    async def fake_search_with_city_fallback(**kwargs):
+        assert kwargs["query"] == "indian-table"
+        return (
+            {"results": []},
+            {
+                "id": "88720",
+                "name": "Indian Table",
+                "city": "New York",
+                "url": "https://resy.com/cities/ny/indian-table",
+            },
+        )
+
+    monkeypatch.setattr(agent_core, "_restaurant_search_with_city_fallback", fake_search_with_city_fallback)
+
+    resolved_id, resolved_name, resolved_city, resolved_url = await agent_core._resolve_restaurant_venue_reference(
+        settings=Settings(),
+        workspace=object(),
+        venue_reference="indian-table",
+        provider="resy",
+    )
+
+    assert resolved_id == "88720"
+    assert resolved_name == "Indian Table"
+    assert resolved_city == "New York"
+    assert resolved_url == "https://resy.com/cities/ny/indian-table"
 
 
 def test_render_resy_slot_policy_handles_missing_policy() -> None:

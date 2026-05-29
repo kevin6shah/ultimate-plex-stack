@@ -302,10 +302,11 @@ def build_heavy_claim(state: StateStore, settings: Settings, job: AgentJob, *, q
     memories = state.list_memories(owner=job.user_id or "siri")
     resume_checkpoint = state.get_latest_checkpoint(job.resume_from_job_id) if job.resume_from_job_id else None
     strategy_state = normalize_strategy_state((job.metadata or {}).get("strategy_state") or default_strategy_state())
+    metadata_query_override = str((job.metadata or {}).get("query_override") or "").strip()
     claim = {
         "job": {
             **job.model_dump(),
-            "query": query_override or job.query,
+            "query": query_override or metadata_query_override or job.query,
         },
         "attachments": [attachment.model_dump() for attachment in job.attachments],
         "context_summary": context_summary,

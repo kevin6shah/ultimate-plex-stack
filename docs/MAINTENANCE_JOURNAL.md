@@ -1,5 +1,127 @@
 # Maintenance Journal
 
+## 2026-05-29
+
+- Tightened restaurant booking preflight reuse so heavy runs can carry a concrete matched venue id/url forward instead of re-running a second structured venue search:
+  - added `RestaurantBookingPreflightResult` / `RestaurantBookingPreflightVenue`
+  - stored booking preflight state on `AgentDependencies`
+  - added `_restaurant_find_availability_attempts(...)` to reuse preflight venue matches when the later tool call is still about the same restaurant
+  - tolerated invented follow-up city values when the original user request did not specify a city
+- Extended regression coverage around the reuse path:
+  - preflight match reuse without a second search
+  - tolerance for bogus later cities when the original request had no city
+  - fallback back to real search when there is an actual city conflict
+- Reran the broader focused slice:
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests/test_agent_core_browser_fallback.py agent/tests/test_agent_core_phase1.py agent/tests/test_status_requests.py agent/tests/test_phase1_control_plane.py`
+  - `131 passed`
+- Deployed the newer restaurant-reliability images live:
+  - Lambda image `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260529-preflight-reuse-v2`
+  - dedicated worker rebuilt/restarted on `3.87.35.135`
+  - confirmed Lambda still configured for `HANDS_WORKER_MODE=dedicated_ec2`
+- Live validation on the Angel Resy booking case narrowed the remaining problem:
+  - `api_direct` now goes from preflight directly to `restaurant_availability` with `venue_id=91940`, proving the duplicate structured venue search was removed in that leg
+  - `stagehand_stealth_act` still sometimes starts with `restaurant_search` after the retry preflight, so the remaining gap is now specifically fallback-tool selection / prompting rather than preflight venue reuse itself
+  - stopped the validation run after capturing that signal and cleaned live state back to:
+    - `/worker/health` -> `{"active_jobs":[]}`
+    - `/context/recent` -> `{"contexts":[]}`
+- Continued from the earlier control-plane cleanup and widened the deterministic restaurant parser so booking/discovery inputs are less brittle across initial requests and resumed follow-ups:
+  - latest `New user input:` / `New user direction:` fields now take precedence over stale earlier text
+  - broader party-size parsing for digits and number words
+  - broader date parsing for labeled fields, weekday+month-name dates, slash dates, and ordinal month-day inputs
+  - broader time parsing for labeled fields, bare times, and flexible phrases like `any available time` / `earliest available`
+  - discovery prefill now accepts the flexible-time sentinel instead of dropping out of structured preflight
+- Persisted resumed/follow-up query text across Temporal retries so strategy switches keep the newest structured user input instead of falling back to the original request:
+  - `agent/app/heavy_job_runtime.py`
+  - `agent/app/temporal_control_activities.py`
+- Extended regression coverage and reran the focused local slice:
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests/test_agent_core_phase1.py agent/tests/test_status_requests.py agent/tests/test_phase1_control_plane.py`
+  - `121 passed`
+- Rebuilt and redeployed both control plane and dedicated worker on the intended topology:
+  - Lambda image:
+    - `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260529-booking-input-parser`
+  - Lambda config after deploy:
+    - `HANDS_WORKER_MODE=dedicated_ec2`
+    - `HANDS_WORKER_INSTANCE_ID=i-04cf5a5edd3b4aa35`
+    - `FRIDAY_EXECUTION_BACKEND=temporal`
+  - dedicated worker redeployed on `3.87.35.135`
+  - verified `friday-temporal-activity-worker.service` is active after the worker rebuild
+- Live booking-parser validation on the previously failing Resy flow:
+  - query:
+    - `Book the earliest available reservation tonight for 3 people at Angel Indian Restaurant on Resy, but only if it has free cancellation.`
+  - queued job id:
+    - `1c019428-e603-408a-b70b-278893ad2fc2`
+  - observed behavior:
+    - no `paused_for_input` for missing `time`
+    - `api_direct` hit the known Resy `500`
+    - Temporal retry switched to `stagehand_stealth_act`
+    - dedicated-worker logs confirmed the retry still carried `time=ANY AVAILABLE`, so the structured input was preserved across the strategy handoff
+  - stopped the run after capturing the regression signal and cleaned live state back to:
+    - `/worker/health` -> `{"active_jobs":[]}`
+    - `/context/recent` -> `{"contexts":[]}`
+- Live flexible-time discovery validation:
+  - query:
+    - `Find me Indian restaurants on Resy near Midtown NYC for tomorrow any available time for two people.`
+  - queued job id:
+    - `7ff5e280-f9a8-45a9-8905-fc36f5d27148`
+  - final result:
+    - completed in `api_direct`
+    - result preview started with:
+      - `I found a few likely Resy options near Midtown Nyc for 2 for any available time on 2026-05-30.`
+      - `INDIAN TABLE (New York) [venue 88720]`
+  - cleaned Siri + Telegram thread state afterward and confirmed:
+    - `/worker/health` -> `{"active_jobs":[]}`
+    - `/context/recent` -> `{"contexts":[]}`
+- Continued the restaurant-reliability branch from the mobile handoff and verified the focused local regression slice with:
+  - `/tmp/friday-agent-venv/bin/python -m pytest -q agent/tests/test_phase1_control_plane.py agent/tests/test_agent_core_phase1.py`
+  - `62 passed`
+- Found a concrete control-plane cleanup mismatch in live state:
+  - `/worker/health` returned `{"active_jobs":[]}`
+  - `/context/recent` still showed a Siri context row with a stale `active_heavy_job_id`
+- Fixed that mismatch locally by reconciling thread ownership during `/context/recent` reads:
+  - added `_parse_context_pk(...)`
+  - added `_recent_contexts_with_synced_active_jobs(...)`
+  - updated the `/context/recent` route to clear stale thread job pointers before returning rows
+- Added a regression test for that endpoint behavior so recent-context reads now clear completed-job pointers instead of surfacing misleading active ownership.
+- While cleaning live thread state, found that the documented Telegram cleanup shortcut used `telegram-owner` while the stored conversation id was actually the allowed Telegram chat id.
+- Fixed that admin-route mismatch locally:
+  - added `_thread_owner(...)`
+  - added `_normalized_thread_conversation_id(...)`
+  - normalized `telegram-owner` to the real allowed chat id in both `GET /threads/{conversation_id}` and `DELETE /threads/{conversation_id}`
+  - added a regression test for the alias path
+- Manually cleaned the live Siri and Telegram validation context after the checks:
+  - `DELETE /threads/siri?channel=siri&user_id=siri`
+  - `DELETE /threads/<telegram chat id>?channel=telegram`
+  - follow-up `/context/recent` returned `{"contexts":[]}`
+- Full `agent/tests` is still not a clean signal in this local venv because collection hits a pre-existing Temporal import problem:
+  - `ModuleNotFoundError: No module named 'temporalio.exceptions'; 'temporalio' is not a package`
+  - this appeared in `agent/tests/test_temporal_control_activities.py`
+  - the focused control-plane and restaurant slices passed, so the new branch work is locally verified where it changed behavior
+- Deployed the control-plane cleanup fixes live with:
+  - `AWS_PROFILE=iris AWS_REGION=us-east-1 HANDS_WORKER_MODE=shared_host SHARED_HOST_INSTANCE_ID=i-0263b221709dce545 TEMPORAL_ENABLED=true TEMPORAL_HOST=ec2-3-80-179-123.compute-1.amazonaws.com:7233 FRIDAY_EXECUTION_BACKEND=temporal EC2_SSH_KEY=/Users/kevinshah/.aws/keys/iris-migration-20260510.pem REMOTE_BUILD_HOST=3.87.35.135 IMAGE_TAG=20260529-control-plane-cleanup ./scripts/deploy-agent.sh`
+  - local Docker was still unavailable, so the deploy used the remote worker build fallback again
+  - image pushed and deployed:
+    - `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260529-control-plane-cleanup`
+- Post-deploy live validation:
+  - Lambda config updated at `2026-05-29T05:54:55+0000`
+  - `GET /worker/health` returned `{"active_jobs":[]}`
+  - `GET /context/recent` returned `{"contexts":[]}` before validation
+  - repeated the fast Siri restaurant-discovery validation:
+    - query: `Find me an Indian restaurant on Resy near Midtown NYC for tonight at 8 PM for 3 people, preferably with free cancellation.`
+    - queued job id: `c2ac26d5-5d0d-42b1-a31b-c3b5ae522d14`
+    - final DynamoDB job status: `completed`
+    - final preview again listed:
+      - `Angel Indian Restaurant (New York) [venue 91940]`
+      - `Muna Indian Restaurant (New York) [venue 95147]`
+  - verified the newly deployed cleanup behavior on live state:
+    - `/context/recent` showed both Siri and Telegram rows with `active_heavy_job_id: ""` after the completed run
+    - `DELETE /threads/telegram-owner?channel=telegram` removed the mirrored Telegram row after a short propagation delay
+    - `DELETE /threads/siri?channel=siri&user_id=siri` removed the Siri row
+    - final `/context/recent` returned `{"contexts":[]}`
+- Important live-state note:
+  - the deployed `friday-agent` Lambda configuration still has `HANDS_WORKER_MODE=shared_host`
+  - that does not match the current docs/handoff narrative that says heavy work is on the dedicated worker by default
+  - do not silently flip that topology in a routine code deploy; treat it as a separate architecture/runtime reconciliation item
+
 ## 2026-05-18
 
 - Started the first real Stagehand migration in repo instead of leaving it as a pure architecture note:

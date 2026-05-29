@@ -1252,6 +1252,48 @@ def _sync_thread_active_heavy_job(
     return None
 
 
+def _parse_context_pk(value: str) -> Optional[tuple[str, str, str]]:
+    parts = str(value or "").split("#", 3)
+    if len(parts) != 4 or parts[0] != "CTX":
+        return None
+    return parts[1], parts[2], parts[3]
+
+
+def _recent_contexts_with_synced_active_jobs(state: StateStore, limit: int = 20) -> list[dict[str, Any]]:
+    contexts = state.list_recent_contexts(limit=limit)
+    refreshed: list[dict[str, Any]] = []
+    for context in contexts:
+        item = dict(context)
+        active_job_id = str(item.get("active_heavy_job_id", "")).strip()
+        parsed_pk = _parse_context_pk(str(item.get("pk", "")))
+        if active_job_id and parsed_pk is not None:
+            channel, user_id, conversation_id = parsed_pk
+            thread_job = _sync_thread_active_heavy_job(
+                state,
+                channel=channel,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+            item["active_heavy_job_id"] = thread_job.job_id if thread_job is not None else ""
+        refreshed.append(item)
+    return refreshed
+
+
+def _thread_owner(channel: str, user_id: Optional[str]) -> str:
+    if user_id:
+        return user_id
+    if channel == "siri":
+        return "siri"
+    return settings.secret(settings.telegram_allowed_chat_id_param) or "unknown"
+
+
+def _normalized_thread_conversation_id(channel: str, conversation_id: str, owner: str) -> str:
+    normalized = str(conversation_id or "").strip()
+    if channel == "telegram" and normalized == "telegram-owner":
+        return owner
+    return normalized
+
+
 async def _preferred_latest_status_job_for_thread_async(
     state: StateStore,
     *,
@@ -2099,8 +2141,9 @@ async def get_thread_turns(
 ) -> dict[str, Any]:
     expected_key = settings.secret(settings.siri_api_key_param)
     _auth_or_401(expected_key, x_friday_siri_key)
-    owner = user_id or ("siri" if channel == "siri" else settings.secret(settings.telegram_allowed_chat_id_param) or "unknown")
-    turns = store().get_recent_turns(channel=channel, user_id=owner, conversation_id=conversation_id, limit=50)
+    owner = _thread_owner(channel, user_id)
+    normalized_conversation_id = _normalized_thread_conversation_id(channel, conversation_id, owner)
+    turns = store().get_recent_turns(channel=channel, user_id=owner, conversation_id=normalized_conversation_id, limit=50)
     return {"turns": [turn.model_dump() for turn in turns]}
 
 
@@ -2113,8 +2156,9 @@ async def delete_thread(
 ) -> dict[str, str]:
     expected_key = settings.secret(settings.siri_api_key_param)
     _auth_or_401(expected_key, x_friday_siri_key)
-    owner = user_id or ("siri" if channel == "siri" else settings.secret(settings.telegram_allowed_chat_id_param) or "unknown")
-    store().clear_thread(channel=channel, user_id=owner, conversation_id=conversation_id)
+    owner = _thread_owner(channel, user_id)
+    normalized_conversation_id = _normalized_thread_conversation_id(channel, conversation_id, owner)
+    store().clear_thread(channel=channel, user_id=owner, conversation_id=normalized_conversation_id)
     return {"status": "ok"}
 
 
@@ -2122,7 +2166,8 @@ async def delete_thread(
 async def recent_context(x_friday_siri_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
     expected_key = settings.secret(settings.siri_api_key_param)
     _auth_or_401(expected_key, x_friday_siri_key)
-    return {"contexts": store().list_recent_contexts()}
+    state = store()
+    return {"contexts": _recent_contexts_with_synced_active_jobs(state)}
 
 
 @app.get("/worker/health")
@@ -2188,12 +2233,7 @@ async def stop_job(job_id: str, x_friday_siri_key: Optional[str] = Header(defaul
     job = state.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER, JobStatus.WAITING_APPROVAL, JobStatus.PAUSED_FOR_INPUT}:
-        state.update_job_status(job_id, status=JobStatus.INTERRUPTED, current_step="stopped by user", error_message="stopped by user")
-        _clear_thread_active_heavy_job_if_matches(state, job)
-        return {"status": "ok"}
-    _clear_thread_active_heavy_job_if_matches(state, job)
-    state.record_control_signal(job_id, command=ControlCommand.STOP, note="stopped by user")
+    await _stop_jobs_async(state, [job])
     return {"status": "ok"}
 
 

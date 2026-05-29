@@ -129,7 +129,14 @@ async def prepare_heavy_job_resume_claim(job_id: str, reply_text: str) -> dict:
         raise _missing_job(job_id)
     checkpoint = state.get_latest_checkpoint(job_id)
     resumed_query = build_paused_input_resume_query(job, checkpoint, reply_text)
-    state.merge_job_metadata(job_id, {"strategy_state": default_strategy_state(), "last_strategy_error": None})
+    state.merge_job_metadata(
+        job_id,
+        {
+            "strategy_state": default_strategy_state(),
+            "last_strategy_error": None,
+            "query_override": resumed_query,
+        },
+    )
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="resuming task")
     refreshed_job = state.get_job(job_id) or job
     return build_heavy_claim(state, settings, refreshed_job, query_override=resumed_query)
@@ -143,7 +150,14 @@ async def prepare_heavy_job_followup_claim(job_id: str, followup_text: str) -> d
         raise _missing_job(job_id)
     checkpoint = state.get_latest_checkpoint(job_id)
     followup_query = build_contextual_heavy_followup_query(job, checkpoint, followup_text)
-    state.merge_job_metadata(job_id, {"strategy_state": default_strategy_state(), "last_strategy_error": None})
+    state.merge_job_metadata(
+        job_id,
+        {
+            "strategy_state": default_strategy_state(),
+            "last_strategy_error": None,
+            "query_override": followup_query,
+        },
+    )
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="updating task")
     refreshed_job = state.get_job(job_id) or job
     return build_heavy_claim(state, settings, refreshed_job, query_override=followup_query)
@@ -161,6 +175,7 @@ async def prepare_heavy_job_strategy_retry_claim(job_id: str, strategy_state: di
         {
             "strategy_state": normalized_strategy_state,
             "last_strategy_error": str(error_message or "")[:1000],
+            "query_override": str((job.metadata or {}).get("query_override") or "").strip() or None,
         },
     )
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="switching strategy")

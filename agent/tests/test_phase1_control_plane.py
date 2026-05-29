@@ -14,10 +14,13 @@ from fastapi.testclient import TestClient
 import app.main as main_module
 from app.jobs import (
     AutomationPolicyRecord,
+    AgentJob,
     BrowserSessionRecord,
     DashboardSessionRecord,
     IdentityRecord,
     IdentitySecretPointer,
+    JobSource,
+    JobStatus,
     MailboxVerificationWaitRecord,
     MailboxWatchState,
     PaymentProfileRecord,
@@ -76,6 +79,111 @@ def test_dashboard_auth_telegram_sets_signed_cookie(monkeypatch) -> None:
     assert response.headers["location"] == "/dashboard/jobs"
     assert created
     assert response.cookies.get("friday_dashboard_session")
+
+
+def test_stop_job_uses_async_stop_path(monkeypatch) -> None:
+    job = AgentJob(
+        job_id="job-123",
+        source=JobSource.SIRI,
+        query="Find me a restaurant",
+        task_class="heavy",
+        status=JobStatus.RUNNING,
+        user_id="siri",
+        conversation_id="siri",
+    )
+    calls: list[str] = []
+
+    class FakeStore:
+        def get_job(self, job_id: str):
+            assert job_id == "job-123"
+            return job
+
+    async def fake_stop_jobs_async(state, jobs):
+        calls.append(",".join(item.job_id for item in jobs))
+        return (1, 1)
+
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(main_module, "_stop_jobs_async", fake_stop_jobs_async)
+    monkeypatch.setattr(type(main_module.settings), "secret", lambda self, parameter_name: "test-key")
+
+    client = TestClient(main_module.app)
+    response = client.post("/jobs/job-123/stop", headers={"x-friday-siri-key": "test-key"})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert calls == ["job-123"]
+
+
+def test_recent_context_clears_stale_active_heavy_job_id(monkeypatch) -> None:
+    job = AgentJob(
+        job_id="job-123",
+        source=JobSource.SIRI,
+        query="Find me a restaurant",
+        task_class="heavy",
+        status=JobStatus.COMPLETED,
+        user_id="siri",
+        conversation_id="siri",
+    )
+    cleared: list[str] = []
+
+    class FakeStore:
+        def list_recent_contexts(self, limit: int = 20):
+            assert limit == 20
+            return [
+                {
+                    "pk": "CTX#siri#siri#siri",
+                    "summary": "summary",
+                    "updated_at": "2026-05-29T05:00:00+00:00",
+                    "task_class": "heavy",
+                    "active_heavy_job_id": "job-123",
+                }
+            ]
+
+        def get_active_heavy_job_id(self, *, channel: str, user_id: str, conversation_id: str):
+            assert channel == "siri"
+            assert user_id == "siri"
+            assert conversation_id == "siri"
+            return "job-123"
+
+        def get_job(self, job_id: str):
+            assert job_id == "job-123"
+            return job
+
+        def clear_active_heavy_job(self, *, channel: str, user_id: str, conversation_id: str, only_if_job_id: str | None = None):
+            cleared.append(f"{channel}:{user_id}:{conversation_id}:{only_if_job_id}")
+            return True
+
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(type(main_module.settings), "secret", lambda self, parameter_name: "test-key")
+
+    client = TestClient(main_module.app)
+    response = client.get("/context/recent", headers={"x-friday-siri-key": "test-key"})
+
+    assert response.status_code == 200
+    assert response.json()["contexts"][0]["active_heavy_job_id"] == ""
+    assert cleared == ["siri:siri:siri:job-123"]
+
+
+def test_delete_thread_normalizes_telegram_owner_alias(monkeypatch) -> None:
+    cleared: list[str] = []
+
+    class FakeStore:
+        def clear_thread(self, *, channel: str, user_id: str, conversation_id: str) -> None:
+            cleared.append(f"{channel}:{user_id}:{conversation_id}")
+
+    secret_values = {
+        main_module.settings.telegram_allowed_chat_id_param: "1106318894",
+    }
+    monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+    monkeypatch.setattr(main_module, "_auth_or_401", lambda expected_key, supplied_key: None)
+    monkeypatch.setattr(type(main_module.settings), "secret", lambda self, parameter_name: secret_values.get(parameter_name, ""))
+
+    client = TestClient(main_module.app)
+    response = client.delete("/threads/telegram-owner?channel=telegram", headers={"x-friday-siri-key": "test-key"})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert cleared == ["telegram:1106318894:1106318894"]
 
 
 def test_gmail_pubsub_ingress_signals_matching_wait(monkeypatch) -> None:
