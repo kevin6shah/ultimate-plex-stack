@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -11,7 +12,15 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi.testclient import TestClient
 
+fake_temporalio = types.ModuleType("temporalio")
+fake_temporalio.activity = types.SimpleNamespace(defn=lambda fn: fn)
+fake_temporalio_exceptions = types.ModuleType("temporalio.exceptions")
+fake_temporalio_exceptions.ApplicationError = RuntimeError
+sys.modules.setdefault("temporalio", fake_temporalio)
+sys.modules.setdefault("temporalio.exceptions", fake_temporalio_exceptions)
+
 import app.main as main_module
+import app.temporal_control_activities as control_activities
 from app.jobs import (
     AutomationPolicyRecord,
     AgentJob,
@@ -112,6 +121,83 @@ def test_stop_job_uses_async_stop_path(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert calls == ["job-123"]
+
+
+def test_stop_jobs_async_records_temporal_control_signal_note(monkeypatch) -> None:
+    job = AgentJob(
+        job_id="job-123",
+        source=JobSource.TELEGRAM,
+        query="Find me a restaurant",
+        task_class="heavy",
+        status=JobStatus.RUNNING,
+        user_id="telegram",
+        conversation_id="telegram",
+        metadata={"execution_backend": "temporal"},
+    )
+    signals: list[tuple[str, str]] = []
+    signal_calls: list[tuple[str, str]] = []
+
+    class FakeStore:
+        def update_job_status(self, *args, **kwargs):
+            return None
+
+        def clear_active_heavy_job(self, **kwargs):
+            return True
+
+        def record_control_signal(self, job_id: str, *, command, note: str = ""):
+            signals.append((job_id, note))
+            return None
+
+    async def fake_signal_stop_heavy_job(_settings, job_id: str, note: str = "") -> bool:
+        signal_calls.append((job_id, note))
+        return True
+
+    fake_temporal_client = types.ModuleType("app.temporal_client")
+    fake_temporal_client.signal_stop_heavy_job = fake_signal_stop_heavy_job
+    monkeypatch.setitem(sys.modules, "app.temporal_client", fake_temporal_client)
+
+    stopped_now, signaled = asyncio.run(
+        main_module._stop_jobs_async(
+            FakeStore(),
+            [job],
+            note="stopped to present current findings",
+        )
+    )
+
+    assert stopped_now == 1
+    assert signaled == 1
+    assert signals == [("job-123", "stopped to present current findings")]
+    assert signal_calls == [("job-123", "stopped to present current findings")]
+
+
+def test_stop_reason_from_control_signal_suppresses_superseded_followup_message() -> None:
+    class FakeSignal:
+        note = "superseded by newer follow-up"
+
+    class FakeStore:
+        def get_latest_control_signal(self, job_id: str):
+            assert job_id == "job-123"
+            return FakeSignal()
+
+    step, message = control_activities._stop_reason_from_control_signal(FakeStore(), "job-123")
+
+    assert step == "superseded by newer follow-up"
+    assert message == ""
+
+
+def test_stop_reason_from_control_signal_suppresses_present_findings_stop_message() -> None:
+    class FakeSignal:
+        note = "stopped to present current findings"
+
+    class FakeStore:
+        def get_latest_control_signal(self, job_id: str):
+            assert job_id == "job-123"
+            return FakeSignal()
+
+    step, message = control_activities._stop_reason_from_control_signal(FakeStore(), "job-123")
+
+    assert step == "stopped to present current findings"
+    assert message == ""
 
 
 def test_recent_context_clears_stale_active_heavy_job_id(monkeypatch) -> None:

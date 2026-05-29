@@ -11,6 +11,7 @@ from .heavy_job_runtime import (
     build_paused_input_resume_query,
     clean_user_facing_result,
     humanize_worker_failure,
+    interrupted_reply_text,
     paused_input_reply_text,
     record_job_assistant_turn,
     send_final_job_message,
@@ -55,14 +56,18 @@ def _stop_reason_from_control_signal(state: StateStore, job_id: str) -> tuple[st
     lowered = note.lower()
     if "stopped by user" in lowered:
         return ("stopped by user", "stopped by user")
+    if "stopped to present current findings" in lowered:
+        return ("stopped to present current findings", "")
+    if "superseded by newer follow-up" in lowered:
+        return ("superseded by newer follow-up", "")
     if "auto-stopped" in lowered or "no meaningful progress" in lowered or "stuck" in lowered:
         return (
             "auto-stopped after repeated identical steps",
-            "I stopped this run because it appeared stuck on the same step without meaningful progress. I kept the latest checkpoint.",
+            "I stopped this run because it appeared stuck on the same step without meaningful progress.",
         )
     return (
         "interrupted",
-        "I hit an interruption before that task finished. I kept the latest checkpoint.",
+        "I hit an interruption before that task finished.",
     )
 
 
@@ -268,12 +273,19 @@ async def finalize_heavy_job_failed(
         status = JobStatus.TIMED_OUT
     if status == JobStatus.INTERRUPTED:
         current_step, user_error = _stop_reason_from_control_signal(state, job_id)
+        if user_error:
+            user_error = interrupted_reply_text(
+                job,
+                state.get_latest_checkpoint(job_id),
+                lead=user_error,
+            )
     else:
         user_error = humanize_worker_failure(job.query, error_message, status)
         current_step = "failed"
     state.update_job_status(job_id, status=status, current_step=current_step, error_message=user_error)
-    record_job_assistant_turn(state, job, user_error)
-    if job.chat_id:
+    if user_error:
+        record_job_assistant_turn(state, job, user_error)
+    if job.chat_id and user_error:
         from .telegram import TelegramClient
 
         await TelegramClient(settings).send_message(job.chat_id, user_error)
@@ -287,7 +299,19 @@ async def finalize_heavy_job_stop(job_id: str) -> None:
     if job is None:
         return
     current_step, error_message = _stop_reason_from_control_signal(state, job_id)
+    if error_message:
+        error_message = interrupted_reply_text(
+            job,
+            state.get_latest_checkpoint(job_id),
+            lead=error_message,
+        )
     state.update_job_status(job_id, status=JobStatus.INTERRUPTED, current_step=current_step, error_message=error_message)
+    if error_message:
+        record_job_assistant_turn(state, job, error_message)
+        if job.chat_id:
+            from .telegram import TelegramClient
+
+            await TelegramClient(settings).send_message(job.chat_id, error_message)
     maybe_stop_dedicated_worker_if_idle(settings, state)
 
 

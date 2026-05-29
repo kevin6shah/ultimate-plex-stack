@@ -42,6 +42,55 @@ def clean_user_facing_result(text: str) -> str:
     return cleaned
 
 
+def has_useful_partial_findings(text: str) -> bool:
+    normalized = plain_text_message(text or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    generic_markers = (
+        "attachments downloaded",
+        "working through website steps",
+        "working through the task",
+        "running agent",
+        "workspace prepared",
+        "agent completed",
+        "interrupted: working through",
+        "checking reservation sources and matching the correct venue",
+        "checking live flight options and collecting candidate itineraries",
+        "collecting hotel candidates with live pricing and location details",
+    )
+    return not any(marker in lowered for marker in generic_markers)
+
+
+def partial_findings_text(job: AgentJob, checkpoint: Optional[CheckpointPayload]) -> str:
+    candidates = [
+        job.result_preview or "",
+        job.latest_checkpoint_summary or "",
+        checkpoint.summary if checkpoint else "",
+    ]
+    for candidate in candidates:
+        cleaned = clean_user_facing_result(candidate)
+        if has_useful_partial_findings(cleaned):
+            return cleaned[:1200]
+    return ""
+
+
+def interrupted_reply_text(
+    job: AgentJob,
+    checkpoint: Optional[CheckpointPayload],
+    *,
+    lead: str,
+    include_checkpoint_note: bool = True,
+) -> str:
+    findings = partial_findings_text(job, checkpoint)
+    if findings:
+        tail = "\n\nI kept the latest checkpoint." if include_checkpoint_note else ""
+        return f"{lead}\n\nCurrent findings:\n{findings}{tail}".strip()
+    if include_checkpoint_note:
+        return f"{lead} I kept the latest checkpoint.".strip()
+    return lead.strip()
+
+
 def humanize_worker_failure(query: str, error_message: str, status: JobStatus) -> str:
     normalized = clean_user_facing_result(error_message)
     lowered = normalized.lower()

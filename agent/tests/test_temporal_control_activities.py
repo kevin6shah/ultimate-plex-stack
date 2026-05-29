@@ -35,10 +35,24 @@ def test_stop_reason_uses_auto_stop_message_for_stall_signal() -> None:
     assert "appeared stuck" in error_message
 
 
+def test_stop_reason_suppresses_present_findings_interrupt_message() -> None:
+    state = SimpleNamespace(
+        get_latest_control_signal=lambda _job_id: ControlSignal(
+            command=ControlCommand.STOP,
+            note="stopped to present current findings",
+        )
+    )
+
+    current_step, error_message = _stop_reason_from_control_signal(state, "job-1")
+
+    assert current_step == "stopped to present current findings"
+    assert error_message == ""
+
+
 def test_stop_reason_defaults_to_generic_interrupted_without_signal() -> None:
     state = SimpleNamespace(get_latest_control_signal=lambda _job_id: None)
 
     current_step, error_message = _stop_reason_from_control_signal(state, "job-1")
 
     assert current_step == "interrupted"
-    assert "interrupted before it finished" in error_message
+    assert "interruption before that task finished" in error_message

@@ -17,6 +17,7 @@ from app.main import (
     _format_status_message,
     _format_tasks_list,
     _humanize_worker_failure,
+    _is_findings_request,
     _is_input_reply,
     _job_can_be_superseded_by_followup,
     _looks_like_booking_cancel_request,
@@ -90,6 +91,12 @@ def test_booking_cancel_detection_distinguishes_domain_action_from_task_stop() -
     assert not _looks_like_booking_cancel_request("cancel this task")
 
 
+def test_findings_request_detection_accepts_present_your_findings_now() -> None:
+    assert _is_findings_request("Okay present your findings now. You've been working on this for too long")
+    assert _is_findings_request("What do you have so far?")
+    assert not _is_findings_request("What's the status?")
+
+
 def test_format_status_message_for_running_job() -> None:
     job = AgentJob(
         source=JobSource.TELEGRAM,
@@ -135,6 +142,20 @@ def test_format_status_message_for_interrupted_job() -> None:
     assert "interrupted" in text
     assert "latest checkpoint" in text
     assert "stopped by you" not in text
+
+
+def test_format_status_message_for_interrupted_job_with_partial_findings() -> None:
+    job = AgentJob(
+        source=JobSource.TELEGRAM,
+        query="find me some fun parties in nyc tonight",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.INTERRUPTED,
+        latest_checkpoint_summary="RNB vs Slow Jams at Littlefield starts at 11 PM and is free before midnight.",
+    )
+    state = SimpleNamespace(get_latest_checkpoint=lambda _job_id: None)
+    text = _format_status_message(state, job)
+    assert "Current findings:" in text
+    assert "Littlefield" in text
 
 
 def test_humanize_worker_failure_for_non_user_interruption() -> None:

@@ -4,6 +4,19 @@ Current focus: reliability first, capability second.
 
 ## Latest update
 
+- Live control-plane image is now:
+  - `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260529-findings-handoff-v3`
+- Findings-request interruption cleanup is now live:
+  - `Okay present your findings now` stops the active heavy job and returns a single reply
+  - the old duplicate follow-up interruption message is gone
+  - validation on the Angel Resy booking task now leaves:
+    - one assistant findings reply
+    - `active_jobs: []`
+- Current gap on that path:
+  - if the run has not produced meaningful findings yet, the reply is still:
+    - `I do not have useful findings to share from that run yet.`
+  - this is cleaner than before, but the next quality pass should surface a better partial-progress summary when available
+
 - Live runtime is still on the dedicated worker and now on the newer restaurant-reliability images:
   - Lambda image: `301142908919.dkr.ecr.us-east-1.amazonaws.com/friday-agent:20260529-preflight-reuse-v2`
   - worker rebuilt and restarted on `3.87.35.135`

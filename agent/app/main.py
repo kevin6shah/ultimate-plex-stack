@@ -75,7 +75,12 @@ from .temporal_runtime import temporal_backend_enabled
 from .telegram import TelegramClient, parse_telegram_update
 from .worker_lifecycle import ensure_dedicated_worker_running as shared_ensure_dedicated_worker_running
 from .worker_lifecycle import maybe_stop_dedicated_worker_if_idle as shared_maybe_stop_dedicated_worker_if_idle
-from .heavy_job_runtime import progress_notification_text
+from .heavy_job_runtime import (
+    has_useful_partial_findings as _shared_has_useful_partial_findings,
+    interrupted_reply_text as _shared_interrupted_reply_text,
+    partial_findings_text as _shared_partial_findings_text,
+    progress_notification_text,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -989,6 +994,7 @@ async def _supersede_running_heavy_job(
     if uses_temporal:
         from .temporal_client import signal_stop_heavy_job
 
+        state.record_control_signal(job.job_id, command=ControlCommand.STOP, note=note)
         await signal_stop_heavy_job(settings, job.job_id, note)
         return
     state.record_control_signal(job.job_id, command=ControlCommand.STOP, note=note)
@@ -1134,35 +1140,28 @@ def _wants_findings_after_stop(query: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in patterns)
 
 
-def _has_useful_partial_findings(summary: str) -> bool:
-    normalized = _plain_text_message(summary or "").strip()
+def _is_findings_request(query: str) -> bool:
+    normalized = query.strip().lower()
     if not normalized:
         return False
-    lowered = normalized.lower()
-    generic_markers = (
-        "attachments downloaded",
-        "working through website steps",
-        "working through the task",
-        "running agent",
-        "workspace prepared",
-        "agent completed",
-        "interrupted: working through",
+    patterns = (
+        r"\bpresent\b.{0,30}\b(findings|results|what you found|what it found)\b",
+        r"\bwhat have you found\b",
+        r"\bwhat do you have so far\b",
+        r"\bcurrent findings\b",
+        r"\bshow\b.{0,30}\bwhat you found\b",
+        r"\bfindings so far\b",
     )
-    return not any(marker in lowered for marker in generic_markers)
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _has_useful_partial_findings(summary: str) -> bool:
+    return _shared_has_useful_partial_findings(summary)
 
 
 def _partial_findings_text(state: StateStore, job: AgentJob) -> str:
     checkpoint = state.get_latest_checkpoint(job.job_id)
-    candidates = [
-        job.result_preview or "",
-        job.latest_checkpoint_summary or "",
-        checkpoint.summary if checkpoint else "",
-    ]
-    for candidate in candidates:
-        cleaned = _clean_user_facing_result(candidate)
-        if _has_useful_partial_findings(cleaned):
-            return cleaned[:1200]
-    return ""
+    return _shared_partial_findings_text(job, checkpoint)
 
 
 def _resume_query_text(query: str, resumable: Optional[AgentJob]) -> str:
@@ -1795,7 +1794,12 @@ def _stop_jobs(state: StateStore, jobs: list[AgentJob]) -> tuple[int, int]:
     return stopped_now, signaled
 
 
-async def _stop_jobs_async(state: StateStore, jobs: list[AgentJob]) -> tuple[int, int]:
+async def _stop_jobs_async(
+    state: StateStore,
+    jobs: list[AgentJob],
+    *,
+    note: str = "stopped by user",
+) -> tuple[int, int]:
     stopped_now = 0
     signaled = 0
     for job in jobs:
@@ -1814,29 +1818,31 @@ async def _stop_jobs_async(state: StateStore, jobs: list[AgentJob]) -> tuple[int
             state.update_job_status(
                 job.job_id,
                 status=JobStatus.INTERRUPTED,
-                current_step="stopped by user",
-                error_message="stopped by user",
+                current_step=note,
+                error_message=note,
             )
             _clear_thread_active_heavy_job_if_matches(state, job)
             if uses_temporal:
                 from .temporal_client import signal_stop_heavy_job
 
-                signaled += 1 if await signal_stop_heavy_job(settings, job.job_id, "stopped by user") else 0
+                state.record_control_signal(job.job_id, command=ControlCommand.STOP, note=note)
+                signaled += 1 if await signal_stop_heavy_job(settings, job.job_id, note) else 0
             stopped_now += 1
         elif job.status == JobStatus.RUNNING:
             state.update_job_status(
                 job.job_id,
                 status=JobStatus.INTERRUPTED,
-                current_step="stopped by user",
-                error_message="stopped by user",
+                current_step=note,
+                error_message=note,
             )
             _clear_thread_active_heavy_job_if_matches(state, job)
             if uses_temporal:
                 from .temporal_client import signal_stop_heavy_job
 
-                signaled += 1 if await signal_stop_heavy_job(settings, job.job_id, "stopped by user") else 0
+                state.record_control_signal(job.job_id, command=ControlCommand.STOP, note=note)
+                signaled += 1 if await signal_stop_heavy_job(settings, job.job_id, note) else 0
             else:
-                state.record_control_signal(job.job_id, command=ControlCommand.STOP, note="stopped by user")
+                state.record_control_signal(job.job_id, command=ControlCommand.STOP, note=note)
                 signaled += 1
             stopped_now += 1
     return stopped_now, signaled
@@ -1854,16 +1860,22 @@ def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
         return f"I queued that task.{step_line}{summary_line}".strip()
     if job.status == JobStatus.RUNNING:
         if _checkpoint_indicates_interruption(summary):
-            tail = "\nI kept the latest checkpoint for the next follow-up."
-            return f"I hit an interruption while finishing that task.{step_line}{summary_line}{tail}".strip()
+            return _shared_interrupted_reply_text(
+                job,
+                checkpoint,
+                lead=f"I hit an interruption while finishing that task.{step_line}{summary_line}".strip(),
+            )
         return f"Still working on it.{step_line}{summary_line}".strip()
     if job.status == JobStatus.WAITING_APPROVAL:
         return f"I’m waiting for approval on that task.{step_line}{summary_line}".strip()
     if job.status == JobStatus.PAUSED_FOR_INPUT:
         return _paused_input_reply_text(state, job)
     if job.status in {JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT}:
-        tail = " I kept the latest checkpoint for the next follow-up."
-        return f"That task is {_humanize_status(job.status)}.{step_line}{summary_line}{tail}".strip()
+        return _shared_interrupted_reply_text(
+            job,
+            checkpoint,
+            lead=f"That task is {_humanize_status(job.status)}.{step_line}{summary_line}".strip(),
+        )
     if job.status == JobStatus.PAUSED_BUDGET:
         return f"That task is paused because of budget limits.{step_line}{summary_line}".strip()
     if job.status == JobStatus.COMPLETED:
@@ -3003,6 +3015,33 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
         await TelegramClient(settings).send_message(chat_id, reply)
         return {"status": "stop_requested"}
 
+    if query and latest_status_job is not None and _is_findings_request(query):
+        state.record_turn(
+            channel="telegram",
+            user_id=user_id,
+            conversation_id=conversation_id,
+            role=ThreadTurnRole.USER,
+            text=query,
+            task_class=TaskClass.LIGHT,
+        )
+        if latest_status_job.status in {JobStatus.RUNNING, JobStatus.WAITING_WORKER, JobStatus.QUEUED, JobStatus.WAITING_APPROVAL}:
+            await _stop_jobs_async(state, [latest_status_job], note="stopped to present current findings")
+        findings = _partial_findings_text(state, latest_status_job)
+        if findings:
+            reply = f"Here’s what I have so far:\n{findings}"
+        else:
+            reply = "I do not have useful findings to share from that run yet."
+        state.record_turn(
+            channel="telegram",
+            user_id=user_id,
+            conversation_id=conversation_id,
+            role=ThreadTurnRole.ASSISTANT,
+            text=reply,
+            task_class=TaskClass.LIGHT,
+        )
+        await TelegramClient(settings).send_message(chat_id, reply)
+        return {"status": "findings_reported"}
+
     paused_job = _latest_paused_input_job_for_pairs(state, owner_pairs)
     thread_active_job = _sync_thread_active_heavy_job(
         state,
@@ -3350,6 +3389,33 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
                             reply += "\n\nI do not have usable findings to show yet, but I will stop it."
                 else:
                     reply = "I do not see an active task to stop right now."
+        state.record_turn(
+            channel="siri",
+            user_id="siri",
+            conversation_id="siri",
+            role=ThreadTurnRole.ASSISTANT,
+            text=reply,
+            task_class=TaskClass.LIGHT,
+        )
+        await _mirror_siri_to_telegram(query, reply=reply, state=state, task_class=TaskClass.LIGHT)
+        return SiriResponse(response=reply)
+
+    if latest_status_job is not None and _is_findings_request(query):
+        state.record_turn(
+            channel="siri",
+            user_id="siri",
+            conversation_id="siri",
+            role=ThreadTurnRole.USER,
+            text=query,
+            task_class=TaskClass.LIGHT,
+        )
+        if latest_status_job.status in {JobStatus.RUNNING, JobStatus.WAITING_WORKER, JobStatus.QUEUED, JobStatus.WAITING_APPROVAL}:
+            await _stop_jobs_async(state, [latest_status_job], note="stopped to present current findings")
+        findings = _partial_findings_text(state, latest_status_job)
+        if findings:
+            reply = f"Here’s what I have so far:\n{findings}"
+        else:
+            reply = "I do not have useful findings to share from that run yet."
         state.record_turn(
             channel="siri",
             user_id="siri",
