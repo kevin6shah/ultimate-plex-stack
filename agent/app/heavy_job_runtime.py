@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from decimal import Decimal
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -15,6 +16,7 @@ from .artifacts import (
 from .jobs import AgentJob, CheckpointPayload, JobStatus, TaskClass, ThreadTurnRole
 from .settings import Settings
 from .storage import StateStore
+from .strategy_runtime import default_strategy_state, normalize_strategy_state
 from .telegram import TelegramClient
 
 
@@ -47,7 +49,7 @@ def humanize_worker_failure(query: str, error_message: str, status: JobStatus) -
     if status == JobStatus.INTERRUPTED:
         if "stopped by user" in lowered or "activity cancelled" in lowered or "activity canceled" in lowered:
             return "I stopped that task."
-        return "This task was interrupted before it finished. Say 'resume that task' if you want me to continue from the last checkpoint."
+        return "I hit an interruption before that task finished. I kept the latest checkpoint."
     if "worker exited without reporting a terminal state" in lowered:
         return "The worker stopped unexpectedly before the task finished."
     if "request_limit of 50" in lowered or "would exceed the request_limit" in lowered:
@@ -208,13 +210,13 @@ def progress_notification_text(job: AgentJob, *, current_step: str, summary: str
         attachments=bool(job.attachments),
         summary=summary,
     )
-    lines = ["Still working on your task."]
+    lines = ["Still working on it."]
     if cleaned_step:
-        lines.append(f"Current step: {cleaned_step}")
+        lines.append(f"Step: {cleaned_step}")
     if cleaned_summary:
-        lines.append(f"Latest progress: {cleaned_summary[:1000]}")
+        lines.append(f"Update: {cleaned_summary[:1000]}")
     else:
-        lines.append(f"Latest progress: {status_summary_for_query(job.query, attachments=bool(job.attachments))}")
+        lines.append(f"Update: {status_summary_for_query(job.query, attachments=bool(job.attachments))}")
     return "\n".join(lines)
 
 
@@ -235,26 +237,16 @@ def paused_input_reply_text(state: StateStore, job: AgentJob) -> str:
     question = plain_text_message(question)
     details = plain_text_message(details)
 
-    lines = ["Your latest task is paused and waiting for your input."]
+    lines = ["I need one thing before I continue."]
     if question:
-        lines.extend(["", "What I need:", question])
+        lines.append(question)
     if details:
-        lines.extend(["", "Details:", details])
-    status_lines: list[str] = []
+        lines.extend(["", details])
     if step:
-        status_lines.append(f"Current step: {step}")
+        lines.extend(["", f"Step: {step}"])
     if summary:
-        status_lines.append(f"Latest update: {summary}")
-    if status_lines:
-        lines.extend(["", "Status:"])
-        lines.extend(status_lines)
-    lines.extend(
-        [
-            "",
-            "Reply with 'answer: ...' to continue.",
-            "If you want to start something new instead, just ask normally.",
-        ]
-    )
+        lines.append(f"Update: {summary}")
+    lines.extend(["", "Reply normally with the missing detail.", "If you want something else instead, just ask."])
     return "\n".join(lines)
 
 
@@ -277,6 +269,30 @@ def build_paused_input_resume_query(
     return "\n\n".join(part for part in parts if part)
 
 
+def build_contextual_heavy_followup_query(
+    prior_job: AgentJob,
+    checkpoint: Optional[CheckpointPayload],
+    new_query: str,
+) -> str:
+    parts = [
+        prior_job.query.strip(),
+        "Continue the same task using the user's new follow-up.",
+    ]
+    if checkpoint is not None and checkpoint.summary.strip():
+        parts.append("Latest saved checkpoint:\n" + checkpoint.summary[:2000])
+    if checkpoint is not None and checkpoint.resume_instructions.strip():
+        parts.append("Resume instructions:\n" + checkpoint.resume_instructions[:3000])
+    normalized_query = new_query.strip()
+    if normalized_query:
+        parts.append("New user direction:\n" + normalized_query[:3000])
+    parts.append(
+        "Use the existing thread context and any saved workspace state. "
+        "Do not repeat stale results or repeat an older answer as if it were new. "
+        "If the user changed provider, cuisine, neighborhood, budget, venue, or booking constraints, rerun the live work with the new constraints."
+    )
+    return "\n\n".join(part for part in parts if part)
+
+
 def build_heavy_claim(state: StateStore, settings: Settings, job: AgentJob, *, query_override: Optional[str] = None) -> dict[str, Any]:
     context_summary, recent_turns, config = state.get_context_bundle(
         channel=job.source.value,
@@ -285,7 +301,8 @@ def build_heavy_claim(state: StateStore, settings: Settings, job: AgentJob, *, q
     )
     memories = state.list_memories(owner=job.user_id or "siri")
     resume_checkpoint = state.get_latest_checkpoint(job.resume_from_job_id) if job.resume_from_job_id else None
-    return {
+    strategy_state = normalize_strategy_state((job.metadata or {}).get("strategy_state") or default_strategy_state())
+    claim = {
         "job": {
             **job.model_dump(),
             "query": query_override or job.query,
@@ -296,9 +313,25 @@ def build_heavy_claim(state: StateStore, settings: Settings, job: AgentJob, *, q
         "durable_memories": memories,
         "resume_checkpoint": resume_checkpoint.model_dump() if resume_checkpoint else None,
         "config": config.model_dump(),
+        "strategy_state": strategy_state,
         "artifacts_bucket": settings.artifacts_bucket,
         "artifacts_prefix": f"jobs/{job.job_id}",
     }
+    return _json_safe(claim)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 async def send_final_job_message(

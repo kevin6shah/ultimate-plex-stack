@@ -12,6 +12,11 @@ Future Codex/Friday sessions should read this early and keep it current.
 
 ## Current Focus
 
+- P0 now: stabilize the base execution model before adding more capabilities:
+  - running-task ownership and follow-up attribution must feel conversational instead of command-like
+  - context assembly must be more reliable than today's summary-plus-recent-turn heuristic bundle
+  - stale/running/paused task cleanup must not depend on opportunistic status/list requests alone
+  - booking flows and account-gated flows need clean end-to-end validation before expanding provider surface area
 - P0 next: close the manual-verification gaps captured in `docs/FRIDAY_MANUAL_VERIFICATION_REPORT_2026-05-18.md` before calling Friday stable.
 - P1 next: extend the now-proven travel and pause/resume substrate into restaurant/account-gated flows instead of adding more browser-first hacks.
 - Use `docs/FRIDAY_CAPABILITIES_MATRIX.md` as the capability contract and backlog for what Friday is allowed to promise.
@@ -31,6 +36,11 @@ Future Codex/Friday sessions should read this early and keep it current.
 
 ## Operator Preferences
 
+- Only write durable memory when the operator explicitly asks for it:
+  - `#memory ...`
+  - `#remember ...`
+  - `remember this: ...`
+  - `add ... to your memory`
 - Do not send browser step screenshots to Telegram by default.
 - Do not improvise Friday heavy-worker rebuilds onto the shared Iris/VPN host without explicit operator approval after cost review.
 - Only send browser screenshots when the request explicitly asks for screenshots/images.
@@ -40,6 +50,25 @@ Future Codex/Friday sessions should read this early and keep it current.
 
 ## Accepted Backlog
 
+- Improve conversational task ownership and context continuity:
+  - follow-ups should attach to the right running or paused task without the user needing to say `resume`
+  - the agent should respond like it remembers what it is doing, not like a task router exposing internals
+  - reduce manual prompt stitching and heuristic follow-up resolution where possible
+- Keep capability expansion behind a reliability gate:
+  - prove booking flows
+  - prove cancel flows
+  - prove account-creation / OTP flows
+  - only then expand the provider surface area
+- Add a true background cleanup/reconciliation pass for stale heavy jobs and superseded paused tasks instead of relying mostly on opportunistic request-time cleanup.
+- Revisit the stop/stall model after base cleanup:
+  - the current stall thresholds may be too aggressive for some hostile sites
+  - but the deeper problem is weak progress semantics and weak recovery strategy, not just the numeric threshold
+- Treat booking/account creation validation as higher priority than net-new capabilities:
+  - restaurant availability research
+  - free-cancel booking
+  - cancel/rebook
+  - login/sign-up/OTP/account-creation pause-resume flows
+- Evaluate whether the heavy agent should receive broader tool/runtime freedom only after the base ownership, cleanup, and validation issues are fixed; more power without stronger orchestration will increase blast radius faster than usefulness.
 - Fix approval-gate false positives for harmless research/planning prompts:
   - hotel searches with `checkout`
   - architecture/tooling questions
@@ -104,7 +133,7 @@ Future Codex/Friday sessions should read this early and keep it current.
 ## Candidate Integrations To Evaluate, Not Assume
 
 - Maps / itinerary: only adopt if the connector or MCP is actively maintained, security-reviewable, and materially better than current deterministic wrappers.
-- Reservations: do not assume any specific OpenTable/Resy MCP is production-worthy until it is reviewed and tested in this stack.
+- Reservations: use `omarshahine/restaurant-cli` as the canonical structured provider path. Do not reintroduce legacy Resy MCP wiring.
 - Web extraction: hosted Firecrawl-style services may help, but they are candidates, not committed architecture.
 - Temporary/burner identity services are not approved by default and must go through the same security review as any other connector.
 - Gmail/email integrations should stay aligned with the active Gmail OAuth + Pub/Sub mailbox architecture unless a materially better event-driven option appears.
@@ -120,7 +149,7 @@ Future Codex/Friday sessions should read this early and keep it current.
 - Added a first routing-profile pass in code for spreadsheet/data, itinerary/maps, booking/commerce, and login/account tasks so the heavy prompt can steer toward the right tool class before browser fallback.
 - Added `docs/FRIDAY_CAPABILITIES_MATRIX.md` as the operator-visible capability contract and backlog.
 - Added `docs/FRIDAY_MCP_STACK_PLAN.md` plus `ops/mcp/docker-compose.trust-tiers.yml` to capture the tiered isolation harness direction for MCPs/connectors.
-- Wired Firecrawl, cablate Google Maps, Google Maps OpenAPI, Resy, OpenTable, and Gmail MCP candidate hooks into the repo worker path behind settings/secrets, pending deployment and live validation.
+- Wired Firecrawl, cablate Google Maps, Google Maps OpenAPI, OpenTable, and Gmail MCP candidate hooks into the repo worker path behind settings/secrets, pending deployment and live validation.
 - Added Skiplagged MCP runtime wiring through `mcp-remote` so flights/hotels/rental cars can move off brittle browser-first flows.
 - Restored the proper dedicated Friday on-demand worker and proved live Skiplagged flights, hotels, and rental cars through the Siri -> worker path.
 - Deployed the cleaned-up paused-input/status UX so blocked tasks now ask for missing details in readable sections instead of raw/internal-looking status text.

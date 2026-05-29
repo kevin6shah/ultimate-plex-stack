@@ -16,7 +16,7 @@ class TaskRoutingProfile:
 LONG_TASK_PATTERNS = (
     r"\b(browser|browse|research|compare|book|buy|order|reserve|apply|fill out)\b",
     r"\b(login|account|website|web site|form|checkout|cart)\b",
-    r"\b(reservation|reservations|availability|available|booking|bookings|restaurant)\b",
+    r"\b(reservation|reservations|availability|availabilities|available|booking|bookings|restaurants?|dinner|lunch|brunch|breakfast|cuisine|cuisines)\b",
     r"\b(itinerary|travel plan|trip plan|route|directions|google maps|map out)\b",
     r"\b(deep dive|investigate|audit|debug|deploy|migrate|scrape)\b",
     r"\b(monitor|track|watch for|keep checking)\b",
@@ -24,7 +24,7 @@ LONG_TASK_PATTERNS = (
 HEAVY_TASK_PATTERNS = (
     r"\b(browser|browse|website|web site|login|account|form|checkout|click|upload|download)\b",
     r"\b(compare|research|deep dive|investigate|audit|scrape|debug|deploy|migrate)\b",
-    r"\b(reservation|reservations|availability|available|booking|bookings|restaurant)\b",
+    r"\b(reservation|reservations|availability|availabilities|available|booking|bookings|restaurants?|dinner|lunch|brunch|breakfast|cuisine|cuisines)\b",
     r"\b(csv|xlsx|spreadsheet|excel|pdf|document|attachment|file|image)\b",
     r"\b(itinerary|travel plan|trip plan|route|directions|google maps|map out|places to visit)\b",
     r"\b(run python|run shell|script|workspace|artifact)\b",
@@ -36,7 +36,7 @@ LIVE_WEB_PATTERNS = (
     r"\b(weather|forecast|headline|news|price|stock|score|status)\b",
     r"\b(browser|browse|website|web site|login|account|form|checkout)\b",
     r"\b(research|compare|search the web|search online|look on the web)\b",
-    r"\b(reservation|reservations|availability|available|booking|bookings|restaurant)\b",
+    r"\b(reservation|reservations|availability|available|booking|bookings|restaurants?|dinner|lunch|brunch|breakfast|cuisine|cuisines)\b",
     r"\b(itinerary|travel plan|trip plan|route|directions|google maps|map out)\b",
 )
 
@@ -50,8 +50,8 @@ ITINERARY_MAPS_PATTERNS = (
     r"\b(flight|flights|airfare|hotel|hotels|rental car|rental cars|car rental|car rentals|google flights|google travel|skiplagged)\b",
 )
 BOOKING_COMMERCE_PATTERNS = (
-    r"\b(book|booking|reserve|reservation|availability|available)\b",
-    r"\b(restaurant|hotel|flight|flights|table|tickets|ticket)\b",
+    r"\b(book|booking|reserve|reservation|availability|availabilities|available|free cancellation)\b",
+    r"\b(restaurants?|hotel|flight|flights|table|tickets|ticket|dinner|lunch|brunch|breakfast|cuisine|cuisines)\b",
     r"\b(buy|purchase|order|checkout|cart)\b",
 )
 LOGIN_ACCOUNT_PATTERNS = (
@@ -87,7 +87,7 @@ BOOKING_COMMERCE_PROFILE = TaskRoutingProfile(
     summary="This is a booking, reservation, or commerce task.",
     instructions=(
         "Prefer a vetted connector or deterministic availability research first.",
-        "For restaurant reservation work, prefer structured restaurant tools with Resy first for search, availability, and booking. Only use OpenTable when explicitly requested or for a manual handoff URL.",
+        "For restaurant reservation work, prefer structured restaurant tools with Resy first, then OpenTable, and only then a browser fallback for verification or interaction.",
         "For flights, hotels, and cars, prefer structured travel tools over opening aggregator websites.",
         "Use Browser-use only for the interaction or confirmation step when a deterministic path is insufficient.",
         "Pause for input or approval instead of improvising risky commits.",

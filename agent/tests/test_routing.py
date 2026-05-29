@@ -36,10 +36,25 @@ def test_task_routing_profile_detection() -> None:
     assert task_routing_profile("build me a spreadsheet of flight prices").name == "spreadsheet_data"
     assert task_routing_profile("plan a two day itinerary in Montreal").name == "itinerary_maps"
     assert task_routing_profile("find me a dinner reservation for Friday").name == "booking_commerce"
+    assert task_routing_profile("find me Indian restaurants for 8 PM tonight").name == "booking_commerce"
     assert task_routing_profile("find hotels in Chicago for June 5 to June 7").name == "itinerary_maps"
     assert task_routing_profile("find rental cars in Chicago for next weekend").name == "itinerary_maps"
     assert task_routing_profile("sign up for the site with a new account").name == "login_account"
     assert task_routing_profile("summarize this article for me").name == "general"
+
+
+def test_plural_restaurants_request_is_heavy() -> None:
+    assert classify_task("find me Indian restaurants for 8 PM tonight") == TaskClass.HEAVY
+
+
+def test_availabilities_plural_request_is_heavy() -> None:
+    assert classify_task("what cuisines have the most availabilities for 10:30 tonight") == TaskClass.HEAVY
+
+
+def test_dinner_discovery_request_is_heavy() -> None:
+    query = "Okay switch gears find me for dinner Indian tomorrow at 7:30pm instead - free cancellation"
+    assert classify_task(query) == TaskClass.HEAVY
+    assert task_routing_profile(query).name == "booking_commerce"
 
 
 def test_browser_tools_hidden_for_structured_travel_and_booking() -> None:

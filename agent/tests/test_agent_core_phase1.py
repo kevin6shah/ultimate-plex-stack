@@ -2,22 +2,38 @@ from __future__ import annotations
 
 import pytest
 
+import app.agent_core as agent_core
 from app.agent_core import (
+    OpenTablePolicyAssessment,
     PauseForInputRequested,
+    _assess_opentable_policy_text,
     _booking_choice_pause_payload,
+    _build_resy_booking_page_url,
     _canonical_booking_site_key,
+    _direct_tool_mode_summary,
     _ensure_default_mailbox_identity,
     _enforce_automation_policy,
+    _extract_party_size_value,
+    _extract_resy_venue_note,
+    _extract_restaurant_booking_prefill,
     _find_automation_policy,
     _handle_phase1_blocking_error,
     _is_booking_cancellation_followup,
     _is_booking_replacement_request,
+    _is_restaurant_discovery_request,
     _is_retryable_model_error,
     _maybe_raise_booking_cancellation_pause,
+    _maybe_raise_nonfree_opentable_confirmation,
     _maybe_raise_nonfree_resy_confirmation,
     _raise_restaurant_provider_unavailable_pause,
+    _restaurant_provider_browser_fallback_message,
     _restaurant_booking_missing_details,
+    _phase1_booking_runtime_guidance,
+    _opentable_requires_login_gate,
+    _restaurant_search_with_city_fallback,
+    _render_clock_label,
     _render_resy_slot_policy,
+    _select_resy_time_option_labels,
     _should_skip_booking_cancellation_precheck,
     _should_expose_browser_tools,
 )
@@ -96,6 +112,21 @@ def test_ensure_default_mailbox_identity_reuses_existing_record() -> None:
 
     assert identity == existing
     assert store.created == []
+
+
+def test_opentable_requires_login_gate_ignores_generic_header_sign_in() -> None:
+    text = "Sign in 1 Find a table 2 Add your details Reservation at Karma Modern Indian"
+    assert _opentable_requires_login_gate(text) is False
+
+
+def test_opentable_requires_login_gate_detects_actual_auth_wall() -> None:
+    text = "Sign in to continue Enter your email Continue with email"
+    assert _opentable_requires_login_gate(text) is True
+
+
+def test_render_clock_label_normalizes_to_twelve_hour_time() -> None:
+    assert _render_clock_label("19:30") == "7:30 PM"
+    assert _render_clock_label("7:15 pm") == "7:15 PM"
 
 
 def test_find_automation_policy_prefers_exact_site_and_category() -> None:
@@ -356,6 +387,8 @@ def test_nonfree_resy_policy_requires_manual_confirmation() -> None:
         _maybe_raise_nonfree_resy_confirmation(
             policy,
             venue_id="73231",
+            venue_name="Junoon",
+            venue_city="New York",
             date="2026-05-26",
             time="21:00",
             party_size=2,
@@ -363,6 +396,8 @@ def test_nonfree_resy_policy_requires_manual_confirmation() -> None:
 
     assert excinfo.value.current_step == "waiting_for_confirmation"
     assert "not free to cancel" in excinfo.value.question.lower()
+    assert "Junoon (New York)" in excinfo.value.question
+    assert "Venue: Junoon (New York)" in excinfo.value.details
     assert "$45.00" in excinfo.value.details
 
 
@@ -371,6 +406,8 @@ def test_unknown_resy_policy_requires_manual_confirmation() -> None:
         _maybe_raise_nonfree_resy_confirmation(
             None,
             venue_id="82481",
+            venue_name="Indian Table",
+            venue_city="Brooklyn",
             date="2026-05-26",
             time="21:00",
             party_size=2,
@@ -378,6 +415,8 @@ def test_unknown_resy_policy_requires_manual_confirmation() -> None:
 
     assert excinfo.value.current_step == "waiting_for_confirmation"
     assert "could not verify" in excinfo.value.question.lower()
+    assert "Indian Table (Brooklyn)" in excinfo.value.question
+    assert "Venue: Indian Table (Brooklyn)" in excinfo.value.details
     assert "Cancellation policy: unavailable" in excinfo.value.details
 
 
@@ -395,6 +434,196 @@ def test_restaurant_provider_unavailable_raises_pause() -> None:
     assert excinfo.value.current_step == "provider_unavailable"
     assert "try another time" in excinfo.value.question.lower()
     assert "Booking page: https://resy.com/cities/ny/rubirosa" in excinfo.value.details
+
+
+def test_restaurant_provider_browser_fallback_message_instructs_browser_verification() -> None:
+    message = _restaurant_provider_browser_fallback_message(
+        provider="resy",
+        venue_name="Rubirosa (New York)",
+        date="2026-05-26",
+        party_size=2,
+        details="The provider returned repeated errors while checking live availability.",
+        venue_url="https://resy.com/cities/ny/rubirosa",
+    )
+
+    assert message.startswith("RESTAURANT_TOOL_UNAVAILABLE:")
+    assert "hardened browser fallback" in message
+    assert "verify live slots and cancellation policy directly before booking" in message
+    assert "Booking page: https://resy.com/cities/ny/rubirosa" in message
+
+
+def test_direct_tool_mode_summary_allows_browser_after_restaurant_provider_failure() -> None:
+    summary = _direct_tool_mode_summary(
+        "Book Rubirosa on Resy for 2 people tomorrow at 7pm",
+        "booking_commerce",
+    )
+
+    assert "try opentable next" in summary.lower()
+    assert "use the hardened browser fallback" in summary.lower()
+    assert "only pause with provider_unavailable after the browser fallback also fails" in summary.lower()
+
+
+def test_direct_tool_mode_summary_keeps_restaurant_discovery_in_search_mode() -> None:
+    summary = _direct_tool_mode_summary(
+        "Find me Indian restaurants for 8 PM tonight",
+        "booking_commerce",
+    )
+
+    assert "restaurant discovery task" in summary.lower()
+    assert "use restaurant_search first" in summary.lower()
+    assert "Do not call restaurant_book_or_handoff yet." in summary
+
+
+def test_phase1_booking_guidance_for_complete_restaurant_request_starts_with_availability() -> None:
+    guidance = _phase1_booking_runtime_guidance(
+        "Book Rubirosa in New York City on Resy for 2 people on 2026-05-27 at 11:00 AM",
+        "booking_commerce",
+    )
+
+    assert "start immediately with one restaurant_find_availability call" in guidance
+    assert "try opentable next before falling back to browser verification" in guidance.lower()
+
+
+def test_assess_opentable_policy_text_marks_free_cancellation() -> None:
+    assessment = _assess_opentable_policy_text(
+        "Reserve now. Free cancellation up to 24 hours before your reservation."
+    )
+
+    assert assessment.free_cancellation is True
+    assert assessment.requires_manual_confirmation is False
+
+
+def test_assess_opentable_policy_text_marks_unknown_as_manual_confirmation() -> None:
+    assessment = _assess_opentable_policy_text("Reserve now. Table for 2 at 7:30 PM.")
+
+    assert assessment.free_cancellation is False
+    assert assessment.requires_manual_confirmation is True
+
+
+def test_nonfree_opentable_policy_requires_manual_confirmation() -> None:
+    assessment = OpenTablePolicyAssessment(
+        free_cancellation=False,
+        requires_manual_confirmation=True,
+        policy_text="Cancellation policy: deposit required",
+    )
+
+    with pytest.raises(PauseForInputRequested) as excinfo:
+        _maybe_raise_nonfree_opentable_confirmation(
+            assessment,
+            venue_id="1046758",
+            venue_name="Carbone",
+            venue_city="New York",
+            date="2026-05-27",
+            time="7:30 PM",
+            party_size=2,
+            booking_url="https://www.opentable.com/restref/client?rid=1046758",
+        )
+
+    assert excinfo.value.current_step == "waiting_for_confirmation"
+    assert "opentable" in excinfo.value.details.lower()
+
+
+def test_extract_restaurant_booking_prefill_parses_explicit_resy_request() -> None:
+    settings = Settings()
+    prefill = _extract_restaurant_booking_prefill(
+        "Book Rubirosa in New York City on Resy for 2 people on Wednesday, May 27, 2026 at 11:00 AM",
+        settings=settings,
+        routing_profile_name="booking_commerce",
+    )
+
+    assert prefill is not None
+    assert prefill.venue_query == "Rubirosa"
+    assert prefill.city == "New York City"
+    assert prefill.provider == "resy"
+    assert prefill.date == "2026-05-27"
+    assert prefill.time == "11:00 AM"
+    assert prefill.party_size == 2
+
+
+def test_extract_party_size_value_accepts_number_words() -> None:
+    assert _extract_party_size_value("find me restaurants tonight at 9:30 PM for three people") == 3
+
+
+def test_restaurant_discovery_request_overrides_stray_booking_words() -> None:
+    query = "Book me a find me restaurants first for tonight at 9:30 PM for three people"
+
+    assert _is_restaurant_discovery_request(query, "booking_commerce") is True
+    assert _restaurant_booking_missing_details(query, "booking_commerce") == []
+
+
+def test_build_resy_booking_page_url_sets_date_and_seats() -> None:
+    assert (
+        _build_resy_booking_page_url(
+            "https://resy.com/cities/new-york-ny/venues/rubirosa",
+            date="2026-05-27",
+            party_size=2,
+        )
+        == "https://resy.com/cities/new-york-ny/venues/rubirosa?date=2026-05-27&seats=2"
+    )
+
+
+def test_select_resy_time_option_labels_finds_exact_and_nearest() -> None:
+    exact_label, nearest_labels, visible_labels = _select_resy_time_option_labels(
+        "9:45 PM",
+        [
+            {"label": "All Day", "value": ""},
+            {"label": "9:30 PM", "value": "2130"},
+            {"label": "9:45 PM", "value": "2145"},
+            {"label": "10:00 PM", "value": "2200"},
+        ],
+    )
+
+    assert exact_label == "9:45 PM"
+    assert nearest_labels[:2] == ("9:30 PM", "10:00 PM")
+    assert visible_labels[0] == "All Day"
+
+
+def test_extract_resy_venue_note_pulls_booking_window_message() -> None:
+    note = _extract_resy_venue_note(
+        "Reservations open up for dinner 14 days in advance via Resy. "
+        "If you do not see availability, we recommend you add your name to the notify list."
+    )
+
+    assert "14 days in advance via Resy" in note
+    assert "notify list" in note
+
+
+@pytest.mark.asyncio
+async def test_restaurant_search_with_city_fallback_retries_without_city(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    async def fake_run_restaurant_cli_json(_settings, _workspace, *args, **_kwargs):
+        calls.append(list(args))
+        if "--city" in args:
+            return {"ok": True, "results": [], "failures": []}
+        return {
+            "ok": True,
+            "results": [
+                {
+                    "id": "466",
+                    "name": "Rubirosa",
+                    "city": "New York",
+                    "url": "https://resy.com/cities/ny/rubirosa",
+                }
+            ],
+            "failures": [],
+        }
+
+    monkeypatch.setattr(agent_core, "run_restaurant_cli_json", fake_run_restaurant_cli_json)
+
+    payload, best_match = await _restaurant_search_with_city_fallback(
+        settings=Settings(),
+        workspace=object(),
+        query="Rubirosa",
+        provider="resy",
+        city="New York City",
+    )
+
+    assert best_match is not None
+    assert best_match["id"] == "466"
+    assert payload["city_filter_relaxed"] is True
+    assert any("--city" in call for call in calls)
+    assert any("--city" not in call for call in calls)
 
 
 def test_render_resy_slot_policy_handles_missing_policy() -> None:

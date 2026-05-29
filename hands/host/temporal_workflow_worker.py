@@ -18,7 +18,9 @@ from app.temporal_control_activities import (
     finalize_heavy_job_paused,
     finalize_heavy_job_stop,
     prepare_heavy_job_claim,
+    prepare_heavy_job_followup_claim,
     prepare_heavy_job_resume_claim,
+    prepare_heavy_job_strategy_retry_claim,
     renew_gmail_watch_activity,
 )
 from app.temporal_workflows import FridayGmailWatchRenewalWorkflow, FridayHeavyJobWorkflow
@@ -37,7 +39,9 @@ async def main() -> None:
         workflows=[FridayHeavyJobWorkflow, FridayGmailWatchRenewalWorkflow],
         activities=[
             prepare_heavy_job_claim,
+            prepare_heavy_job_followup_claim,
             prepare_heavy_job_resume_claim,
+            prepare_heavy_job_strategy_retry_claim,
             finalize_heavy_job_completed,
             finalize_heavy_job_paused,
             finalize_heavy_job_failed,

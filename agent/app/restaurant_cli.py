@@ -11,6 +11,7 @@ from typing import Any, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .browser import BrowserSession
 from .settings import Settings
 from .workspace import Workspace
 
@@ -20,12 +21,14 @@ def _is_retryable_restaurant_error(message: str) -> bool:
     return any(
         token in normalized
         for token in (
+            "500",
             "timed out",
             "timeout",
             "429",
             "502",
             "503",
             "504",
+            "internal server error",
             "temporarily unavailable",
             "connection reset",
             "connection aborted",
@@ -42,6 +45,8 @@ def _restaurant_cli_env(settings: Settings, workspace: Workspace) -> dict[str, s
         "XDG_CONFIG_HOME": str(workspace.root / ".config"),
         "RESTAURANT_CLI_AGENT": "1",
         "RESTAURANT_CLI_OT_MODE": settings.restaurant_cli_ot_mode,
+        "RESTAURANT_CLI_HEADLESS": "1",
+        "RESTAURANT_CLI_BROWSER_CHANNEL": "chromium",
         "PATH": os.environ.get("PATH", ""),
     }
     resy_auth_token = settings.secret(settings.resy_auth_token_param)
@@ -92,11 +97,126 @@ def build_opentable_booking_url(*, restaurant_id: str, date: str, time: str, par
     )
 
 
+_OPENTABLE_TIME_PATTERN = re.compile(r"^\d{1,2}:\d{2}\s?(?:AM|PM)$", flags=re.IGNORECASE)
+
+
+def extract_opentable_time_labels(button_texts: list[str]) -> list[str]:
+    times: list[str] = []
+    for value in button_texts:
+        normalized = " ".join(str(value or "").upper().split())
+        if not _OPENTABLE_TIME_PATTERN.match(normalized):
+            continue
+        if normalized not in times:
+            times.append(normalized)
+    return times
+
+
+async def fetch_opentable_slots_via_browser(
+    settings: Settings,
+    workspace: Workspace,
+    *,
+    venue_id: str,
+    date: str,
+    time: str,
+    party_size: int,
+) -> list[dict[str, Any]]:
+    booking_url = build_opentable_booking_url(
+        restaurant_id=venue_id,
+        date=date,
+        time=time,
+        party_size=party_size,
+    )
+    session = BrowserSession(workspace, settings=settings)
+    try:
+        await session.start(booking_url)
+        try:
+            await session.click_text("Find a table")
+        except Exception:
+            pass
+        button_texts = await session.list_button_texts(limit=120)
+        times = extract_opentable_time_labels(button_texts)
+        results: list[dict[str, Any]] = []
+        for visible_time in times:
+            twenty_four_hour = _normalize_opentable_time_label(visible_time)
+            results.append(
+                {
+                    "token": build_opentable_booking_url(
+                        restaurant_id=venue_id,
+                        date=date,
+                        time=twenty_four_hour,
+                        party_size=party_size,
+                    ),
+                    "time": visible_time,
+                    "type": "Standard",
+                    "raw": {"source": "opentable_browser"},
+                }
+            )
+        return results
+    finally:
+        await session.close()
+
+
+def _normalize_opentable_time_label(value: str) -> str:
+    normalized = " ".join(value.strip().upper().split())
+    match = re.match(r"^(\d{1,2}):(\d{2})\s?(AM|PM)$", normalized)
+    if not match:
+        return value
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    meridiem = match.group(3)
+    if meridiem == "AM":
+        hour = 0 if hour == 12 else hour
+    else:
+        hour = 12 if hour == 12 else hour + 12
+    return f"{hour:02d}:{minute:02d}"
+
+
 def normalize_restaurant_provider(provider: str, *, default: str = "resy") -> str:
-    normalized = provider.strip().lower()
+    normalized = re.sub(r"\s+", " ", provider.strip().lower())
     if not normalized:
         return default
+    if normalized == "open table":
+        return "opentable"
+    if normalized in {"resy only", "resy-only"}:
+        return "resy"
+    if normalized in {"opentable only", "open table only", "opentable-only"}:
+        return "opentable"
+    if normalized in {"auto", "any", "either"}:
+        return "auto"
     return normalized
+
+
+def restaurant_provider_sequence(provider: str) -> tuple[str, ...]:
+    normalized = re.sub(r"\s+", " ", provider.strip().lower())
+    explicit_only = "only" in normalized
+    pieces = [
+        normalize_restaurant_provider(piece, default="")
+        for piece in re.split(r"\s*(?:,|/|->|>|then)\s*", normalized or "resy")
+    ]
+    sequence: list[str] = []
+
+    def _append(value: str) -> None:
+        if value and value not in sequence:
+            sequence.append(value)
+
+    for piece in pieces:
+        if not piece:
+            continue
+        if piece == "auto":
+            _append("resy")
+            _append("opentable")
+            continue
+        if piece in {"resy", "opentable"}:
+            _append(piece)
+    if not sequence:
+        sequence = ["resy"]
+    if explicit_only:
+        return tuple(sequence)
+    if sequence == ["resy"]:
+        sequence.append("opentable")
+    elif sequence == ["opentable"]:
+        sequence.append("resy")
+    return tuple(sequence)
 
 
 @dataclass(frozen=True)

@@ -22,9 +22,16 @@ if str(AGENT_ROOT) not in sys.path:
 from app.agent_core import PauseForInputRequested, run_agent
 from app.artifacts import is_browser_step_screenshot, query_requests_browser_images
 from app.heavy_job_runtime import artifact_key, progress_notification_text, progress_summary_for_step, status_summary_for_query
-from app.jobs import AgentConfig, AgentJob, CheckpointPayload, ControlCommand, ThreadTurn
+from app.jobs import AgentConfig, AgentJob, CheckpointPayload, ThreadTurn
 from app.settings import Settings
 from app.storage import StateStore
+from app.strategy_runtime import (
+    advance_strategy_state,
+    default_strategy_state,
+    is_retryable_interaction_failure,
+    normalize_strategy_state,
+    strategy_threshold_for_error,
+)
 from app.telegram import TelegramClient
 from app.workspace import Workspace
 
@@ -97,6 +104,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
     config = AgentConfig.model_validate(claim.get("config") or {})
     workspace = _prepare_workspace(job.job_id, resume_checkpoint=claim.get("resume_checkpoint"))
     attachment_names = [attachment["file_name"] for attachment in claim.get("attachments", [])]
+    strategy_state = normalize_strategy_state(claim.get("strategy_state") or (job.metadata or {}).get("strategy_state") or default_strategy_state())
+    state.merge_job_metadata(job.job_id, {"strategy_state": strategy_state})
     status_interval = max(10, settings.temporal_activity_heartbeat_seconds)
     current_step = "starting worker"
     current_step_started_at = time.monotonic()
@@ -104,6 +113,8 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
     task_summary = status_summary_for_query(job.query, attachments=bool(attachment_names))
     interrupted = asyncio.Event()
     main_task = asyncio.current_task()
+    strategy_retry_result: dict[str, Any] | None = None
+    strategy_exhausted_pause: dict[str, Any] | None = None
 
     def _signal_handler(*_args) -> None:
         interrupted.set()
@@ -116,6 +127,7 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             loop.add_signal_handler(signum, _signal_handler)
 
     async def report_status(*, notify: bool = False) -> None:
+        nonlocal strategy_state, strategy_retry_result, strategy_exhausted_pause
         elapsed_seconds = max(0.0, time.monotonic() - current_step_started_at)
         heartbeat_summary = progress_summary_for_step(
             job.query,
@@ -124,20 +136,70 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             summary=current_summary,
             elapsed_seconds=elapsed_seconds,
         )
-        updated_job = state.update_job_heartbeat(job.job_id, current_step=current_step, summary=heartbeat_summary)
+        try:
+            updated_job = state.update_job_heartbeat(job.job_id, current_step=current_step, summary=heartbeat_summary)
+        except KeyError:
+            interrupted.set()
+            if main_task is not None:
+                main_task.cancel()
+            return
         config = state.get_config()
         if state.should_stop_for_stall(job.job_id, interval_seconds=config.status_update_interval_seconds):
-            state.record_control_signal(
-                job.job_id,
-                command=ControlCommand.STOP,
-                note="auto-stopped after repeated identical worker heartbeats with no meaningful progress",
+            strategy_state = advance_strategy_state(
+                strategy_state,
+                "stalled without meaningful progress",
+                threshold=1,
             )
-            state.mark_loop_stop_requested(job.job_id)
-            if updated_job.chat_id:
+            state.merge_job_metadata(job.job_id, {"strategy_state": strategy_state})
+            state.save_checkpoint(
+                job.job_id,
+                CheckpointPayload(
+                    summary=f"strategy retry pending: {strategy_state.get('current_strategy', '')}",
+                    current_step="strategy_retry_pending",
+                    workspace_files=workspace.list_files(),
+                    resume_instructions="Continue from the latest workspace state using the next internal strategy automatically.",
+                    metadata={
+                        "pause_kind": "strategy_retry_pending",
+                        "strategy_state": strategy_state,
+                        "last_error": "stalled without meaningful progress",
+                    },
+                ),
+            )
+            if bool(strategy_state.get("retry_requested")):
+                strategy_retry_result = {
+                    "kind": "retry_strategy",
+                    "error_message": "stalled without meaningful progress",
+                    "strategy_state": strategy_state,
+                }
+            else:
+                strategy_exhausted_pause = {
+                    "kind": "paused",
+                    "question": "I exhausted the available internal strategies for this run.",
+                    "details": (
+                        "I already rotated through direct tools, Stagehand, and visual browser fallback. "
+                        "I only need your input if you want to change the constraints, provider, or destination."
+                    ),
+                    "checkpoint": CheckpointPayload(
+                        summary="strategy exhausted after automatic retries",
+                        current_step="waiting_for_user_input",
+                        workspace_files=workspace.list_files(),
+                        resume_instructions="Use the user's next reply to change the constraints, provider, or venue and continue from the saved workspace state.",
+                        metadata={
+                            "pause_kind": "strategy_exhausted",
+                            "strategy_state": strategy_state,
+                            "last_error": "stalled without meaningful progress",
+                        },
+                    ).model_dump(),
+                }
+            if updated_job.chat_id and bool(strategy_state.get("retry_requested")):
                 await TelegramClient(settings).send_message(
                     updated_job.chat_id,
-                    "I stopped this task because it appeared stuck on the same step without meaningful progress. "
-                    "If you want, I can resume it or try a different approach.",
+                    "Still working on it. I hit a dead end and switched to another approach.",
+                )
+            elif updated_job.chat_id:
+                await TelegramClient(settings).send_message(
+                    updated_job.chat_id,
+                    "I tried the available approaches and need one change from you before I continue.",
                 )
             interrupted.set()
             if main_task is not None:
@@ -197,6 +259,7 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             config=config,
             resume_checkpoint=resume_checkpoint,
             current_job=job,
+            strategy_mode=str(strategy_state.get("current_strategy") or ""),
         )
         current_step = "uploading_outputs"
         current_step_started_at = time.monotonic()
@@ -233,13 +296,71 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             ).model_dump(),
         }
     except asyncio.CancelledError as exc:
+        if strategy_retry_result is not None:
+            if main_task is not None:
+                main_task.uncancel()
+            return strategy_retry_result
+        if strategy_exhausted_pause is not None:
+            if main_task is not None:
+                main_task.uncancel()
+            return strategy_exhausted_pause
         state.save_checkpoint(
             job.job_id,
             CheckpointPayload(summary=f"interrupted: {current_summary}", current_step=current_step, workspace_files=workspace.list_files()),
         )
         return {"kind": "failed", "error_message": str(exc) or "stopped by user", "interrupted": True, "timed_out": False}
     except Exception as exc:
-        return {"kind": "failed", "error_message": str(exc), "interrupted": False, "timed_out": False}
+        error_message = str(exc)
+        if is_retryable_interaction_failure(error_message):
+            retry_threshold = strategy_threshold_for_error(
+                str(strategy_state.get("current_strategy") or ""),
+                error_message,
+                default_threshold=max(1, int(settings.strategy_consecutive_failure_threshold)),
+            )
+            updated_strategy_state = advance_strategy_state(
+                strategy_state,
+                error_message,
+                threshold=retry_threshold,
+            )
+            state.save_checkpoint(
+                job.job_id,
+                CheckpointPayload(
+                    summary=f"strategy retry pending: {updated_strategy_state.get('current_strategy', '')}",
+                    current_step="strategy_retry_pending",
+                    workspace_files=workspace.list_files(),
+                    resume_instructions="Continue from the latest workspace state using the next internal strategy automatically.",
+                    metadata={
+                        "pause_kind": "strategy_retry_pending",
+                        "strategy_state": updated_strategy_state,
+                    },
+                ),
+            )
+            if bool(updated_strategy_state.get("retry_requested")):
+                return {
+                    "kind": "retry_strategy",
+                    "error_message": error_message,
+                    "strategy_state": updated_strategy_state,
+                }
+            return {
+                "kind": "paused",
+                "question": "I exhausted the available internal strategies for this run.",
+                "details": (
+                    "I already rotated through direct tools, Stagehand, and visual browser fallback. "
+                    "I only need your input if you want to change the constraints, provider, or destination."
+                ),
+                "checkpoint": CheckpointPayload(
+                    summary="strategy exhausted after automatic retries",
+                    current_step="waiting_for_user_input",
+                    workspace_files=workspace.list_files(),
+                    resume_instructions="Use the user's next reply to change the constraints, provider, or venue and continue from the saved workspace state.",
+                    metadata={
+                        "pause_kind": "strategy_exhausted",
+                        "strategy_state": updated_strategy_state,
+                        "last_error": error_message[:1000],
+                    },
+                ).model_dump(),
+            }
+        return {"kind": "failed", "error_message": error_message, "interrupted": False, "timed_out": False}
     finally:
         status_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

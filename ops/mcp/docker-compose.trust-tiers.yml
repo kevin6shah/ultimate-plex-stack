@@ -107,29 +107,6 @@ services:
     cpus: 0.25
     restart: unless-stopped
 
-  resy-mcp:
-    image: friday-worker-local
-    working_dir: /opt/friday/mcp/resy-mcp
-    command:
-      - sh
-      - -lc
-      - >
-        node /opt/friday/mcp/resy-mcp/build/index.js --stdio
-    environment:
-      RESY_API_KEY: ${RESY_API_KEY:-}
-      RESY_AUTH_TOKEN: ${RESY_AUTH_TOKEN:-}
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    pids_limit: 128
-    mem_limit: 512m
-    cpus: 0.50
-    restart: unless-stopped
-
   opentable-mcp:
     image: friday-worker-local
     command:

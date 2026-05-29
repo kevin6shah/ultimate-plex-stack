@@ -131,9 +131,9 @@ def test_worker_stall_defaults_are_tighter_than_old_status_timer(monkeypatch):
     reloaded = importlib.reload(settings_module)
     settings = reloaded.Settings()
 
-    assert settings.worker_stall_repeat_heartbeats == 18
-    assert settings.worker_running_stall_seconds == 900
-    assert settings.worker_preflight_stall_seconds == 300
+    assert settings.worker_stall_repeat_heartbeats == 8
+    assert settings.worker_running_stall_seconds == 180
+    assert settings.worker_preflight_stall_seconds == 90
 
 
 def test_claim_telegram_update_is_idempotent(monkeypatch):

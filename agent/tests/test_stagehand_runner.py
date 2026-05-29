@@ -8,9 +8,13 @@ from app.stagehand_runner import (
     _stagehand_browser_payload,
     _stagehand_chrome_path,
     _stagehand_extract_explicit_urls,
+    _stagehand_interaction_steps,
+    _stagehand_interaction_instruction,
     _stagehand_model_name,
     _stagehand_result_needs_fallback,
     _stagehand_search_url,
+    _stagehand_task_needs_interaction,
+    _stagehand_verification_instruction,
 )
 from app.workspace import Workspace
 
@@ -84,6 +88,39 @@ def test_stagehand_search_url_uses_duckduckgo_html() -> None:
     url = _stagehand_search_url("Find best boutique hotels in Ibiza")
     assert url.startswith("https://html.duckduckgo.com/html/?q=")
     assert "boutique+hotels+in+Ibiza" in url
+
+
+def test_stagehand_task_needs_interaction_for_booking_flow() -> None:
+    assert _stagehand_task_needs_interaction(
+        "Use the booking flow, set party size to 3, and reveal available times."
+    )
+    assert not _stagehand_task_needs_interaction("Summarize the restaurant's homepage.")
+
+
+def test_stagehand_interaction_instruction_is_non_destructive() -> None:
+    instruction = _stagehand_interaction_instruction("Find dinner slots")
+    assert "Set or confirm the requested date, party size, and reservation controls" in instruction
+    assert "Do not submit or finalize any booking." in instruction
+
+
+def test_stagehand_interaction_steps_prioritize_date_then_party_size() -> None:
+    steps = _stagehand_interaction_steps(
+        "Open the booking flow for 2026-05-28 for 3 people and reveal visible reservation times."
+    )
+    assert steps[0].startswith("Open the date selector and set the reservation date to 2026-05-28")
+    assert steps[1].startswith("Set the party size selector to 3 guests")
+    assert steps[2].startswith("Open the reservation time selector or reservation results area")
+
+
+def test_stagehand_verification_instruction_understands_relative_date_labels() -> None:
+    instruction = _stagehand_verification_instruction(
+        "Use the booking flow for 2026-05-28 for 3 people and summarize visible times."
+    )
+    assert "treat the requested date as satisfied" in instruction
+    assert "calendar shows 2026-05-28 or its human-readable equivalent as selected" in instruction
+    assert "current page URL includes date=2026-05-28" in instruction
+    assert "If the guests selector shows 3 Guests" in instruction
+    assert "current page URL includes seats=3" in instruction
 
 
 def test_coerce_stagehand_search_results_discards_invalid_rows() -> None:

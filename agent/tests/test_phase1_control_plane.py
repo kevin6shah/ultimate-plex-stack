@@ -8,6 +8,7 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi.testclient import TestClient
 
 import app.main as main_module
@@ -18,6 +19,7 @@ from app.jobs import (
     IdentityRecord,
     IdentitySecretPointer,
     MailboxVerificationWaitRecord,
+    MailboxWatchState,
     PaymentProfileRecord,
 )
 
@@ -96,9 +98,6 @@ def test_gmail_pubsub_ingress_signals_matching_wait(monkeypatch) -> None:
             assert delivery_id == "pubsub-1"
             return True
 
-        def get_mailbox_watch_state(self, mailbox_email: str):
-            return None
-
         def put_mailbox_watch_state(self, state):
             saved_watch_states.append(state)
             return state
@@ -120,12 +119,16 @@ def test_gmail_pubsub_ingress_signals_matching_wait(monkeypatch) -> None:
 
     async def fake_list_history(_settings, *, access_token: str, history_id: str):
         assert access_token == "access-token"
-        assert history_id == "history-1"
-        return ["gmail-1"]
+        assert history_id == "history-0"
+        return ["draft-1", "gmail-1"]
 
     async def fake_gmail_get(_settings, path: str, *, access_token: str, params=None):
-        assert path == "/messages/gmail-1"
         assert access_token == "access-token"
+        if path == "/messages/draft-1":
+            request = httpx.Request("GET", "https://gmail.googleapis.com/gmail/v1/users/me/messages/draft-1?format=full")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("draft lookup failed", request=request, response=response)
+        assert path == "/messages/gmail-1"
         return {
             "internalDate": str(int(datetime.now(timezone.utc).timestamp() * 1000)),
             "snippet": "Your Resy verification code is 482991.",
@@ -150,6 +153,15 @@ def test_gmail_pubsub_ingress_signals_matching_wait(monkeypatch) -> None:
     object.__setattr__(main_module.settings, "secret", lambda parameter_name: secret_values.get(parameter_name, ""))
     try:
         monkeypatch.setattr(main_module, "store", lambda: FakeStore())
+        monkeypatch.setattr(
+            main_module,
+            "_mailbox_watch_state",
+            lambda _state: MailboxWatchState(
+                mailbox_email="friday.nyc.agent@gmail.com",
+                history_id="history-0",
+                watch_status="active",
+            ),
+        )
         monkeypatch.setattr(main_module, "mint_gmail_access_token", fake_mint_token)
         monkeypatch.setattr(main_module, "list_history_message_ids", fake_list_history)
         monkeypatch.setattr(main_module, "gmail_api_get", fake_gmail_get)
@@ -174,6 +186,7 @@ def test_gmail_pubsub_ingress_signals_matching_wait(monkeypatch) -> None:
 
         assert response.status_code == 200
         assert response.json()["signals_sent"] == 1
+        assert response.json()["history_cursor"] == "history-0"
         assert matched == {
             "wait_id": wait.wait_id,
             "gmail_message_id": "gmail-1",

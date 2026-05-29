@@ -9,6 +9,7 @@ from typing import Any, Optional
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
+from pydantic import ValidationError
 
 from .budget import month_key, today_key, ttl_epoch
 from .context_memory import build_thread_summary
@@ -33,6 +34,7 @@ from .jobs import (
     ThreadTurnRole,
 )
 from .settings import Settings
+from .strategy_runtime import normalize_strategy_state, stall_thresholds_for_strategy
 
 
 def utc_now() -> datetime:
@@ -86,6 +88,9 @@ class StateStore:
     def _context_pk(self, *, channel: str, user_id: str, conversation_id: str) -> str:
         return f"CTX#{channel}#{user_id}#{conversation_id}"
 
+    def _context_key(self, *, channel: str, user_id: str, conversation_id: str) -> dict[str, str]:
+        return {"PK": self._context_pk(channel=channel, user_id=user_id, conversation_id=conversation_id), "SK": "LATEST"}
+
     def get_config(self) -> AgentConfig:
         item = self.table.get_item(Key={"PK": "CONFIG", "SK": "AGENT"}).get("Item")
         if not item:
@@ -134,6 +139,9 @@ class StateStore:
         expires_at = int((utc_now() + timedelta(seconds=self._conversation_ttl_seconds(effective_config))).timestamp())
         turn = ThreadTurn(role=role, text=normalized, task_class=task_class)
         thread_pk = self._thread_pk(channel=channel, user_id=user_id, conversation_id=conversation_id)
+        existing_context = self.table.get_item(
+            Key=self._context_key(channel=channel, user_id=user_id, conversation_id=conversation_id)
+        ).get("Item", {})
         self.table.put_item(
             Item={
                 "PK": thread_pk,
@@ -164,6 +172,8 @@ class StateStore:
                 "last_role": role.value,
                 "last_text": normalized[:1000],
                 "turn_count_hint": len(turns),
+                "active_heavy_job_id": existing_context.get("active_heavy_job_id", ""),
+                "active_heavy_job_updated_at": existing_context.get("active_heavy_job_updated_at", ""),
             }
         )
         return turn
@@ -238,11 +248,70 @@ class StateStore:
             )
 
     def get_context_summary(self, *, channel: str, user_id: str, conversation_id: str) -> str:
-        response = self.table.get_item(Key={"PK": self._context_pk(channel=channel, user_id=user_id, conversation_id=conversation_id), "SK": "LATEST"})
+        response = self.table.get_item(Key=self._context_key(channel=channel, user_id=user_id, conversation_id=conversation_id))
         item = response.get("Item")
         if not item:
             return ""
         return str(item.get("summary", ""))
+
+    def get_active_heavy_job_id(self, *, channel: str, user_id: str, conversation_id: str) -> Optional[str]:
+        item = self.table.get_item(Key=self._context_key(channel=channel, user_id=user_id, conversation_id=conversation_id)).get("Item")
+        if not item:
+            return None
+        job_id = str(item.get("active_heavy_job_id", "")).strip()
+        return job_id or None
+
+    def set_active_heavy_job(
+        self,
+        *,
+        channel: str,
+        user_id: str,
+        conversation_id: str,
+        job_id: str,
+        config: Optional[AgentConfig] = None,
+    ) -> None:
+        normalized_job_id = job_id.strip()
+        if not normalized_job_id:
+            return
+        effective_config = config or self.get_config()
+        expires_at = int((utc_now() + timedelta(seconds=self._conversation_ttl_seconds(effective_config))).timestamp())
+        key = self._context_key(channel=channel, user_id=user_id, conversation_id=conversation_id)
+        existing = self.table.get_item(Key=key).get("Item", {})
+        item = {
+            "PK": key["PK"],
+            "SK": key["SK"],
+            "ttl": expires_at,
+            "updated_at": utc_now().isoformat(),
+            "summary": existing.get("summary", ""),
+            "task_class": existing.get("task_class", TaskClass.LIGHT.value),
+            "last_role": existing.get("last_role", ""),
+            "last_text": existing.get("last_text", ""),
+            "turn_count_hint": existing.get("turn_count_hint", 0),
+            "active_heavy_job_id": normalized_job_id,
+            "active_heavy_job_updated_at": utc_now().isoformat(),
+        }
+        self.table.put_item(Item=item)
+
+    def clear_active_heavy_job(
+        self,
+        *,
+        channel: str,
+        user_id: str,
+        conversation_id: str,
+        only_if_job_id: Optional[str] = None,
+    ) -> bool:
+        key = self._context_key(channel=channel, user_id=user_id, conversation_id=conversation_id)
+        item = self.table.get_item(Key=key).get("Item")
+        if not item:
+            return False
+        active_job_id = str(item.get("active_heavy_job_id", "")).strip()
+        if only_if_job_id is not None and active_job_id != only_if_job_id:
+            return False
+        item["updated_at"] = utc_now().isoformat()
+        item.pop("active_heavy_job_id", None)
+        item.pop("active_heavy_job_updated_at", None)
+        self.table.put_item(Item=item)
+        return True
 
     def remember_fact(self, *, owner: str, text: str) -> None:
         normalized = text.strip()
@@ -281,7 +350,7 @@ class StateStore:
         with self.table.batch_writer() as batch:
             for item in response.get("Items", []):
                 batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
-            batch.delete_item(Key={"PK": self._context_pk(channel=channel, user_id=user_id, conversation_id=conversation_id), "SK": "LATEST"})
+            batch.delete_item(Key=self._context_key(channel=channel, user_id=user_id, conversation_id=conversation_id))
 
     def put_identity(self, record: IdentityRecord) -> IdentityRecord:
         payload = record.model_copy(update={"updated_at": utc_now().isoformat()})
@@ -580,7 +649,29 @@ class StateStore:
         item = response.get("Item")
         if not item:
             return None
-        return self._job_from_item(item)
+        try:
+            return self._job_from_item(item)
+        except ValidationError:
+            return None
+
+    def merge_job_metadata(self, job_id: str, updates: dict[str, Any]) -> None:
+        job = self.get_job(job_id)
+        if job is None:
+            raise KeyError(f"job not found: {job_id}")
+        merged = dict(job.metadata or {})
+        for key, value in updates.items():
+            if value is None:
+                merged.pop(str(key), None)
+            else:
+                merged[str(key)] = value
+        self.table.update_item(
+            Key={"PK": f"JOB#{job_id}", "SK": "META"},
+            UpdateExpression="SET metadata = :metadata, updated_at = :updated_at",
+            ExpressionAttributeValues={
+                ":metadata": merged,
+                ":updated_at": utc_now().isoformat(),
+            },
+        )
 
     def update_job_status(
         self,
@@ -702,7 +793,14 @@ class StateStore:
         job = self.get_job(job_id)
         if job is None or job.loop_stop_requested_at:
             return False
-        repeat_threshold = max(3, int(self.settings.worker_stall_repeat_heartbeats))
+        strategy_state = normalize_strategy_state((job.metadata or {}).get("strategy_state"))
+        repeat_threshold, stale_threshold = stall_thresholds_for_strategy(
+            str(strategy_state.get("current_strategy") or ""),
+            job.current_step or "",
+            running_default=max(120, int(self.settings.worker_running_stall_seconds)),
+            preflight_default=max(60, int(self.settings.worker_preflight_stall_seconds)),
+        )
+        repeat_threshold = max(repeat_threshold, int(self.settings.worker_stall_repeat_heartbeats))
         if int(job.heartbeat_repeat_count or 0) < repeat_threshold:
             return False
         raw_timestamp = job.last_progress_at or job.heartbeat_repeat_since
@@ -713,11 +811,6 @@ class StateStore:
         except ValueError:
             return False
         stale_seconds = (utc_now() - last_progress).total_seconds()
-        current_step = (job.current_step or "").strip().lower()
-        if current_step == "running_agent":
-            stale_threshold = max(120, int(self.settings.worker_running_stall_seconds))
-        else:
-            stale_threshold = max(60, int(self.settings.worker_preflight_stall_seconds))
         return stale_seconds >= stale_threshold
 
     def mark_loop_stop_requested(self, job_id: str) -> None:
@@ -869,6 +962,7 @@ class StateStore:
                 "summary": item.get("summary", ""),
                 "updated_at": item.get("updated_at", ""),
                 "task_class": item.get("task_class", ""),
+                "active_heavy_job_id": item.get("active_heavy_job_id", ""),
             }
             for item in items[:limit]
         ]

@@ -10,7 +10,6 @@ from app.browser_use_runner import (
     _maps_openapi_mcp_env,
     _opentable_mcp_env,
     _register_optional_mcp,
-    _resy_mcp_env,
     _split_mcp_args,
 )
 from app.settings import Settings
@@ -87,24 +86,6 @@ def test_maps_openapi_mcp_env_uses_base_url_headers_and_token() -> None:
     }
 
 
-def test_resy_mcp_env_requires_api_key_and_auth_token() -> None:
-    settings = replace(
-        Settings(),
-        resy_api_key_param="/resy/key",
-        resy_auth_token_param="/resy/token",
-    )
-    secret_values = {
-        "/resy/key": "resy-key",
-        "/resy/token": "resy-token",
-    }
-    object.__setattr__(settings, "secret", lambda parameter_name: secret_values.get(parameter_name, ""))
-    assert _resy_mcp_env(settings) == {
-        "DOTENV_CONFIG_QUIET": "true",
-        "RESY_API_KEY": "resy-key",
-        "RESY_AUTH_TOKEN": "resy-token",
-    }
-
-
 def test_opentable_mcp_env_requires_email_and_password() -> None:
     settings = replace(
         Settings(),
@@ -134,10 +115,10 @@ def test_register_optional_mcp_times_out_and_returns_none() -> None:
         _register_optional_mcp(
             MCPClient=HangingClient,
             tools=object(),
-            server_name="resy",
+            server_name="opentable",
             command="node",
             args=["server.js"],
-            prefix="resy_",
+            prefix="opentable_",
             timeout_seconds=1,
         )
     )

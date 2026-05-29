@@ -130,9 +130,6 @@ class Settings:
     maps_openapi_mcp_args: str = os.environ.get("MAPS_OPENAPI_MCP_ARGS", "-y @openapi-mcp/server")
     maps_openapi_spec_url: str = os.environ.get("MAPS_OPENAPI_SPEC_URL", "")
     maps_openapi_base_url: str = os.environ.get("MAPS_OPENAPI_BASE_URL", "")
-    resy_mcp_enabled: bool = os.environ.get("RESY_MCP_ENABLED", "false").lower() == "true"
-    resy_mcp_command: str = os.environ.get("RESY_MCP_COMMAND", "node")
-    resy_mcp_args: str = os.environ.get("RESY_MCP_ARGS", "/opt/friday/mcp/resy-mcp/build/index.js --stdio")
     opentable_mcp_enabled: bool = os.environ.get("OPENTABLE_MCP_ENABLED", "false").lower() == "true"
     opentable_mcp_command: str = os.environ.get("OPENTABLE_MCP_COMMAND", "npx")
     opentable_mcp_args: str = os.environ.get("OPENTABLE_MCP_ARGS", "-y @striderlabs/mcp-opentable")
@@ -163,6 +160,7 @@ class Settings:
     temporal_activity_schedule_to_close_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_SCHEDULE_TO_CLOSE_SECONDS", "5400"))
     temporal_activity_start_to_close_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_START_TO_CLOSE_SECONDS", "5400"))
     temporal_activity_max_attempts: int = int(os.environ.get("TEMPORAL_ACTIVITY_MAX_ATTEMPTS", "3"))
+    strategy_consecutive_failure_threshold: int = int(os.environ.get("STRATEGY_CONSECUTIVE_FAILURE_THRESHOLD", "4"))
     worker_stall_repeat_heartbeats: int = int(os.environ.get("WORKER_STALL_REPEAT_HEARTBEATS", "8"))
     worker_running_stall_seconds: int = int(os.environ.get("WORKER_RUNNING_STALL_SECONDS", "180"))
     worker_preflight_stall_seconds: int = int(os.environ.get("WORKER_PREFLIGHT_STALL_SECONDS", "90"))

@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from .heavy_job_runtime import (
+    build_contextual_heavy_followup_query,
     build_heavy_claim,
     build_paused_input_resume_query,
     clean_user_facing_result,
@@ -17,11 +19,16 @@ from .gmail_oauth import renew_gmail_watch
 from .jobs import CheckpointPayload, JobStatus, MailboxWatchState, utc_now_iso
 from .settings import Settings, settings
 from .storage import StateStore
+from .strategy_runtime import default_strategy_state, normalize_strategy_state
 from .worker_lifecycle import ensure_dedicated_worker_running, maybe_stop_dedicated_worker_if_idle
 
 
 def _store() -> StateStore:
     return StateStore(settings)
+
+
+def _missing_job(job_id: str) -> ApplicationError:
+    return ApplicationError(f"job not found: {job_id}", non_retryable=True)
 
 
 def _checkpoint_indicates_interruption(state: StateStore, job_id: str) -> bool:
@@ -51,11 +58,11 @@ def _stop_reason_from_control_signal(state: StateStore, job_id: str) -> tuple[st
     if "auto-stopped" in lowered or "no meaningful progress" in lowered or "stuck" in lowered:
         return (
             "auto-stopped after repeated identical steps",
-            "I stopped this task because it appeared stuck on the same step without meaningful progress.",
+            "I stopped this run because it appeared stuck on the same step without meaningful progress. I kept the latest checkpoint.",
         )
     return (
         "interrupted",
-        "This task was interrupted before it finished. Say 'resume that task' if you want me to continue from the last checkpoint.",
+        "I hit an interruption before that task finished. I kept the latest checkpoint.",
     )
 
 
@@ -108,7 +115,7 @@ async def prepare_heavy_job_claim(job_id: str) -> dict:
     state = _store()
     job = state.get_job(job_id)
     if job is None:
-        raise RuntimeError(f"job not found: {job_id}")
+        raise _missing_job(job_id)
     ensure_dedicated_worker_running(settings)
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="starting worker")
     return build_heavy_claim(state, settings, job)
@@ -119,11 +126,46 @@ async def prepare_heavy_job_resume_claim(job_id: str, reply_text: str) -> dict:
     state = _store()
     job = state.get_job(job_id)
     if job is None:
-        raise RuntimeError(f"job not found: {job_id}")
+        raise _missing_job(job_id)
     checkpoint = state.get_latest_checkpoint(job_id)
     resumed_query = build_paused_input_resume_query(job, checkpoint, reply_text)
+    state.merge_job_metadata(job_id, {"strategy_state": default_strategy_state(), "last_strategy_error": None})
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="resuming task")
-    return build_heavy_claim(state, settings, job, query_override=resumed_query)
+    refreshed_job = state.get_job(job_id) or job
+    return build_heavy_claim(state, settings, refreshed_job, query_override=resumed_query)
+
+
+@activity.defn
+async def prepare_heavy_job_followup_claim(job_id: str, followup_text: str) -> dict:
+    state = _store()
+    job = state.get_job(job_id)
+    if job is None:
+        raise _missing_job(job_id)
+    checkpoint = state.get_latest_checkpoint(job_id)
+    followup_query = build_contextual_heavy_followup_query(job, checkpoint, followup_text)
+    state.merge_job_metadata(job_id, {"strategy_state": default_strategy_state(), "last_strategy_error": None})
+    state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="updating task")
+    refreshed_job = state.get_job(job_id) or job
+    return build_heavy_claim(state, settings, refreshed_job, query_override=followup_query)
+
+
+@activity.defn
+async def prepare_heavy_job_strategy_retry_claim(job_id: str, strategy_state: dict, error_message: str = "") -> dict:
+    state = _store()
+    job = state.get_job(job_id)
+    if job is None:
+        raise _missing_job(job_id)
+    normalized_strategy_state = normalize_strategy_state(strategy_state)
+    state.merge_job_metadata(
+        job_id,
+        {
+            "strategy_state": normalized_strategy_state,
+            "last_strategy_error": str(error_message or "")[:1000],
+        },
+    )
+    state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="switching strategy")
+    refreshed_job = state.get_job(job_id) or job
+    return build_heavy_claim(state, settings, refreshed_job)
 
 
 @activity.defn
@@ -131,7 +173,7 @@ async def finalize_heavy_job_completed(job_id: str, result_text: str, output_fil
     state = _store()
     job = state.get_job(job_id)
     if job is None:
-        raise RuntimeError(f"job not found: {job_id}")
+        return
     cleaned_result = clean_user_facing_result(result_text)
     if _result_looks_like_booking_clarification(job.query, cleaned_result):
         input_question, input_details = _booking_clarification_prompt_from_result(cleaned_result)
@@ -180,7 +222,7 @@ async def finalize_heavy_job_paused(job_id: str, question: str, details: str, ch
     state = _store()
     job = state.get_job(job_id)
     if job is None:
-        raise RuntimeError(f"job not found: {job_id}")
+        return
     payload = CheckpointPayload.model_validate(checkpoint)
     state.save_checkpoint(job_id, payload)
     state.update_job_status(job_id, status=JobStatus.PAUSED_FOR_INPUT, current_step=payload.current_step or "waiting_for_user_input")
@@ -203,7 +245,7 @@ async def finalize_heavy_job_failed(
     state = _store()
     job = state.get_job(job_id)
     if job is None:
-        raise RuntimeError(f"job not found: {job_id}")
+        return
     status = JobStatus.FAILED
     if interrupted or _checkpoint_indicates_interruption(state, job_id) or _message_indicates_interruption(error_message):
         status = JobStatus.INTERRUPTED

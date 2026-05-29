@@ -112,6 +112,13 @@ def _is_web_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def _preferred_browser_name_for_url(url: str) -> str:
+    host = urlparse(url or "").netloc.lower()
+    if host.endswith("opentable.com"):
+        return "firefox"
+    return "chromium"
+
+
 def _is_bot_blocked(text: str, title: str = "") -> bool:
     haystack = f"{title}\n{text}".lower()
     return any(pattern in haystack for pattern in BOT_BLOCK_PATTERNS)
@@ -188,8 +195,33 @@ async def _select_value_via_locator(locator: object, text: str) -> bool:
     if tag_name == "select":
         if not normalized_text:
             return False
-        await locator.select_option(label=normalized_text, timeout=10000)
-        return True
+        selection_attempts = (
+            {"label": normalized_text},
+            {"value": normalized_text},
+        )
+        for selection_kwargs in selection_attempts:
+            try:
+                await locator.select_option(timeout=10000, **selection_kwargs)
+            except Exception:
+                continue
+            return True
+        options = await locator.locator("option").evaluate_all(
+            """(els) => els.map((el) => ({
+                value: (el.value || '').trim(),
+                label: (el.innerText || el.textContent || '').trim(),
+            }))"""
+        )
+        normalized_target = normalized_text.casefold()
+        for option in options:
+            option_value = " ".join(str(option.get("value") or "").split())
+            option_label = " ".join(str(option.get("label") or "").split())
+            if option_label.casefold() == normalized_target and option_label:
+                await locator.select_option(label=option_label, timeout=10000)
+                return True
+            if option_value.casefold() == normalized_target and option_value:
+                await locator.select_option(value=option_value, timeout=10000)
+                return True
+        return False
     if tag_name != "option":
         return False
     parent = locator.locator("xpath=ancestor::select[1]").first
@@ -205,6 +237,10 @@ async def _select_value_via_locator(locator: object, text: str) -> bool:
         await parent.select_option(label=normalized_text, timeout=10000)
         return True
     return False
+
+
+def _normalize_button_text(value: str) -> str:
+    return " ".join(str(value or "").split())
 
 
 def _selector_candidates(selector: str) -> list[str]:
@@ -363,7 +399,7 @@ async def _guard_zero_dollar_before_action(page, *, selector: str, locator) -> N
 
 
 class BrowserSession:
-    def __init__(self, workspace=None, *, settings: Settings | None = None) -> None:
+    def __init__(self, workspace=None, *, settings: Settings | None = None, browser_name: str = "chromium") -> None:
         self._playwright = None
         self._browser = None
         self._context = None
@@ -373,16 +409,20 @@ class BrowserSession:
         self._stealth = None
         self._user_agent = _choose_user_agent(settings)
         self._fingerprint: BrowserFingerprint | None = None
+        self._browser_name = browser_name.strip().lower() or "chromium"
 
     async def _create_context(self, *, fingerprint: BrowserFingerprint) -> None:
         from playwright_stealth import Stealth
 
         self._stealth = Stealth(init_scripts_only=True) if (self._settings is None or self._settings.browser_stealth_enabled) else None
         self._fingerprint = fingerprint
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=common_chromium_args(),
-        )
+        browser_type = getattr(self._playwright, self._browser_name, None)
+        if browser_type is None:
+            raise RuntimeError(f"unsupported browser engine: {self._browser_name}")
+        launch_kwargs = {"headless": True}
+        if self._browser_name == "chromium":
+            launch_kwargs["args"] = common_chromium_args()
+        self._browser = await browser_type.launch(**launch_kwargs)
         self._context = await self._browser.new_context(
             user_agent=fingerprint.user_agent,
             locale=fingerprint.locale,
@@ -403,6 +443,8 @@ class BrowserSession:
             return await self.describe()
         from playwright.async_api import async_playwright
 
+        if start_url:
+            self._browser_name = _preferred_browser_name_for_url(start_url)
         self._playwright = await async_playwright().start()
         fingerprint = build_browser_fingerprint(
             seed=browser_fingerprint_seed(start_url or "friday-browser"),
@@ -418,6 +460,13 @@ class BrowserSession:
             await self.start()
 
     async def goto(self, url: str) -> str:
+        preferred_browser_name = _preferred_browser_name_for_url(url)
+        if self._page is not None and preferred_browser_name != self._browser_name:
+            logger.info("browser switching engine from=%s to=%s url=%s", self._browser_name, preferred_browser_name, url)
+            await self.close()
+            self._browser_name = preferred_browser_name
+            await self.start(url)
+            return await self.describe()
         await self.ensure_started()
         logger.info("browser goto url=%s", url)
         await _run_with_retries(
@@ -434,6 +483,35 @@ class BrowserSession:
         await _guard_zero_dollar_before_action(self._page, selector=selector, locator=locator)
         if not await _select_value_via_locator(locator, selector):
             await locator.click(timeout=10000)
+        await self._page.wait_for_timeout(800)
+        return await self.describe()
+
+    async def click_text(self, text: str, *, exact: bool = True) -> str:
+        await self.ensure_started()
+        normalized = _normalize_button_text(text)
+        logger.info("browser click_text text=%s exact=%s", normalized, exact)
+        locator = self._page.get_by_role("button", name=normalized, exact=exact).first
+        try:
+            await _guard_zero_dollar_before_action(self._page, selector=f"text:{normalized}", locator=locator)
+            await locator.click(timeout=10000)
+        except Exception:
+            clicked = await self._page.evaluate(
+                """([target, exact]) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const wanted = normalize(target);
+                    const buttons = Array.from(document.querySelectorAll('button,[role="button"]'));
+                    const match = buttons.find((el) => {
+                        const text = normalize(el.innerText || el.textContent || '');
+                        return exact ? text === wanted : text.includes(wanted);
+                    });
+                    if (!match) return false;
+                    match.click();
+                    return true;
+                }""",
+                [normalized, exact],
+            )
+            if not clicked:
+                raise
         await self._page.wait_for_timeout(800)
         return await self.describe()
 
@@ -489,6 +567,20 @@ class BrowserSession:
         await self.ensure_started()
         return self._page.url
 
+    async def list_button_texts(self, *, limit: int = 80) -> list[str]:
+        await self.ensure_started()
+        values = await self._page.evaluate(
+            """(limit) => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                return Array.from(document.querySelectorAll('button,[role="button"]'))
+                    .map((el) => normalize(el.innerText || el.textContent || ''))
+                    .filter(Boolean)
+                    .slice(0, limit);
+            }""",
+            limit,
+        )
+        return [_normalize_button_text(value) for value in values]
+
     async def list_links(self, limit: int = 20) -> str:
         await self.ensure_started()
         links = await self._page.locator("a[href]").evaluate_all(
@@ -502,6 +594,20 @@ class BrowserSession:
         for index, link in enumerate(links, start=1):
             lines.append(f"[{index}] {link.get('text') or '(no text)'} -> {link.get('href')}")
         return "\n".join(lines)[:3500]
+
+    async def has_selector(self, selector: str) -> bool:
+        await self.ensure_started()
+        return bool(await self._page.locator(selector).count())
+
+    async def select_options(self, selector: str, *, limit: int = 50) -> list[dict[str, str]]:
+        await self.ensure_started()
+        return await self._page.locator(selector).first.locator("option").evaluate_all(
+            """(els, limit) => els.slice(0, limit).map((el) => ({
+                value: (el.value || '').trim(),
+                label: (el.innerText || el.textContent || '').trim(),
+            }))""",
+            limit,
+        )
 
     async def describe(self) -> str:
         await self.ensure_started()

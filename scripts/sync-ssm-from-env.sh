@@ -38,6 +38,33 @@ AWS_REGION_NAME="${AWS_REGION_NAME:-us-east-1}"
 
 [[ -n "$AWS_PROFILE_NAME" ]] || { echo "AWS_PROFILE is required in $ENV_FILE" >&2; exit 1; }
 
+WRITTEN_PARAMS_FILE="$(mktemp)"
+cleanup() {
+  rm -f "$WRITTEN_PARAMS_FILE"
+}
+trap cleanup EXIT
+
+already_written_by() {
+  local param_name="$1"
+  python3 - "$WRITTEN_PARAMS_FILE" "$param_name" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+target = sys.argv[2]
+if not path.exists():
+    raise SystemExit(1)
+for raw_line in path.read_text(encoding="utf-8").splitlines():
+    if not raw_line or "\t" not in raw_line:
+        continue
+    param_name, env_key = raw_line.split("\t", 1)
+    if param_name == target:
+        print(env_key)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 while IFS=$'\t' read -r env_key param_name; do
   [[ -n "$env_key" ]] || continue
   [[ "$env_key" == \#* ]] && continue
@@ -49,6 +76,11 @@ while IFS=$'\t' read -r env_key param_name; do
     continue
   fi
 
+  if written_by="$(already_written_by "$param_name")"; then
+    echo "duplicate target skipped: $env_key -> $param_name (already set by $written_by)"
+    continue
+  fi
+
   AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION_NAME" \
     aws ssm put-parameter \
       --name "$param_name" \
@@ -56,6 +88,7 @@ while IFS=$'\t' read -r env_key param_name; do
       --value "$value" \
       --overwrite \
       >/dev/null
+  printf '%s\t%s\n' "$param_name" "$env_key" >>"$WRITTEN_PARAMS_FILE"
   echo "pushed $env_key"
 done < "$MAP_FILE"
 

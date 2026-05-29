@@ -108,7 +108,6 @@ MAPS_OPENAPI_SPEC_URL=
 MAPS_OPENAPI_BASE_URL=
 MAPS_OPENAPI_HEADERS_PARAM=/friday/agent/maps-openapi-headers
 MAPS_OPENAPI_AUTH_TOKEN_PARAM=/friday/agent/maps-openapi-auth-token
-RESY_MCP_ENABLED=${RESY_MCP_ENABLED:-false}
 RESY_API_KEY_PARAM=/friday/agent/resy-api-key
 RESY_AUTH_TOKEN_PARAM=/friday/agent/resy-auth-token
 OPENTABLE_MCP_ENABLED=${OPENTABLE_MCP_ENABLED:-false}

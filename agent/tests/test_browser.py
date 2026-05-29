@@ -5,6 +5,7 @@ from app.browser import (
     _extract_page_text,
     _extract_search_result_links_from_html,
     _guard_zero_dollar_before_action,
+    _preferred_browser_name_for_url,
     _select_value_via_locator,
     _run_with_retries,
     _selector_or_text_suggests_terminal_action,
@@ -147,6 +148,11 @@ def test_extract_search_result_links_from_html_decodes_duckduckgo_redirects() ->
         "https://example.com/camera-review",
         "https://www.reddit.com/r/cameras/comments/abc123/",
     ]
+
+
+def test_preferred_browser_name_for_url_uses_firefox_for_opentable() -> None:
+    assert _preferred_browser_name_for_url("https://www.opentable.com/") == "firefox"
+    assert _preferred_browser_name_for_url("https://www.resy.com/") == "chromium"
 
 
 def test_guard_zero_dollar_before_action_blocks_non_zero_terminal_submit() -> None:

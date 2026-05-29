@@ -8,7 +8,8 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 from pydantic_ai import Agent, RunContext
@@ -35,8 +36,10 @@ from .research import fetch_page_content, sanitize_tool_output, search_web
 from .restaurant_cli import (
     build_opentable_booking_url,
     choose_best_restaurant_result,
+    fetch_opentable_slots_via_browser,
     fetch_resy_slot_policies,
     normalize_restaurant_provider,
+    restaurant_provider_sequence,
     RestaurantSlotPolicy,
     run_restaurant_cli,
     run_restaurant_cli_json,
@@ -46,6 +49,12 @@ from .skiplagged import call_skiplagged_tool
 from .stagehand_runner import run_stagehand_task
 from .settings import Settings
 from .storage import StateStore
+from .strategy_runtime import (
+    STRATEGY_API_DIRECT,
+    STRATEGY_BROWSER_USE_VISUAL_PIVOT,
+    STRATEGY_STAGEHAND_STEALTH_ACT,
+    strategy_guidance,
+)
 from .temporal_runtime import heavy_workflow_id
 from .workspace import Workspace
 
@@ -121,6 +130,42 @@ class AgentDependencies:
     workspace: Optional[Workspace] = None
     browser: Optional[BrowserSession] = None
     current_job: Optional[AgentJob] = None
+    strategy_mode: str = STRATEGY_API_DIRECT
+
+
+@dataclass(frozen=True)
+class RestaurantBookingPrefill:
+    venue_query: str
+    city: str
+    provider: str
+    date: str
+    time: str
+    party_size: int
+
+
+@dataclass(frozen=True)
+class ResyBrowserProbeResult:
+    booking_url: str
+    selected_exact_time_label: str = ""
+    nearest_time_labels: tuple[str, ...] = ()
+    visible_time_labels: tuple[str, ...] = ()
+    venue_note: str = ""
+    current_url: str = ""
+
+
+@dataclass(frozen=True)
+class RestaurantSearchAttempt:
+    provider: str
+    payload: dict[str, object]
+    best_match: Optional[dict[str, object]]
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class OpenTablePolicyAssessment:
+    free_cancellation: bool = False
+    requires_manual_confirmation: bool = True
+    policy_text: str = "Cancellation policy: unavailable from the current OpenTable page."
 
 
 def _resolved_secret(settings: Settings, parameter_name: str) -> str:
@@ -132,6 +177,198 @@ def _resolved_secret(settings: Settings, parameter_name: str) -> str:
     if not parameter_name.startswith("/") and value == parameter_name and parameter_name.isupper():
         return ""
     return value
+
+
+def _build_resy_booking_page_url(venue_url: str, *, date: str, party_size: int) -> str:
+    parsed = urlparse(venue_url.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return venue_url.strip()
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["date"] = date
+    query["seats"] = str(max(1, party_size))
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _parse_clock_minutes(value: str) -> Optional[int]:
+    normalized = " ".join(value.strip().upper().replace(".", "").split())
+    if not normalized or normalized in {"ALL DAY", "ANY TIME"}:
+        return None
+    match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*([AP]M)?\b", normalized)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    meridiem = match.group(3)
+    if meridiem:
+        hour %= 12
+        if meridiem == "PM":
+            hour += 12
+    if hour >= 24 or minute >= 60:
+        return None
+    return hour * 60 + minute
+
+
+def _render_clock_label(value: str) -> str:
+    minutes = _parse_clock_minutes(value)
+    if minutes is None:
+        return value
+    hour = minutes // 60
+    minute = minutes % 60
+    meridiem = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return f"{display_hour}:{minute:02d} {meridiem}"
+
+
+def _select_resy_time_option_labels(requested_time: str, options: list[dict[str, str]]) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    visible_labels = tuple(
+        label
+        for label in (
+            " ".join(str(option.get("label") or option.get("value") or "").split())
+            for option in options
+        )
+        if label
+    )
+    requested_minutes = _parse_clock_minutes(requested_time)
+    if requested_minutes is None:
+        return "", tuple(), visible_labels
+    candidates: list[tuple[int, int, str]] = []
+    exact_label = ""
+    for option in options:
+        option_label = " ".join(str(option.get("label") or option.get("value") or "").split())
+        if not option_label:
+            continue
+        option_minutes = _parse_clock_minutes(option_label)
+        if option_minutes is None:
+            continue
+        if option_minutes == requested_minutes and not exact_label:
+            exact_label = option_label
+        candidates.append((abs(option_minutes - requested_minutes), option_minutes, option_label))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    nearest_labels: list[str] = []
+    seen: set[str] = set()
+    for _, _, label in candidates:
+        if label in seen or label == exact_label:
+            continue
+        seen.add(label)
+        nearest_labels.append(label)
+        if len(nearest_labels) >= 4:
+            break
+    return exact_label, tuple(nearest_labels), visible_labels
+
+
+def _extract_resy_venue_note(body_text: str) -> str:
+    compact = " ".join(body_text.split())
+    if not compact:
+        return ""
+    patterns = (
+        r"(You can check availability and reserve on Resy starting at midnight[^.?!]*[.?!])",
+        r"(Reservations open up for dinner \d+ days in advance via Resy[^.?!]*[.?!])",
+        r"(If you do not see availability[^.?!]*[.?!])",
+        r"(We recommend you add your name to the notify list[^.?!]*[.?!])",
+        r"(No times are available[^.?!]*[.?!])",
+    )
+    notes: list[str] = []
+    for pattern in patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if not match:
+            continue
+        note = match.group(1).strip()
+        if note not in notes:
+            notes.append(note)
+        if len(notes) >= 2:
+            break
+    return " ".join(notes)
+
+
+async def _run_resy_browser_probe(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    venue_url: str,
+    venue_name: str,
+    venue_city: str,
+    date: str,
+    time: str,
+    party_size: int,
+) -> Optional[ResyBrowserProbeResult]:
+    if not venue_url.strip():
+        return None
+    booking_url = _build_resy_booking_page_url(venue_url, date=date, party_size=party_size)
+    browser = BrowserSession(workspace=workspace, settings=settings)
+    try:
+        await browser.start(booking_url)
+        if await browser.has_selector("select[name='party_size']"):
+            await browser.type_text("select[name='party_size']", str(max(1, party_size)))
+        time_options = await browser.select_options("select[name='time']") if await browser.has_selector("select[name='time']") else []
+        exact_label, nearest_labels, visible_labels = _select_resy_time_option_labels(time, time_options)
+        if exact_label:
+            await browser.type_text("select[name='time']", exact_label)
+        body_text = await browser.read(limit=7000)
+        return ResyBrowserProbeResult(
+            booking_url=booking_url,
+            selected_exact_time_label=exact_label,
+            nearest_time_labels=nearest_labels,
+            visible_time_labels=visible_labels,
+            venue_note=_extract_resy_venue_note(body_text),
+            current_url=await browser.current_url(),
+        )
+    except Exception as exc:
+        logger.warning(
+            "resy_browser_probe_failed venue=%s city=%s date=%s party_size=%s error=%s",
+            venue_name,
+            venue_city,
+            date,
+            party_size,
+            exc,
+        )
+        return None
+    finally:
+        await browser.close()
+
+
+def _render_resy_browser_probe_summary(
+    probe: ResyBrowserProbeResult,
+    *,
+    venue_id: str,
+    venue_name: str,
+    venue_city: str,
+    date: str,
+    time: str,
+    party_size: int,
+) -> str:
+    lines = [
+        "BROWSER_RESY_PROBE:",
+        f"Matched venue: {venue_name}" + (f" ({venue_city})" if venue_city else ""),
+        f"Venue id: {venue_id}",
+        f"Booking page: {probe.booking_url}",
+        f"Requested date: {date}",
+        f"Requested time: {time}",
+        f"Party size: {max(1, party_size)}",
+    ]
+    if probe.current_url and probe.current_url != probe.booking_url:
+        lines.append(f"Current browser URL: {probe.current_url}")
+    if probe.selected_exact_time_label:
+        lines.append(f"Exact requested time is selectable on the live venue page: {probe.selected_exact_time_label}.")
+    elif probe.nearest_time_labels:
+        lines.append("Exact requested time is not selectable on the live venue page.")
+        lines.append("Closest live time options on the page:")
+        for label in probe.nearest_time_labels:
+            lines.append(f"- {label}")
+    elif probe.visible_time_labels:
+        lines.append("The live venue page exposed a time selector, but the requested time was not present.")
+    if probe.visible_time_labels:
+        lines.append("Visible time selector options:")
+        for label in probe.visible_time_labels[:8]:
+            lines.append(f"- {label}")
+    if probe.venue_note:
+        lines.append(f"Venue note: {probe.venue_note}")
+    lines.append(
+        "Use this as the matched Resy venue context immediately. Do not restart venue matching. "
+        "Prefer structured Resy tools with this venue id for live availability, policy checks, and booking. "
+        "Only fall back to raw browser selectors if the structured provider call still fails after the venue is matched. "
+        "If the exact time is not selectable or the venue page says availability opens later, pause and ask the user whether to choose another time, venue, or source."
+    )
+    return sanitize_tool_output("\n".join(lines))
 
 
 def _ensure_default_mailbox_identity(settings: Settings, store: StateStore) -> Optional[IdentityRecord]:
@@ -262,6 +499,310 @@ def _raise_restaurant_provider_unavailable_pause(
     )
 
 
+def _restaurant_provider_browser_fallback_message(
+    *,
+    provider: str,
+    venue_name: str,
+    date: str,
+    party_size: int,
+    details: str = "",
+    venue_url: str = "",
+) -> str:
+    normalized_provider = provider.strip().title() or "provider"
+    lines = [
+        (
+            "RESTAURANT_TOOL_UNAVAILABLE: "
+            f"{normalized_provider} live availability verification failed due to repeated provider errors. "
+            "Continue with the hardened browser fallback to verify live slots and cancellation policy directly before booking."
+        ),
+        f"Venue: {venue_name}",
+        f"Date: {date}",
+        f"Party: {max(1, party_size)}",
+    ]
+    if details.strip():
+        lines.append(details.strip())
+    if venue_url.strip():
+        lines.append(f"Booking page: {venue_url.strip()}")
+    lines.append(
+        "If browser verification also fails, pause with provider_unavailable instead of retrying the same structured provider path."
+    )
+    return "\n".join(lines)
+
+
+def _restaurant_provider_label(provider: str) -> str:
+    normalized = normalize_restaurant_provider(provider)
+    if normalized == "opentable":
+        return "OpenTable"
+    if normalized == "resy":
+        return "Resy"
+    return normalized.title() or "provider"
+
+
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _assess_opentable_policy_text(page_text: str) -> OpenTablePolicyAssessment:
+    normalized = " ".join((page_text or "").split())
+    lowered = normalized.lower()
+    free_patterns = (
+        r"\bfree cancellation\b",
+        r"\bcancel(?:ation)?(?: is)? free\b",
+        r"\bcancel for free\b",
+        r"\bfully refundable\b",
+        r"\bno cancellation fee\b",
+    )
+    manual_patterns = (
+        r"\bcancellation fee\b",
+        r"\bdeposit\b",
+        r"\bprepaid\b",
+        r"\bnon-refundable\b",
+        r"\bwill be charged\b",
+        r"\bcancel within\b",
+        r"\bcard required\b",
+    )
+    for pattern in free_patterns:
+        match = re.search(pattern, lowered, flags=re.IGNORECASE)
+        if match:
+            return OpenTablePolicyAssessment(
+                free_cancellation=True,
+                requires_manual_confirmation=False,
+                policy_text=f"Cancellation policy: {match.group(0).strip()}",
+            )
+    for pattern in manual_patterns:
+        match = re.search(pattern, lowered, flags=re.IGNORECASE)
+        if match:
+            return OpenTablePolicyAssessment(
+                free_cancellation=False,
+                requires_manual_confirmation=True,
+                policy_text=f"Cancellation policy: {match.group(0).strip()}",
+            )
+    return OpenTablePolicyAssessment()
+
+
+def _opentable_requires_login_gate(page_text: str) -> bool:
+    lowered = " ".join((page_text or "").split()).lower()
+    if "continue with email" in lowered:
+        return True
+    required_markers = (
+        "enter your email",
+        "enter your password",
+        "log in to continue",
+        "sign in to continue",
+        "continue signing in",
+    )
+    return any(marker in lowered for marker in required_markers)
+
+
+def _maybe_raise_nonfree_opentable_confirmation(
+    assessment: OpenTablePolicyAssessment,
+    *,
+    venue_id: str,
+    venue_name: str = "",
+    venue_city: str = "",
+    date: str,
+    time: str,
+    party_size: int,
+    booking_url: str = "",
+) -> None:
+    if assessment.free_cancellation and not assessment.requires_manual_confirmation:
+        return
+    venue_label = venue_name.strip()
+    if venue_city.strip():
+        venue_label = f"{venue_label} ({venue_city.strip()})" if venue_label else venue_city.strip()
+    question = (
+        f"I could not verify that {venue_label or 'this OpenTable reservation'} has free cancellation, "
+        "so I need your explicit confirmation before booking it."
+    )
+    if assessment.policy_text and assessment.policy_text != "Cancellation policy: unavailable from the current OpenTable page.":
+        question = (
+            f"{venue_label or 'This OpenTable reservation'} is not clearly free to cancel, so I need your explicit confirmation before booking it. "
+            + assessment.policy_text
+        ).strip()
+    details_lines = [
+        "Provider: opentable",
+        f"Venue: {venue_label}" if venue_label else "",
+        f"Venue id: {venue_id}",
+        f"Date: {date}",
+        f"Time: {time}",
+        f"Party size: {max(1, party_size)}",
+        assessment.policy_text,
+        f"Booking page: {booking_url}" if booking_url else "",
+    ]
+    _raise_phase1_pause(
+        question=question,
+        details="\n".join(line for line in details_lines if line).strip(),
+        summary="waiting for your confirmation because this OpenTable booking is not proven free to cancel",
+        current_step="waiting_for_confirmation",
+        resume_instructions=(
+            "Only continue if the user explicitly confirms that Friday should proceed despite the OpenTable cancellation policy. "
+            "Otherwise, look for a free-cancellation alternative."
+        ),
+    )
+
+
+def _extract_booking_confirmation_reference(page_text: str) -> str:
+    patterns = (
+        r"(?:confirmation|reservation)\s*(?:number|id|#)\s*[:#]?\s*([A-Z0-9-]{4,})",
+        r"\b([A-Z0-9]{6,})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page_text or "", flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+async def _run_opentable_booking_browser_flow(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    booking_url: str,
+    venue_id: str,
+    venue_name: str,
+    venue_city: str,
+    date: str,
+    time: str,
+    party_size: int,
+) -> str:
+    session = BrowserSession(workspace, settings=settings)
+    try:
+        await session.start(booking_url)
+        requested_time_label = _render_clock_label(time)
+        try:
+            await session.click_text("Find a table")
+        except Exception:
+            pass
+        try:
+            await session.click_text(requested_time_label)
+        except Exception:
+            pass
+        body = await session.read(limit=12000)
+        lowered = body.lower()
+        if "select a seating option" in lowered:
+            try:
+                await session.click_text("Standard")
+            except Exception:
+                pass
+            body = await session.read(limit=12000)
+            lowered = body.lower()
+        if "standard reservation" in lowered:
+            try:
+                await session.click_text("Select")
+            except Exception:
+                pass
+            body = await session.read(limit=12000)
+            lowered = body.lower()
+        if _opentable_requires_login_gate(body):
+            email = _resolved_secret(settings, settings.opentable_email_param)
+            password = _resolved_secret(settings, settings.opentable_password_param)
+            if not email or not password:
+                _raise_phase1_pause(
+                    question="OpenTable needs a login session before I can continue this booking.",
+                    details=f"Venue: {venue_name or venue_id}\nBooking page: {booking_url}",
+                    summary="waiting for an OpenTable login session",
+                    current_step="login_required",
+                    resume_instructions="Provide or restore an OpenTable login session before continuing the same booking flow.",
+                )
+            for selector in (
+                "button:has-text('Sign in')",
+                "button:has-text('Log in')",
+                "text=Continue with email",
+            ):
+                if await session.has_selector(selector):
+                    await session.click(selector)
+                    break
+            for selector in ("input[type='email']", "input[name='email']", "input[autocomplete='email']"):
+                if await session.has_selector(selector):
+                    await session.type_text(selector, email)
+                    break
+            for selector in (
+                "button:has-text('Continue')",
+                "button:has-text('Next')",
+                "button:has-text('Sign in')",
+                "button:has-text('Log in')",
+            ):
+                if await session.has_selector(selector):
+                    await session.click(selector)
+                    break
+            for selector in ("input[type='password']", "input[name='password']", "input[autocomplete='current-password']"):
+                if await session.has_selector(selector):
+                    await session.type_text(selector, password)
+                    break
+            for selector in (
+                "button:has-text('Sign in')",
+                "button:has-text('Log in')",
+                "button:has-text('Continue')",
+            ):
+                if await session.has_selector(selector):
+                    await session.click(selector)
+                    break
+            body = await session.read(limit=12000)
+            lowered = body.lower()
+        if any(marker in lowered for marker in ("verification code", "one-time code", "otp", "captcha", "verify you are human")):
+            _raise_phase1_pause(
+                question="OpenTable requires an extra verification step before I can finish this booking.",
+                details=f"Venue: {venue_name or venue_id}\nBooking page: {booking_url}",
+                summary="waiting at an OpenTable verification wall",
+                current_step="verification_required",
+                resume_instructions="Pause until the verification challenge is cleared or a reusable OpenTable session is restored.",
+            )
+        try:
+            enforce_zero_dollar_booking(body)
+        except Exception as exc:
+            _handle_phase1_blocking_error(exc, action=f"opentable_booking_page({venue_id}, {date}, {time})")
+            raise
+        assessment = _assess_opentable_policy_text(body)
+        _maybe_raise_nonfree_opentable_confirmation(
+            assessment,
+            venue_id=venue_id,
+            venue_name=venue_name,
+            venue_city=venue_city,
+            date=date,
+            time=time,
+            party_size=party_size,
+            booking_url=booking_url,
+        )
+        for selector in (
+            "button:has-text('Complete reservation')",
+            "button:has-text('Confirm reservation')",
+            "button:has-text('Reserve now')",
+            "button:has-text('Book now')",
+            "button:has-text('Confirm')",
+            "button:has-text('Complete')",
+        ):
+            if await session.has_selector(selector):
+                await session.click(selector)
+                break
+        confirmation_text = await session.read(limit=12000)
+        if "confirmed" not in confirmation_text.lower() and "reservation complete" not in confirmation_text.lower():
+            return sanitize_tool_output(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "provider": "opentable",
+                        "booking_url": booking_url,
+                        "message": "OpenTable booking page was reached, but Friday could not verify a final confirmation automatically.",
+                        "policy": assessment.policy_text,
+                    }
+                )
+            )
+        confirmation_reference = _extract_booking_confirmation_reference(confirmation_text)
+        payload: dict[str, Any] = {
+            "ok": True,
+            "provider": "opentable",
+            "booking_url": booking_url,
+            "message": "OpenTable reservation confirmed.",
+            "policy": assessment.policy_text,
+        }
+        if confirmation_reference:
+            payload["confirmation_reference"] = confirmation_reference
+        return sanitize_tool_output(json.dumps(payload))
+    finally:
+        await session.close()
+
+
 def _enforce_automation_policy(
     store: StateStore,
     *,
@@ -381,12 +922,21 @@ def _direct_tool_mode_summary(query: str, routing_profile_name: str) -> str:
     lowered = query.lower()
     if routing_profile_name == "booking_commerce":
         if any(token in lowered for token in ("restaurant", "reservation", "resy", "opentable", "table")):
+            if _is_restaurant_discovery_request(query, routing_profile_name):
+                return (
+                    "This is a restaurant discovery task, not an approved booking task yet. "
+                    "Use restaurant_search first to build a shortlist of candidate venues, then use restaurant_availability or restaurant_find_availability only after the user has picked a specific restaurant or clearly asked for a single best option. "
+                    "Do not call restaurant_book_or_handoff yet. "
+                    "Do not stop on one venue's cancellation policy before you have named the venue and given the user a clear choice."
+                )
             return (
                 "This is a structured reservation task for restaurants. Use restaurant_search first to find the venue, "
                 "prefer restaurant_find_availability for the full search-plus-slots flow, and only use restaurant_book_or_handoff for an approved booking or manual handoff step. "
                 "For read-only availability checks, stay on the structured restaurant tools. "
                 "If the user asks to cancel or modify an existing reservation, first inspect saved bookings and current reservations, then use the saved browser session or a fresh login flow only if the structured tools cannot finish the account step cleanly. "
-                "If the structured path cannot verify live availability, return the structured result plus a clean handoff path instead of drifting into browser automation."
+                "If Resy cannot verify live availability, try OpenTable next before falling back to the hardened browser path. "
+                "Use the hardened browser fallback only after the structured provider sequence is exhausted, to verify the live slot and exact cancellation policy directly before booking. "
+                "Only pause with provider_unavailable after the browser fallback also fails or the user needs to choose a different venue, time, or booking source."
             )
         if any(token in lowered for token in ("flight", "flights", "hotel", "hotels", "rental car", "rental cars", "car rental", "car rentals")):
             return (
@@ -412,15 +962,127 @@ def _is_structured_restaurant_task(query: str, routing_profile_name: str) -> boo
     return any(token in lowered for token in ("restaurant", "reservation", "reservations", "resy", "opentable", "table"))
 
 
+_NUMBER_WORDS: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+
+def _extract_party_size_value(query: str) -> Optional[int]:
+    lowered = query.lower()
+    party_match = re.search(r"\b(?:for|table for|party of)\s+(\d+)\b", lowered) or re.search(
+        r"\b(\d+)\s+(?:people|persons|person|guests)\b",
+        lowered,
+    )
+    if party_match:
+        return max(1, int(party_match.group(1)))
+    word_match = re.search(
+        r"\b(?:for|table for|party of)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b",
+        lowered,
+    ) or re.search(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:people|persons|person|guests)\b",
+        lowered,
+    )
+    if word_match:
+        return _NUMBER_WORDS.get(word_match.group(1))
+    return None
+
+
+def _is_restaurant_discovery_request(query: str, routing_profile_name: str) -> bool:
+    if routing_profile_name != "booking_commerce":
+        return False
+    lowered = query.lower()
+    has_restaurant_context = any(
+        token in lowered
+        for token in (
+            "restaurant",
+            "restaurants",
+            "resy",
+            "opentable",
+            "table",
+            "dinner",
+            "lunch",
+            "brunch",
+            "breakfast",
+        )
+    )
+    if not has_restaurant_context:
+        return False
+    has_booking_intent = any(
+        token in lowered
+        for token in (
+            "book ",
+            "book me",
+            "reserve",
+            "reservation for",
+            "make a reservation",
+            "get me a table",
+            "secure a table",
+        )
+    )
+    has_discovery_intent = any(
+        token in lowered
+        for token in (
+            "find ",
+            "show ",
+            "list ",
+            "suggest ",
+            "recommend ",
+            "options",
+            "best ",
+            "good ",
+            "available ",
+        )
+    )
+    generic_plural_discovery = bool(
+        re.search(r"\b(find|show|list|suggest|recommend)\b", lowered)
+        and re.search(r"\brestaurants\b", lowered)
+    )
+    return generic_plural_discovery or (has_discovery_intent and not has_booking_intent)
+
+
 def _phase1_booking_runtime_guidance(query: str, routing_profile_name: str) -> str:
     lowered = query.lower()
     if routing_profile_name != "booking_commerce" and not any(
         token in lowered for token in ("login", "sign in", "account", "book", "booking", "reservation", "cancel")
     ):
         return ""
+    restaurant_booking_start = ""
+    if routing_profile_name == "booking_commerce":
+        has_restaurant_context = any(token in lowered for token in ("restaurant", "resy", "opentable", "table", "dinner", "lunch", "brunch", "breakfast"))
+        has_booking_intent = any(
+            token in lowered
+            for token in (
+                "book ",
+                "book me",
+                "reserve",
+                "reservation for",
+                "make a reservation",
+                "get me a table",
+                "secure a table",
+            )
+        )
+        if has_restaurant_context and has_booking_intent and not _restaurant_booking_missing_details(query, routing_profile_name):
+            restaurant_booking_start = (
+                "- For a complete restaurant booking request, start immediately with one restaurant_find_availability call using the user's venue, city, date, party size, and provider instead of spending turns narrating venue matching.\n"
+                "- If the first structured availability attempt is on Resy and it fails, try OpenTable next before falling back to browser verification.\n"
+                "- Use the hardened browser fallback only after the structured provider sequence is exhausted, to verify the slot and cancellation policy directly on the booking page.\n"
+            )
     return (
         "Phase 1 booking/account rules:\n"
         "- Friday may only autonomously complete $0 bookings in this flow. If a payment form, deposit, hold, fee, or non-zero total appears, stop immediately.\n"
+        f"{restaurant_booking_start}"
+        "- If the user is searching for restaurant options rather than explicitly booking one, first surface a shortlist with venue names, neighborhoods, and live slots when possible. Do not auto-pick one venue and then ask for confirmation about its cancellation policy before the user chooses.\n"
         "- Before or during login/account creation, call list_saved_identities to see if an existing identity already fits the site.\n"
         "- If an email verification step appears, call wait_for_email_verification instead of polling the inbox manually. The workflow will resume automatically when Gmail push delivers the code.\n"
         "- After a successful login or account creation, call browser_save_session so the site session can be reused later.\n"
@@ -720,14 +1382,20 @@ def _maybe_raise_nonfree_resy_confirmation(
     policy: Optional[RestaurantSlotPolicy],
     *,
     venue_id: str,
+    venue_name: str = "",
+    venue_city: str = "",
     date: str,
     time: str,
     party_size: int,
 ) -> None:
     if policy is not None and policy.free_cancellation:
         return
+    venue_label = venue_name.strip()
+    if venue_city.strip():
+        venue_label = f"{venue_label} ({venue_city.strip()})" if venue_label else venue_city.strip()
     details_lines = [
         f"Provider: resy",
+        f"Venue: {venue_label}" if venue_label else "",
         f"Venue id: {venue_id}",
         f"Date: {date}",
         f"Time: {time}",
@@ -741,11 +1409,11 @@ def _maybe_raise_nonfree_resy_confirmation(
     question = "I need your explicit confirmation before booking this Resy slot."
     if policy is None:
         question = (
-            "I could not verify whether this Resy slot has free cancellation, so I need your explicit confirmation before booking it."
+            f"I could not verify whether {venue_label or 'this Resy slot'} has free cancellation, so I need your explicit confirmation before booking it."
         )
     elif policy.policy_text:
         question = (
-            "This Resy slot is not free to cancel, so I need your explicit confirmation before booking it. "
+            f"{venue_label or 'This Resy slot'} is not free to cancel, so I need your explicit confirmation before booking it. "
             + policy.policy_text
         ).strip()
     _raise_phase1_pause(
@@ -762,6 +1430,8 @@ def _maybe_raise_nonfree_resy_confirmation(
 
 def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -> list[str]:
     if routing_profile_name != "booking_commerce":
+        return []
+    if _is_restaurant_discovery_request(query, routing_profile_name):
         return []
     lowered = query.lower()
     booking_intent = any(
@@ -781,7 +1451,7 @@ def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -
         return []
 
     missing: list[str] = []
-    if not re.search(r"\b(?:party of|table for|for)\s+\d+\b", lowered) and not re.search(r"\b\d+\s+(?:people|persons|person|guests)\b", lowered):
+    if _extract_party_size_value(query) is None:
         missing.append("party size")
 
     has_date = bool(
@@ -804,6 +1474,406 @@ def _restaurant_booking_missing_details(query: str, routing_profile_name: str) -
     return missing
 
 
+def _normalize_restaurant_booking_date(raw_date: str, *, settings: Settings) -> str:
+    value = raw_date.strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    timezone_name = settings.restaurant_cli_timezone or "America/New_York"
+    try:
+        current = datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        current = datetime.now(timezone.utc)
+    if lowered in {"today", "tonight"}:
+        return current.date().isoformat()
+    if lowered == "tomorrow":
+        return (current.date() + timedelta(days=1)).isoformat()
+    for fmt in ("%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%A, %B %d, %Y", "%A, %b %d, %Y"):
+        with_value = value
+        try:
+            return datetime.strptime(with_value, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return value
+
+
+def _extract_restaurant_booking_prefill(query: str, *, settings: Settings, routing_profile_name: str) -> Optional[RestaurantBookingPrefill]:
+    if routing_profile_name != "booking_commerce":
+        return None
+    if _restaurant_booking_missing_details(query, routing_profile_name):
+        return None
+    lowered = query.lower()
+    if not any(token in lowered for token in ("book ", "book me", "reserve", "reservation", "get me a table", "secure a table")):
+        return None
+    if not any(token in lowered for token in ("resy", "opentable", "restaurant", "table", "dinner", "lunch", "brunch", "breakfast")):
+        return None
+
+    provider = "resy" if "resy" in lowered else "opentable" if "opentable" in lowered else "resy"
+
+    party_size = _extract_party_size_value(query)
+    if party_size is None:
+        return None
+
+    time_match = re.search(r"\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lowered) or re.search(
+        r"\bat\s+(\d{1,2}:\d{2})\b",
+        lowered,
+    )
+    if not time_match:
+        return None
+    time_value = time_match.group(1).strip()
+
+    date_value = ""
+    date_patterns = (
+        r"\b(today|tomorrow|tonight)\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\b",
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\b",
+    )
+    for pattern in date_patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            date_value = match.group(0)
+            break
+    if not date_value:
+        return None
+
+    city = ""
+    city_match = re.search(
+        r"\bin\s+([a-z0-9 .'-]+?)(?=\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b|\s+on\s+(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|\d{4}-\d{2}-\d{2})\b|\s+at\s+\d|\s*$)",
+        lowered,
+    )
+    if city_match:
+        city = city_match.group(1).strip(" ,.")
+
+    venue_query = query.strip()
+    venue_match = re.search(
+        r"\b(?:book|reserve|get me a table at|get me a table for|secure a table at|make a reservation at)\s+(.+?)(?=\s+in\s+[A-Za-z0-9 .'-]+?(?:\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b)|\s+on\s+(?:resy|opentable)\b|\s+for\s+\d+\b|\s+\d+\s+(?:people|persons|person|guests)\b|\s+on\s+(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|\d{4}-\d{2}-\d{2})\b|\s+at\s+\d|\s*$)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if venue_match:
+        venue_query = venue_match.group(1).strip(" ,.")
+    if not venue_query:
+        return None
+
+    normalized_date = _normalize_restaurant_booking_date(date_value, settings=settings)
+    if not normalized_date:
+        return None
+    return RestaurantBookingPrefill(
+        venue_query=venue_query,
+        city=city.title() if city else "",
+        provider=provider,
+        date=normalized_date,
+        time=time_value.upper(),
+        party_size=party_size,
+    )
+
+
+async def _restaurant_search_with_city_fallback(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    query: str,
+    provider: str,
+    city: str = "",
+    limit: int = 8,
+    timeout_seconds: int = 25,
+) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    normalized_provider = normalize_restaurant_provider(provider)
+    city_value = city.strip()
+    attempted_cities = [city_value] if city_value else [""]
+    if city_value:
+        attempted_cities.append("")
+
+    last_payload: dict[str, Any] = {"results": [], "failures": []}
+    for attempt_city in attempted_cities:
+        search_args = [
+            "search",
+            query,
+            "--limit",
+            str(max(1, min(limit, 25))),
+            "--provider",
+            normalized_provider,
+            "--agent",
+        ]
+        if attempt_city:
+            search_args.extend(["--city", attempt_city])
+        payload = await run_restaurant_cli_json(
+            settings,
+            workspace,
+            *search_args,
+            timeout_seconds=timeout_seconds,
+        )
+        last_payload = payload if isinstance(payload, dict) else {"results": [], "failures": []}
+        results = list(last_payload.get("results") or [])
+        best_match = choose_best_restaurant_result(query, results)
+        if best_match is not None:
+            if city_value and not attempt_city:
+                last_payload = dict(last_payload)
+                last_payload["city_filter_relaxed"] = True
+            return last_payload, best_match
+    return last_payload, None
+
+
+async def _restaurant_search_attempts(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    query: str,
+    provider: str,
+    city: str = "",
+    limit: int = 8,
+    timeout_seconds: int = 25,
+) -> list[RestaurantSearchAttempt]:
+    attempts: list[RestaurantSearchAttempt] = []
+    for provider_name in restaurant_provider_sequence(provider):
+        try:
+            payload, best_match = await _restaurant_search_with_city_fallback(
+                settings=settings,
+                workspace=workspace,
+                query=query,
+                provider=provider_name,
+                city=city,
+                limit=limit,
+                timeout_seconds=timeout_seconds,
+            )
+            attempts.append(
+                RestaurantSearchAttempt(
+                    provider=provider_name,
+                    payload=payload if isinstance(payload, dict) else {"results": [], "failures": []},
+                    best_match=best_match,
+                )
+            )
+        except Exception as exc:
+            attempts.append(
+                RestaurantSearchAttempt(
+                    provider=provider_name,
+                    payload={"results": [], "failures": []},
+                    best_match=None,
+                    error=str(exc),
+                )
+            )
+    return attempts
+
+
+def _render_restaurant_search_shortlist(
+    *,
+    query: str,
+    attempts: list[RestaurantSearchAttempt],
+    city: str = "",
+    limit: int = 8,
+) -> str:
+    lines = [f"Candidate venues for {query}:"]
+    any_results = False
+    for attempt in attempts:
+        provider_label = _restaurant_provider_label(attempt.provider)
+        if attempt.error:
+            lines.append(f"- {provider_label}: search failed because {attempt.error}")
+            continue
+        payload = attempt.payload if isinstance(attempt.payload, dict) else {}
+        results = list(payload.get("results") or [])
+        if not results:
+            relaxed = " after relaxing the city filter" if payload.get("city_filter_relaxed") else ""
+            lines.append(f"- {provider_label}: no matches{relaxed}.")
+            continue
+        any_results = True
+        lines.append(f"- {provider_label}:")
+        for item in results[: max(1, min(limit, 5))]:
+            name = str(item.get("name") or "").strip() or "Unknown venue"
+            venue_city = str(item.get("city") or "").strip()
+            venue_url = str(item.get("url") or "").strip()
+            line = f"  - {name}"
+            if venue_city:
+                line += f" ({venue_city})"
+            if venue_url:
+                line += f" — {venue_url}"
+            lines.append(line)
+        if payload.get("city_filter_relaxed") and city.strip():
+            lines.append(f"  - note: this provider only matched after relaxing the city filter from '{city.strip()}'.")
+    if not any_results:
+        lines.append("No structured providers returned usable matches.")
+    lines.append("Pick one venue if you want a specific availability check, or ask for another area, cuisine, or provider.")
+    return sanitize_tool_output("\n".join(lines))
+
+
+async def _restaurant_booking_preflight(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    prefill: RestaurantBookingPrefill,
+) -> str:
+    attempts = await _restaurant_search_attempts(
+        settings=settings,
+        workspace=workspace,
+        query=prefill.venue_query,
+        provider=prefill.provider,
+        city=prefill.city,
+        limit=8,
+        timeout_seconds=25,
+    )
+    browser_probe_candidate: Optional[tuple[str, str, str, str, str]] = None
+    failure_lines: list[str] = []
+    requested_time = prefill.time.lower().replace(" ", "")
+    for attempt in attempts:
+        normalized_provider = normalize_restaurant_provider(attempt.provider)
+        provider_label = _restaurant_provider_label(normalized_provider)
+        if attempt.error:
+            failure_lines.append(f"{provider_label} search failed because {attempt.error}.")
+            continue
+        search_payload = attempt.payload if isinstance(attempt.payload, dict) else {}
+        best_match = attempt.best_match
+        if best_match is None:
+            failure_lines.append(f"{provider_label} had no structured match for {prefill.venue_query}.")
+            continue
+        venue_id = str(best_match.get("id") or "").strip()
+        venue_name = str(best_match.get("name") or prefill.venue_query).strip() or prefill.venue_query
+        venue_city = str(best_match.get("city") or "").strip()
+        venue_url = str(best_match.get("url") or "").strip()
+        if not venue_id:
+            failure_lines.append(f"{provider_label} matched {venue_name}, but returned no usable venue id.")
+            continue
+        if normalized_provider == "resy" and venue_url and browser_probe_candidate is None:
+            browser_probe_candidate = (venue_id, venue_name, venue_city, venue_url, normalized_provider)
+        availability_args = [
+            "availability",
+            "--venue",
+            venue_id,
+            "--date",
+            prefill.date,
+            "--party",
+            str(prefill.party_size),
+            "--provider",
+            normalized_provider,
+            "--agent",
+        ]
+        try:
+            slots_payload = await run_restaurant_cli_json(
+                settings,
+                workspace,
+                *availability_args,
+                timeout_seconds=35,
+            )
+        except Exception as exc:
+            failure_lines.append(
+                f"{provider_label} availability failed for {venue_name}"
+                + (f" ({venue_city})" if venue_city else "")
+                + f" because {exc}."
+            )
+            continue
+        slots = slots_payload if isinstance(slots_payload, list) else []
+        policy_map: dict[str, RestaurantSlotPolicy] = {}
+        if normalized_provider == "resy" and slots:
+            try:
+                policy_map = await fetch_resy_slot_policies(
+                    settings,
+                    venue_id=venue_id,
+                    date=prefill.date,
+                    party_size=max(1, prefill.party_size),
+                )
+            except Exception:
+                policy_map = {}
+        exact_match = None
+        for slot in slots:
+            slot_time = str(slot.get("time") or "").strip()
+            if slot_time.lower().replace(" ", "") == requested_time:
+                exact_match = slot
+                break
+        lines = [
+            "STRUCTURED_BOOKING_PREFLIGHT:",
+            f"Matched venue: {venue_name}" + (f" ({venue_city})" if venue_city else ""),
+            f"Venue id: {venue_id}",
+            f"Provider: {normalized_provider}",
+            f"Booking page: {venue_url}" if venue_url else "Booking page: unavailable",
+            f"Requested date: {prefill.date}",
+            f"Requested time: {prefill.time}",
+            f"Party size: {prefill.party_size}",
+        ]
+        if search_payload.get("city_filter_relaxed"):
+            lines.append(f"Venue search only matched after relaxing the city filter from '{prefill.city}'.")
+        if exact_match is not None:
+            lines.append(f"Exact requested time is present in the structured slot list: {str(exact_match.get('time') or '').strip()}.")
+            slot_token = str(exact_match.get("token") or "").strip()
+            policy = policy_map.get(slot_token)
+            if policy is not None and policy.policy_text:
+                lines.append(f"Cancellation policy: {policy.policy_text}")
+        elif slots:
+            lines.append("Exact requested time was not found in the structured slot list.")
+            lines.append("Closest structured slots:")
+            for slot in slots[:5]:
+                slot_time = str(slot.get("time") or "").strip()
+                line = f"- {slot_time or '(unknown time)'}"
+                slot_token = str(slot.get("token") or "").strip()
+                policy = policy_map.get(slot_token)
+                if policy is not None and policy.policy_text:
+                    line += f" — {policy.policy_text}"
+                lines.append(line)
+        else:
+            lines.append("Structured availability returned no slots.")
+        lines.append(
+            "Use this preflight context immediately. If structured slot verification is incomplete, continue through the provider sequence before using the browser fallback."
+        )
+        if normalized_provider == "resy" and venue_url:
+            probe = await _run_resy_browser_probe(
+                settings=settings,
+                workspace=workspace,
+                venue_url=venue_url,
+                venue_name=venue_name,
+                venue_city=venue_city,
+                date=prefill.date,
+                time=prefill.time,
+                party_size=prefill.party_size,
+            )
+            if probe is not None:
+                lines.append("")
+                lines.append(
+                    _render_resy_browser_probe_summary(
+                        probe,
+                        venue_id=venue_id,
+                        venue_name=venue_name,
+                        venue_city=venue_city,
+                        date=prefill.date,
+                        time=prefill.time,
+                        party_size=prefill.party_size,
+                    )
+                )
+        return sanitize_tool_output("\n".join(lines))
+    if browser_probe_candidate is not None:
+        venue_id, venue_name, venue_city, venue_url, _provider_name = browser_probe_candidate
+        probe = await _run_resy_browser_probe(
+            settings=settings,
+            workspace=workspace,
+            venue_url=venue_url,
+            venue_name=venue_name,
+            venue_city=venue_city,
+            date=prefill.date,
+            time=prefill.time,
+            party_size=prefill.party_size,
+        )
+        if probe is not None:
+            return _render_resy_browser_probe_summary(
+                probe,
+                venue_id=venue_id,
+                venue_name=venue_name,
+                venue_city=venue_city,
+                date=prefill.date,
+                time=prefill.time,
+                party_size=prefill.party_size,
+            )
+    if failure_lines:
+        return sanitize_tool_output(
+            _restaurant_provider_browser_fallback_message(
+                provider=restaurant_provider_sequence(prefill.provider)[0],
+                venue_name=prefill.venue_query,
+                date=prefill.date,
+                party_size=prefill.party_size,
+                details="\n".join(failure_lines[:6]),
+            )
+        )
+    return sanitize_tool_output(
+        f"RESTAURANT_PREFLIGHT_NO_MATCH: no structured venue match was found for {prefill.venue_query}."
+    )
+
+
 def _select_model(query: str, settings: Settings) -> str:
     lowered = query.lower()
     if any(token in lowered for token in ("think deeply", "reason", "plan carefully", "complex")):
@@ -818,27 +1888,40 @@ async def _run_travel_browser_fallback(
     task: str,
     max_pages: int = 2,
     max_steps: int = 8,
+    strategy_mode: str = STRATEGY_API_DIRECT,
 ) -> str:
+    if strategy_mode == STRATEGY_API_DIRECT:
+        return "BROWSER_TASK_UNAVAILABLE: browser escalation is disabled in API_DIRECT strategy mode."
+    if strategy_mode == STRATEGY_BROWSER_USE_VISUAL_PIVOT:
+        if workspace is None:
+            raise RuntimeError("BROWSER_USE_VISUAL_PIVOT requires a workspace.")
+        if not settings.browser_use_enabled:
+            return "BROWSER_TASK_UNAVAILABLE: Browser Use is disabled in BROWSER_USE_VISUAL_PIVOT strategy mode."
+        return await run_browser_use_task(
+            (
+                "Visual travel pivot mode. Use visual browser automation as the active fallback for this run. "
+                "Stay tightly scoped and summarize the best live options clearly.\n\n"
+                + task
+            ),
+            max_pages=max(1, min(max_pages, 2)),
+            max_steps=max(10, min(max_steps * 2, 16)),
+            settings=settings,
+            workspace=workspace,
+            enable_optional_mcps=False,
+        )
     scoped_task = (
         "Travel fallback mode. The structured travel tools were unavailable or rate-limited. "
         "Use Google Travel / Google Flights / Google Hotels, Kayak, or another mainstream travel source only as needed. "
         "Stay tightly scoped and summarize the best options clearly.\n\n"
         + task
     )
-    public_web_result = await run_browser_task(
-        scoped_task,
-        max_pages=max_pages,
-        max_steps=max_steps,
-    )
-    if not _browser_fallback_failed(public_web_result):
-        return public_web_result
     if workspace is None:
-        raise RuntimeError(public_web_result)
+        return "BROWSER_TASK_UNAVAILABLE: workspace is unavailable for browser strategy execution."
 
     stagehand_result = await run_stagehand_task(
         (
             "Travel interaction fallback. The direct travel tools were unavailable or rate-limited, "
-            "and the lightweight public-web pass could not gather enough data. "
+            "and this strategy run is explicitly using Stagehand before any other browser fallback. "
             "Use at most one or two mainstream travel sites, keep steps bounded, and return the best live options you can verify.\n\n"
             + task
         ),
@@ -846,38 +1929,7 @@ async def _run_travel_browser_fallback(
         settings=settings,
         workspace=workspace,
     )
-    if not _browser_fallback_failed(stagehand_result):
-        return stagehand_result
-
-    if not settings.browser_use_enabled:
-        raise RuntimeError(
-            "public-web and stagehand travel fallback failed. "
-            f"Public-web result: {public_web_result}. "
-            f"Stagehand result: {stagehand_result}."
-        )
-
-    interaction_result = await run_browser_use_task(
-        (
-            "Last-resort travel interaction mode. The direct travel tools were unavailable or rate-limited, "
-            "the lightweight public-web pass was insufficient, and the Stagehand browser pass did not finish cleanly. "
-            "Use at most one or two mainstream travel sites, keep steps bounded, avoid loops, "
-            "and return the best live options you can find.\n\n"
-            + task
-        ),
-        max_pages=max(1, min(max_pages, 2)),
-        max_steps=max(10, min(max_steps * 2, 16)),
-        settings=settings,
-        workspace=workspace,
-        enable_optional_mcps=False,
-    )
-    if _browser_fallback_failed(interaction_result):
-        raise RuntimeError(
-            "public-web fallback failed, Stagehand fallback failed, and last-resort browser interaction also failed. "
-            f"Public-web result: {public_web_result}. "
-            f"Stagehand result: {stagehand_result}. "
-            f"Interaction result: {interaction_result}."
-        )
-    return interaction_result
+    return stagehand_result
 
 
 def _browser_fallback_failed(result: str) -> bool:
@@ -908,41 +1960,42 @@ async def _run_general_browser_task(
     task: str,
     max_pages: int,
     max_steps: int,
+    strategy_mode: str = STRATEGY_API_DIRECT,
 ) -> str:
-    public_web_result = await run_browser_task(
+    if strategy_mode == STRATEGY_API_DIRECT:
+        return "BROWSER_TASK_UNAVAILABLE: browser interaction is disabled in API_DIRECT strategy mode."
+    if workspace is None:
+        return "BROWSER_TASK_UNAVAILABLE: workspace is unavailable for browser strategy execution."
+    if strategy_mode == STRATEGY_STAGEHAND_STEALTH_ACT:
+        return await run_stagehand_task(
+            (
+                "Stagehand browser escalation mode. Use Stagehand as the primary browser strategy for this run. "
+                "Keep steps bounded and finish with a concise summary.\n\n"
+                + task
+            ),
+            max_steps=max_steps,
+            settings=settings,
+            workspace=workspace,
+        )
+    if strategy_mode == STRATEGY_BROWSER_USE_VISUAL_PIVOT:
+        if not settings.browser_use_enabled:
+            return "BROWSER_TASK_UNAVAILABLE: Browser Use is disabled in BROWSER_USE_VISUAL_PIVOT strategy mode."
+        return await run_browser_use_task(
+            (
+                "Visual browser escalation mode. Use Browser Use as the active strategy for this run. "
+                "Keep the steps bounded and finish with a concise summary.\n\n"
+                + task
+            ),
+            max_pages=max_pages,
+            max_steps=max_steps,
+            settings=settings,
+            workspace=workspace,
+            enable_optional_mcps=False,
+        )
+    return await run_browser_task(
         task,
         max_pages=max_pages,
         max_steps=max_steps,
-    )
-    if not _browser_fallback_failed(public_web_result):
-        return public_web_result
-    if workspace is None:
-        return public_web_result
-    stagehand_result = await run_stagehand_task(
-        (
-            "Interactive browser escalation mode. The lightweight public-web pass could not gather enough information. "
-            "Use browser automation only as needed, keep steps bounded, and finish with a concise summary.\n\n"
-            + task
-        ),
-        max_steps=max_steps,
-        settings=settings,
-        workspace=workspace,
-    )
-    if not _browser_fallback_failed(stagehand_result):
-        return stagehand_result
-    if not settings.browser_use_enabled:
-        return stagehand_result
-    return await run_browser_use_task(
-        (
-            "Last-resort browser escalation mode. The lightweight public-web pass was insufficient and the Stagehand browser pass did not finish cleanly. "
-            "Use browser automation only as needed, keep the steps bounded, and finish with a concise summary.\n\n"
-            + task
-        ),
-        max_pages=max_pages,
-        max_steps=max_steps,
-        settings=settings,
-        workspace=workspace,
-        enable_optional_mcps=False,
     )
 
 
@@ -957,6 +2010,28 @@ def _current_local_datetime_text(settings: Settings) -> str:
     return (
         f"Current local date/time: {rendered} ({timezone_name}). "
         "Resolve relative dates like today, tomorrow, this Friday, and next week against this timestamp."
+    )
+
+
+def _restaurant_browser_availability_task(
+    *,
+    booking_url: str,
+    venue_name: str,
+    venue_city: str,
+    provider_label: str,
+    date: str,
+    party_size: int,
+) -> str:
+    venue_line = venue_name + (f" in {venue_city}" if venue_city else "")
+    return (
+        f"Open {booking_url}. "
+        f"Use the live {provider_label} booking flow for {venue_line} on {date} for {party_size} people. "
+        "Do not just summarize the landing screen. "
+        "Actively set or confirm the requested date and party size, then open the reservation time area and interact with the page controls if needed to reveal actual bookable times. "
+        "If times are available, list the visible bookable times. "
+        "If no times are available, say that clearly. "
+        "Also include any visible cancellation, deposit, or prepaid reservation language. "
+        "Keep it concise and plain text."
     )
 
 
@@ -1036,6 +2111,7 @@ async def run_agent(
     config: Optional[AgentConfig] = None,
     resume_checkpoint: Optional[CheckpointPayload] = None,
     current_job: Optional[AgentJob] = None,
+    strategy_mode: str = STRATEGY_API_DIRECT,
 ) -> AgentResult:
     spend_target = spend_store or store
     if not spend_target.budget_available():
@@ -1056,8 +2132,8 @@ async def run_agent(
     attachments = attachment_names or []
     effective_config = config or AgentConfig()
     routing_profile = task_routing_profile(query)
-    allow_browser_tools = _should_expose_browser_tools(query, routing_profile.name)
-    allow_travel_browser_fallback = _should_expose_travel_browser_fallback(query, routing_profile.name)
+    allow_browser_tools = _should_expose_browser_tools(query, routing_profile.name) and strategy_mode != STRATEGY_API_DIRECT
+    allow_travel_browser_fallback = _should_expose_travel_browser_fallback(query, routing_profile.name) and strategy_mode != STRATEGY_API_DIRECT
     structured_restaurant_task = _is_structured_restaurant_task(query, routing_profile.name)
     missing_restaurant_booking_details = _restaurant_booking_missing_details(query, routing_profile.name)
     effective_query = _render_user_query(
@@ -1074,6 +2150,9 @@ async def run_agent(
     )
 
     if mode == "heavy":
+        strategy_note = strategy_guidance(strategy_mode)
+        if strategy_note:
+            effective_query += "\n\nExecution strategy:\n" + strategy_note
         _ensure_default_mailbox_identity(settings, store)
         if not _should_skip_booking_cancellation_precheck(
             query=query,
@@ -1096,6 +2175,18 @@ async def run_agent(
                 current_step="waiting_for_user_input",
                 resume_instructions="Use the provided booking details to continue the same reservation flow without asking again for the same fields.",
             )
+        prefill = _extract_restaurant_booking_prefill(query, settings=settings, routing_profile_name=routing_profile.name)
+        if prefill is not None and workspace is not None:
+            preflight_summary = await _restaurant_booking_preflight(
+                settings=settings,
+                workspace=workspace,
+                prefill=prefill,
+            )
+            effective_query += (
+                "\n\nStructured restaurant preflight:\n"
+                + preflight_summary
+                + "\n\nStart from this preflight context. Do not spend extra turns re-matching the same venue before taking the next concrete action."
+            )
 
     deps = AgentDependencies(
         settings=settings,
@@ -1103,6 +2194,7 @@ async def run_agent(
         workspace=workspace,
         browser=BrowserSession(workspace=workspace, settings=settings) if mode == "heavy" else None,
         current_job=current_job,
+        strategy_mode=strategy_mode,
     )
     system_prompt = STATIC_SYSTEM_PROMPT
     if effective_config.agent_name.strip() and effective_config.agent_name.strip() != "Friday":
@@ -1223,6 +2315,7 @@ async def run_agent(
                                 "Prefer nonstop or low-stop options when they are clearly better value. "
                                 "Summarize the best options with airline, times, duration, and price."
                             ),
+                            strategy_mode=ctx.deps.strategy_mode,
                         )
                     except Exception as fallback_exc:
                         logger.warning(
@@ -1311,6 +2404,7 @@ async def run_agent(
                                 f"for {max(1, adults)} adult(s) and {max(1, rooms)} room(s). "
                                 "Use Google Travel / Google Hotels first and summarize strong options with nightly price, total price, rating, and neighborhood."
                             ),
+                            strategy_mode=ctx.deps.strategy_mode,
                         )
                     except Exception as fallback_exc:
                         logger.warning("travel_search_hotels fallback degraded city=%s error=%s", city, fallback_exc)
@@ -1364,6 +2458,7 @@ async def run_agent(
                                 + (f" in {dropoff_location}" if dropoff_location.strip() else "")
                                 + ". Summarize strong options with company, vehicle class, cancellation terms if shown, and total price."
                             ),
+                            strategy_mode=ctx.deps.strategy_mode,
                         )
                     except Exception as fallback_exc:
                         logger.warning("travel_search_cars fallback degraded pickup_location=%s error=%s", pickup_location, fallback_exc)
@@ -1415,195 +2510,90 @@ async def run_agent(
                 city: str = "",
                 limit: int = 8,
             ) -> str:
-                """Search for a restaurant venue and then fetch live availability for the best match in one step. Prefer this for restaurant reservation research."""
+                """Fetch live availability for a specific restaurant venue. Use restaurant_search first for cuisine discovery or multi-option venue research."""
                 assert ctx.deps.workspace is not None
-                normalized_provider = normalize_restaurant_provider(provider)
-                search_args = [
-                    "search",
-                    query,
-                    "--limit",
-                    str(max(1, min(limit, 25))),
-                    "--provider",
-                    normalized_provider,
-                    "--agent",
-                ]
-                if city.strip():
-                    search_args.extend(["--city", city.strip()])
-                try:
-                    search_payload = await run_restaurant_cli_json(
-                        ctx.deps.settings,
-                        ctx.deps.workspace,
-                        *search_args,
-                        timeout_seconds=25,
+                attempts = await _restaurant_search_attempts(
+                    settings=ctx.deps.settings,
+                    workspace=ctx.deps.workspace,
+                    query=query,
+                    provider=provider,
+                    city=city,
+                    limit=limit,
+                    timeout_seconds=25,
+                )
+                if _is_restaurant_discovery_request(query, "booking_commerce"):
+                    return _render_restaurant_search_shortlist(
+                        query=query,
+                        attempts=attempts,
+                        city=city,
+                        limit=limit,
                     )
-                except Exception as exc:
-                    logger.warning("restaurant_find_availability search degraded query=%s provider=%s error=%s", query, provider, exc)
-                    return sanitize_tool_output(
-                        f"RESTAURANT_TOOL_UNAVAILABLE: restaurant search failed because {exc}."
-                    )
-                results = list(search_payload.get("results") or []) if isinstance(search_payload, dict) else []
-                failures = list(search_payload.get("failures") or []) if isinstance(search_payload, dict) else []
-                best_match = choose_best_restaurant_result(query, results)
-                if best_match is None:
-                    return sanitize_tool_output(
-                        f"I could not find a matching {normalized_provider.title()} venue for {query}."
-                    )
-                venue_id = str(best_match.get("id") or "").strip()
-                venue_name = str(best_match.get("name") or query).strip() or query
-                venue_city = str(best_match.get("city") or "").strip()
-                venue_url = str(best_match.get("url") or "").strip()
-                if not venue_id:
-                    return sanitize_tool_output(
-                        f"I found a likely match for {venue_name}, but I could not resolve a usable venue id for live availability."
-                    )
-                availability_args = [
-                    "availability",
-                    "--venue",
-                    venue_id,
-                    "--date",
-                    date,
-                    "--party",
-                    str(max(1, party_size)),
-                    "--provider",
-                    normalized_provider,
-                    "--agent",
-                ]
-                try:
-                    slots_payload = await run_restaurant_cli_json(
-                        ctx.deps.settings,
-                        ctx.deps.workspace,
-                        *availability_args,
-                        timeout_seconds=35,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "restaurant_find_availability availability degraded query=%s venue_id=%s provider=%s error=%s",
-                        query,
-                        venue_id,
-                        provider,
-                        exc,
-                    )
-                    if normalized_provider == "resy":
-                        try:
-                            resy_policy_by_token = await fetch_resy_slot_policies(
-                                ctx.deps.settings,
-                                venue_id=venue_id,
+                browser_probe_candidate: Optional[tuple[str, str, str, str]] = None
+                failure_lines: list[str] = []
+                for attempt in attempts:
+                    normalized_provider = normalize_restaurant_provider(attempt.provider)
+                    provider_label = _restaurant_provider_label(normalized_provider)
+                    if attempt.error:
+                        logger.warning(
+                            "restaurant_find_availability search degraded query=%s provider=%s error=%s",
+                            query,
+                            attempt.provider,
+                            attempt.error,
+                        )
+                        failure_lines.append(f"{provider_label} search failed because {attempt.error}.")
+                        continue
+                    search_payload = attempt.payload if isinstance(attempt.payload, dict) else {}
+                    failures = list(search_payload.get("failures") or [])
+                    best_match = attempt.best_match
+                    if best_match is None:
+                        failure_lines.append(f"{provider_label} had no matching venue for {query}.")
+                        continue
+                    venue_id = str(best_match.get("id") or "").strip()
+                    venue_name = str(best_match.get("name") or query).strip() or query
+                    venue_city = str(best_match.get("city") or "").strip()
+                    venue_url = str(best_match.get("url") or "").strip()
+                    if not venue_id:
+                        failure_lines.append(f"{provider_label} matched {venue_name}, but returned no usable venue id.")
+                        continue
+                    if normalized_provider == "resy" and venue_url and browser_probe_candidate is None:
+                        browser_probe_candidate = (venue_id, venue_name, venue_city, venue_url)
+                    if ctx.deps.strategy_mode != STRATEGY_API_DIRECT:
+                        if not venue_url:
+                            failure_lines.append(
+                                f"{provider_label} matched {venue_name}, but there was no live booking page URL to inspect in {ctx.deps.strategy_mode} mode."
+                            )
+                            continue
+                        browser_booking_url = venue_url
+                        if normalized_provider == "resy":
+                            browser_booking_url = _build_resy_booking_page_url(
+                                venue_url,
                                 date=date,
                                 party_size=max(1, party_size),
                             )
-                        except Exception as policy_exc:
-                            logger.warning(
-                                "restaurant_find_availability direct resy fallback failed query=%s venue_id=%s error=%s",
-                                query,
-                                venue_id,
-                                policy_exc,
-                            )
-                        else:
-                            return sanitize_tool_output(
-                                _render_resy_policy_slot_lines(
-                                    resy_policy_by_token,
-                                    date=date,
-                                    party_size=party_size,
-                                    venue_name=venue_name,
-                                    venue_city=venue_city,
-                                    venue_url=venue_url,
-                                )
-                            )
-                    _raise_restaurant_provider_unavailable_pause(
-                        provider=normalized_provider,
-                        venue_name=venue_name + (f" ({venue_city})" if venue_city else ""),
-                        date=date,
-                        party_size=party_size,
-                        details=f"The provider returned repeated errors while checking live availability.",
-                        venue_url=venue_url,
-                    )
-                slots = slots_payload if isinstance(slots_payload, list) else []
-                resy_policy_by_token: dict[str, RestaurantSlotPolicy] = {}
-                if normalized_provider == "resy" and slots:
-                    try:
-                        resy_policy_by_token = await fetch_resy_slot_policies(
-                            ctx.deps.settings,
-                            venue_id=venue_id,
-                            date=date,
-                            party_size=max(1, party_size),
+                        browser_summary = await _run_general_browser_task(
+                            settings=ctx.deps.settings,
+                            workspace=ctx.deps.workspace,
+                            task=_restaurant_browser_availability_task(
+                                booking_url=browser_booking_url,
+                                venue_name=venue_name,
+                                venue_city=venue_city,
+                                provider_label=provider_label,
+                                date=date,
+                                party_size=max(1, party_size),
+                            ),
+                            max_pages=2,
+                            max_steps=12,
+                            strategy_mode=ctx.deps.strategy_mode,
                         )
-                    except Exception as exc:
-                        logger.warning(
-                            "restaurant_find_availability policy degraded query=%s venue_id=%s provider=%s error=%s",
-                            query,
-                            venue_id,
-                            provider,
-                            exc,
-                        )
-                lines = [
-                    f"Matched venue: {venue_name}"
-                    + (f" ({venue_city})" if venue_city else "")
-                    + f" on {normalized_provider.title()}",
-                ]
-                if venue_url:
-                    lines.append(f"Booking page: {venue_url}")
-                if slots:
-                    lines.append(f"Live availability for {date} for {max(1, party_size)} people:")
-                    for slot in slots[:12]:
-                        slot_time = str(slot.get('time') or '').strip()
-                        slot_type = str(slot.get('type') or '').strip()
-                        if slot_time:
-                            line = f"- {slot_time}" + (f" ({slot_type})" if slot_type else "")
-                            slot_token = str(slot.get("token") or "").strip()
-                            policy = resy_policy_by_token.get(slot_token)
-                            if policy is not None and policy.policy_text:
-                                line += f" — {policy.policy_text}"
-                            lines.append(line)
-                else:
-                    lines.append(f"No live slots were returned for {date} for {max(1, party_size)} people.")
-                if failures:
-                    provider_labels = ", ".join(str(item.get("provider") or "provider") for item in failures[:3])
-                    lines.append(f"Other provider lookups also had issues: {provider_labels}.")
-                return sanitize_tool_output("\n".join(lines))
-
-            if not structured_restaurant_task:
-
-                @agent.tool
-                async def restaurant_search(
-                    ctx: RunContext[AgentDependencies],
-                    query: str,
-                    provider: str = "resy",
-                    city: str = "",
-                    limit: int = 10,
-                ) -> str:
-                    """Search restaurant venues with Resy by default. Use OpenTable only when explicitly requested."""
-                    assert ctx.deps.workspace is not None
-                    normalized_provider = normalize_restaurant_provider(provider)
-                    args = ["search", query, "--limit", str(max(1, min(limit, 25))), "--agent"]
-                    args.extend(["--provider", normalized_provider])
-                    if city.strip():
-                        args.extend(["--city", city.strip()])
-                    try:
-                        result = await run_restaurant_cli(
-                            ctx.deps.settings,
-                            ctx.deps.workspace,
-                            *args,
-                            timeout_seconds=25,
-                        )
-                    except Exception as exc:
-                        logger.warning("restaurant_search degraded query=%s provider=%s error=%s", query, provider, exc)
-                        return sanitize_tool_output(
-                            f"RESTAURANT_TOOL_UNAVAILABLE: restaurant search failed because {exc}."
-                        )
-                    return sanitize_tool_output(result)
-
-                @agent.tool
-                async def restaurant_availability(
-                    ctx: RunContext[AgentDependencies],
-                    venue_id: str,
-                    date: str,
-                    party_size: int = 2,
-                    provider: str = "resy",
-                ) -> str:
-                    """Look up restaurant reservation availability for a venue and date using restaurant-cli."""
-                    assert ctx.deps.workspace is not None
-                    normalized_provider = normalize_restaurant_provider(provider)
-                    args = [
+                        lines = [
+                            f"Matched venue: {venue_name}"
+                            + (f" ({venue_city})" if venue_city else "")
+                            + f" on {provider_label}",
+                            f"Booking page: {browser_booking_url}",
+                            browser_summary.strip(),
+                        ]
+                        return sanitize_tool_output("\n".join(line for line in lines if line.strip()))
+                    availability_args = [
                         "availability",
                         "--venue",
                         venue_id,
@@ -1615,6 +2605,199 @@ async def run_agent(
                         normalized_provider,
                         "--agent",
                     ]
+                    try:
+                        slots_payload = await run_restaurant_cli_json(
+                            ctx.deps.settings,
+                            ctx.deps.workspace,
+                            *availability_args,
+                            timeout_seconds=35,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "restaurant_find_availability availability degraded query=%s venue_id=%s provider=%s error=%s",
+                            query,
+                            venue_id,
+                            normalized_provider,
+                            exc,
+                        )
+                        if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                            raise RuntimeError(
+                                "service unavailable: structured restaurant availability failed in api_direct mode. "
+                                f"provider={normalized_provider} venue={venue_name} venue_id={venue_id} error={exc}"
+                            ) from exc
+                        if normalized_provider == "resy":
+                            try:
+                                resy_policy_by_token = await fetch_resy_slot_policies(
+                                    ctx.deps.settings,
+                                    venue_id=venue_id,
+                                    date=date,
+                                    party_size=max(1, party_size),
+                                )
+                            except Exception as policy_exc:
+                                logger.warning(
+                                    "restaurant_find_availability direct resy fallback failed query=%s venue_id=%s error=%s",
+                                    query,
+                                    venue_id,
+                                    policy_exc,
+                                )
+                            else:
+                                return sanitize_tool_output(
+                                    _render_resy_policy_slot_lines(
+                                        resy_policy_by_token,
+                                        date=date,
+                                        party_size=party_size,
+                                        venue_name=venue_name,
+                                        venue_city=venue_city,
+                                        venue_url=venue_url,
+                                    )
+                                )
+                        failure_lines.append(
+                            f"{provider_label} live availability failed for {venue_name}"
+                            + (f" ({venue_city})" if venue_city else "")
+                            + f" because {exc}."
+                        )
+                        continue
+                    slots = slots_payload if isinstance(slots_payload, list) else []
+                    if normalized_provider == "opentable" and not slots:
+                        try:
+                            slots = await fetch_opentable_slots_via_browser(
+                                ctx.deps.settings,
+                                ctx.deps.workspace,
+                                venue_id=venue_id,
+                                date=date,
+                                time="19:00",
+                                party_size=max(1, party_size),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "restaurant_find_availability opentable browser probe degraded query=%s venue_id=%s error=%s",
+                                query,
+                                venue_id,
+                                exc,
+                            )
+                    resy_policy_by_token: dict[str, RestaurantSlotPolicy] = {}
+                    if normalized_provider == "resy" and slots:
+                        try:
+                            resy_policy_by_token = await fetch_resy_slot_policies(
+                                ctx.deps.settings,
+                                venue_id=venue_id,
+                                date=date,
+                                party_size=max(1, party_size),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "restaurant_find_availability policy degraded query=%s venue_id=%s provider=%s error=%s",
+                                query,
+                                venue_id,
+                                normalized_provider,
+                                exc,
+                            )
+                    lines = [
+                        f"Matched venue: {venue_name}"
+                        + (f" ({venue_city})" if venue_city else "")
+                        + f" on {provider_label}",
+                    ]
+                    if venue_url:
+                        lines.append(f"Booking page: {venue_url}")
+                    if slots:
+                        lines.append(f"Live availability for {date} for {max(1, party_size)} people:")
+                        for slot in slots[:12]:
+                            slot_time = str(slot.get('time') or '').strip()
+                            slot_type = str(slot.get('type') or '').strip()
+                            if slot_time:
+                                line = f"- {slot_time}" + (f" ({slot_type})" if slot_type else "")
+                                slot_token = str(slot.get("token") or "").strip()
+                                policy = resy_policy_by_token.get(slot_token)
+                                if policy is not None and policy.policy_text:
+                                    line += f" — {policy.policy_text}"
+                                lines.append(line)
+                    else:
+                        lines.append(f"No live slots were returned for {date} for {max(1, party_size)} people.")
+                    if failures:
+                        provider_labels = ", ".join(str(item.get("provider") or "provider") for item in failures[:3])
+                        lines.append(f"Other provider lookups also had issues: {provider_labels}.")
+                    return sanitize_tool_output("\n".join(lines))
+                if browser_probe_candidate is not None and ctx.deps.strategy_mode != STRATEGY_API_DIRECT:
+                    venue_id, venue_name, venue_city, venue_url = browser_probe_candidate
+                    probe = await _run_resy_browser_probe(
+                        settings=ctx.deps.settings,
+                        workspace=ctx.deps.workspace,
+                        venue_url=venue_url,
+                        venue_name=venue_name,
+                        venue_city=venue_city,
+                        date=date,
+                        time="",
+                        party_size=party_size,
+                    )
+                    if probe is not None:
+                        return _render_resy_browser_probe_summary(
+                            probe,
+                            venue_id=venue_id,
+                            venue_name=venue_name,
+                            venue_city=venue_city,
+                            date=date,
+                            time="(not specified)",
+                            party_size=party_size,
+                        )
+                return sanitize_tool_output(
+                    _restaurant_provider_browser_fallback_message(
+                        provider=restaurant_provider_sequence(provider)[0],
+                        venue_name=query,
+                        date=date,
+                        party_size=party_size,
+                        details="\n".join(failure_lines[:6]) if failure_lines else "The provider sequence exhausted without a usable live availability result.",
+                    )
+                )
+
+            @agent.tool
+            async def restaurant_search(
+                ctx: RunContext[AgentDependencies],
+                query: str,
+                provider: str = "resy",
+                city: str = "",
+                limit: int = 10,
+            ) -> str:
+                """Search restaurant venues with Resy by default. Use this first for cuisine discovery or when the user has not picked a specific restaurant yet."""
+                assert ctx.deps.workspace is not None
+                attempts = await _restaurant_search_attempts(
+                    settings=ctx.deps.settings,
+                    workspace=ctx.deps.workspace,
+                    query=query,
+                    provider=provider,
+                    city=city,
+                    limit=limit,
+                    timeout_seconds=25,
+                )
+                return _render_restaurant_search_shortlist(
+                    query=query,
+                    attempts=attempts,
+                    city=city,
+                    limit=limit,
+                )
+
+            @agent.tool
+            async def restaurant_availability(
+                ctx: RunContext[AgentDependencies],
+                venue_id: str,
+                date: str,
+                party_size: int = 2,
+                provider: str = "resy",
+            ) -> str:
+                """Look up restaurant reservation availability for a venue and date using restaurant-cli."""
+                assert ctx.deps.workspace is not None
+                normalized_provider = normalize_restaurant_provider(provider)
+                args = [
+                    "availability",
+                    "--venue",
+                    venue_id,
+                    "--date",
+                    date,
+                    "--party",
+                    str(max(1, party_size)),
+                    "--provider",
+                    normalized_provider,
+                    "--agent",
+                ]
                 try:
                     result = await run_restaurant_cli(
                         ctx.deps.settings,
@@ -1650,13 +2833,34 @@ async def run_agent(
                                     venue_url="",
                                 )
                             )
-                    _raise_restaurant_provider_unavailable_pause(
-                        provider=normalized_provider,
-                        venue_name=f"venue {venue_id}",
-                        date=date,
-                        party_size=party_size,
-                        details=f"Availability lookup failed because {exc}.",
+                    return sanitize_tool_output(
+                        _restaurant_provider_browser_fallback_message(
+                            provider=normalized_provider,
+                            venue_name=f"venue {venue_id}",
+                            date=date,
+                            party_size=party_size,
+                            details=f"Availability lookup failed because {exc}.",
+                        )
                     )
+                if normalized_provider == "opentable":
+                    try:
+                        browser_slots = await fetch_opentable_slots_via_browser(
+                            ctx.deps.settings,
+                            ctx.deps.workspace,
+                            venue_id=venue_id,
+                            date=date,
+                            time="19:00",
+                            party_size=max(1, party_size),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "restaurant_availability opentable browser probe degraded venue_id=%s error=%s",
+                            venue_id,
+                            exc,
+                        )
+                    else:
+                        if browser_slots:
+                            return sanitize_tool_output(json.dumps(browser_slots))
                 return sanitize_tool_output(result)
 
             @agent.tool
@@ -1669,27 +2873,45 @@ async def run_agent(
                 provider: str = "resy",
                 slot_token: str = "",
                 notes: str = "",
+                venue_name: str = "",
+                venue_city: str = "",
             ) -> str:
-                """Book a Resy reservation or return a manual OpenTable handoff URL. Use only after explicit user approval."""
+                """Book a restaurant reservation after explicit approval. Resy uses structured booking; OpenTable uses a browser-confirmed deep-link flow."""
                 assert ctx.deps.workspace is not None
                 normalized_provider = normalize_restaurant_provider(provider)
                 if normalized_provider == "opentable":
-                    return sanitize_tool_output(
-                        json.dumps(
-                            {
-                                "ok": True,
-                                "provider": "opentable",
-                                "handoff": True,
-                                "message": "OpenTable booking must be completed manually by the user.",
-                                "url": build_opentable_booking_url(
-                                    restaurant_id=venue_id,
-                                    date=date,
-                                    time=time,
-                                    party_size=max(1, party_size),
-                                ),
-                            }
-                        )
+                    _enforce_automation_policy(
+                        ctx.deps.store,
+                        site_scope="opentable.com",
+                        category="restaurant",
+                        action="zero_dollar_booking",
                     )
+                    booking_url = slot_token.strip() if _is_http_url(slot_token) else build_opentable_booking_url(
+                        restaurant_id=venue_id,
+                        date=date,
+                        time=time,
+                        party_size=max(1, party_size),
+                    )
+                    try:
+                        return await _run_opentable_booking_browser_flow(
+                            settings=ctx.deps.settings,
+                            workspace=ctx.deps.workspace,
+                            booking_url=booking_url,
+                            venue_id=venue_id,
+                            venue_name=venue_name,
+                            venue_city=venue_city,
+                            date=date,
+                            time=time,
+                            party_size=max(1, party_size),
+                        )
+                    except PauseForInputRequested:
+                        raise
+                    except Exception as exc:
+                        _handle_phase1_blocking_error(exc, action=f"restaurant_book_or_handoff(opentable, venue={venue_id}, date={date}, time={time})")
+                        logger.warning("restaurant_book_or_handoff opentable browser flow failed venue_id=%s error=%s", venue_id, exc)
+                        return sanitize_tool_output(
+                            f"RESTAURANT_TOOL_UNAVAILABLE: OpenTable browser booking failed because {exc}.\nBooking page: {booking_url}"
+                        )
                 site_scope = "resy.com" if normalized_provider == "resy" else normalized_provider
                 _enforce_automation_policy(
                     ctx.deps.store,
@@ -1729,6 +2951,8 @@ async def run_agent(
                     _maybe_raise_nonfree_resy_confirmation(
                         policy,
                         venue_id=venue_id,
+                        venue_name=venue_name,
+                        venue_city=venue_city,
                         date=date,
                         time=time,
                         party_size=party_size,
@@ -1851,7 +3075,7 @@ async def run_agent(
                         )
                 return sanitize_tool_output(json.dumps(result))
 
-        if allow_browser_tools:
+        if allow_browser_tools and not structured_restaurant_task:
 
             @agent.tool
             async def web_browser_task(ctx: RunContext[AgentDependencies], task: str, max_pages: int = 3, max_steps: int = 12) -> str:
@@ -1865,6 +3089,7 @@ async def run_agent(
                         task=task,
                         max_pages=bounded_pages,
                         max_steps=bounded_steps,
+                        strategy_mode=ctx.deps.strategy_mode,
                     )
                 except Exception as exc:
                     logger.warning("web_browser_task degraded task=%s error=%s", task, exc)

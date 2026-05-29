@@ -205,7 +205,6 @@ def run_worker(claim: dict) -> None:
         "MAPS_OPENAPI_HEADERS_JSON",
         "MAPS_OPENAPI_AUTH_TOKEN_PARAM",
         "MAPS_OPENAPI_AUTH_TOKEN",
-        "RESY_MCP_ENABLED",
         "RESY_API_KEY_PARAM",
         "RESY_API_KEY",
         "RESY_AUTH_TOKEN_PARAM",

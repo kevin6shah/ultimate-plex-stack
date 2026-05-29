@@ -118,6 +118,9 @@ async def list_history_message_ids(settings: Settings, *, access_token: str, his
     for item in payload.get("history", []) or []:
         for message in item.get("messagesAdded", []) or []:
             raw = message.get("message") or {}
+            label_ids = {str(label).strip().upper() for label in (raw.get("labelIds") or []) if str(label).strip()}
+            if "DRAFT" in label_ids:
+                continue
             message_id = str(raw.get("id") or "").strip()
             if message_id and message_id not in seen:
                 seen.add(message_id)

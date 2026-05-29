@@ -215,10 +215,6 @@ Parameters:
   MapsOpenApiBaseUrl:
     Type: String
     Default: ''
-  ResyMcpEnabled:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
   OpenTableMcpEnabled:
     Type: String
     Default: 'false'
@@ -410,6 +406,8 @@ Resources:
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ResyAuthTokenParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenTableEmailParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenTablePasswordParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailAccountEmailParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GmailAppPasswordParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleClientIdParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleClientSecretParam}'
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleRefreshTokenParam}'
@@ -509,7 +507,6 @@ Resources:
           MAPS_OPENAPI_MCP_ENABLED: !Ref MapsOpenApiMcpEnabled
           MAPS_OPENAPI_SPEC_URL: !Ref MapsOpenApiSpecUrl
           MAPS_OPENAPI_BASE_URL: !Ref MapsOpenApiBaseUrl
-          RESY_MCP_ENABLED: !Ref ResyMcpEnabled
           OPENTABLE_MCP_ENABLED: !Ref OpenTableMcpEnabled
           GMAIL_MCP_ENABLED: !Ref GmailMcpEnabled
           LOGFIRE_TOKEN_PARAM: !Ref LogfireTokenParam

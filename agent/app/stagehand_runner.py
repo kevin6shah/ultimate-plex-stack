@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 from .browser import _choose_user_agent
 from .booking_guard import zero_dollar_booking_instruction
@@ -20,6 +21,8 @@ from .workspace import Workspace
 logger = logging.getLogger(__name__)
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
+DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+PARTY_SIZE_PATTERN = re.compile(r"\bfor\s+(\d+)\s+people\b", re.IGNORECASE)
 
 LOW_QUALITY_STAGEHAND_PATTERNS = (
     "i need more information",
@@ -114,6 +117,94 @@ def _stagehand_extract_explicit_urls(task: str) -> list[str]:
             seen.add(candidate)
             urls.append(candidate)
     return urls
+
+
+def _stagehand_task_needs_interaction(task: str) -> bool:
+    normalized = " ".join((task or "").lower().split())
+    markers = (
+        "booking flow",
+        "bookable times",
+        "reservation time",
+        "reservation times",
+        "available times",
+        "reservation page",
+        "party size",
+        "date selector",
+        "cancellation",
+        "deposit",
+        "prepaid reservation",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _stagehand_interaction_instruction(task: str) -> str:
+    return (
+        "Interact with the current page before summarizing. "
+        "Set or confirm the requested date, party size, and reservation controls from the task. "
+        "Open the time selector or reservation area if needed so visible bookable times are shown. "
+        "Do not submit or finalize any booking."
+    )
+
+
+def _stagehand_interaction_steps(task: str) -> list[str]:
+    steps: list[str] = []
+    date_match = DATE_PATTERN.search(task or "")
+    if date_match:
+        requested_date = date_match.group(1)
+        steps.append(
+            f"Open the date selector and set the reservation date to {requested_date}. "
+            "Do not book anything."
+        )
+    party_match = PARTY_SIZE_PATTERN.search(task or "")
+    if party_match:
+        party_size = party_match.group(1)
+        steps.append(
+            f"Set the party size selector to {party_size} guests. "
+            "Do not book anything."
+        )
+    steps.append(
+        "Open the reservation time selector or reservation results area so visible bookable times are shown. "
+        "Do not book anything."
+    )
+    return steps
+
+
+def _stagehand_verification_instruction(task: str) -> str:
+    guidance: list[str] = [
+        "Summarize the current page for the user's task.",
+        "Return concrete findings and note any blocker briefly.",
+    ]
+    date_match = DATE_PATTERN.search(task or "")
+    if date_match:
+        requested_date = date_match.group(1)
+        guidance.append(
+            f"If the page shows relative wording like Today for the requested date {requested_date}, treat the requested date as satisfied instead of calling it a mismatch."
+        )
+        guidance.append(
+            f"If the calendar shows {requested_date} or its human-readable equivalent as selected, treat the date as set correctly."
+        )
+        guidance.append(
+            f"If the current page URL includes date={requested_date}, treat the reservation date as set correctly."
+        )
+        try:
+            timezone_name = os.environ.get("TZ", "America/New_York")
+            local_today = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+        except Exception:
+            local_today = ""
+        if local_today and local_today == requested_date:
+            guidance.append(
+                f"The requested date {requested_date} is the current local date, so a Today label is valid and should not be treated as a mismatch."
+            )
+    party_match = PARTY_SIZE_PATTERN.search(task or "")
+    if party_match:
+        party_size = party_match.group(1)
+        guidance.append(
+            f"If the guests selector shows {party_size} Guests or an equivalent selected state, treat the party size as set correctly."
+        )
+        guidance.append(
+            f"If the current page URL includes seats={party_size}, treat the party size as set correctly."
+        )
+    return " ".join(guidance)
 
 
 def _stagehand_search_url(task: str) -> str:
@@ -399,13 +490,34 @@ async def run_stagehand_task(
                     timeout=max(5, settings.stagehand_task_timeout_seconds),
                 )
 
+        if explicit_urls and _stagehand_task_needs_interaction(task):
+            for interaction_step in _stagehand_interaction_steps(task):
+                try:
+                    await asyncio.wait_for(
+                        _stagehand_raw_json(
+                            raw_sessions.act(
+                                session_id,
+                                input=interaction_step,
+                                options={
+                                    "model": model_config,
+                                    "timeout": float(max(5000, settings.stagehand_tool_timeout_ms)),
+                                },
+                            )
+                        ),
+                        timeout=max(5, settings.stagehand_task_timeout_seconds),
+                    )
+                except Exception as exc:
+                    logger.warning("stagehand act step failed: %s", exc)
+                    blocker = " ".join((blocker + " " + f"Interactive step failed: {exc}").split())
+                    break
+
         final_extract = await asyncio.wait_for(
             _stagehand_raw_json(
                 raw_sessions.extract(
                     session_id,
                     instruction=(
-                        "Summarize the current page for the user's task. "
-                        "Return concrete findings and note any blocker briefly.\n\n"
+                        _stagehand_verification_instruction(task)
+                        + "\n\n"
                         + normalized_task
                     ),
                     schema={

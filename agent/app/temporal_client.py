@@ -53,6 +53,16 @@ async def signal_answer_heavy_job(settings: Settings, job_id: str, text: str) ->
         return False
 
 
+async def signal_update_heavy_job(settings: Settings, job_id: str, text: str) -> bool:
+    client = await get_temporal_client(settings)
+    try:
+        handle = client.get_workflow_handle(heavy_workflow_id(settings, job_id))
+        await handle.signal(FridayHeavyJobWorkflow.update_constraints, text)
+        return True
+    except TemporalError:
+        return False
+
+
 async def signal_submit_verification_code(settings: Settings, job_id: str, code: str) -> bool:
     client = await get_temporal_client(settings)
     try:

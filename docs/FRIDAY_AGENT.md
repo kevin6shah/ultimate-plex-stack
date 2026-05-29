@@ -40,6 +40,14 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - Temporal mode only activates when a real `TEMPORAL_HOST` is configured. If that host is empty, the code intentionally does not pretend Temporal is live.
 - Heavy browser/file tasks belong on the dedicated on-demand EC2 worker so the shared VPN/Iris host remains orchestration-only, not the heavy runtime target.
 
+## Host Split
+
+- Lambda/control plane handles ingress, job state, Telegram/Siri responses, Dynamo updates, and Temporal workflow start/signal calls.
+- The shared Iris/VPN host runs the lightweight Temporal workflow worker from `hands/host/temporal_workflow_worker.py`.
+- The dedicated on-demand worker runs the heavy Temporal activity worker from `hands/worker/temporal_activity_worker.py`.
+- The shared host should only hold orchestration logic such as pause/resume, retries, and workflow state transitions.
+- Stagehand, Playwright, browser-use, site automation, and booking/account actions belong on the dedicated worker only.
+
 ## Dashboard And Cost View
 
 - The agent stack creates a CloudWatch dashboard named `${AgentName}-operations`.
@@ -91,7 +99,7 @@ For code changes, inspect `agent/app/` and run local tests. For live AWS changes
 - The browser tool is not offered in Lambda light-mode at all.
 - Heavy tasks are classified before execution. Browser actions, attachments, file-processing work, and explicit resume requests are routed to the hands runtime instead of Lambda.
 - Heavy tasks can now pause durably for missing user input instead of failing terminally. The worker writes a `paused_for_input` state, preserves a checkpoint, and asks the user for the missing answer.
-- In Temporal mode, the explicit resume contract for paused-input jobs is: reply with `answer: ...`. That signals the existing workflow to continue from the saved checkpoint/workspace instead of creating a separate replacement job.
+- In Temporal mode, paused-input jobs can resume from a natural follow-up reply like `2 people at 8 PM tonight` or an explicit `answer: ...` reply. Both paths signal the existing workflow to continue from the saved checkpoint/workspace instead of creating a separate replacement job.
 - Attachment-driven resume is still handled by creating a new heavy run when the workflow needs a newly uploaded file.
 - Browser-use step screenshots are no longer sent back to Telegram by default. They are only kept/sent when the original request explicitly asks for screenshots or images, and multiple requested screenshots are bundled into one zip.
 - The intended common-use routing hierarchy is:
@@ -153,7 +161,9 @@ For the Friday mailbox specifically:
 
 - active Phase 1 path: `/friday/agent/gmail-account-email` + Google OAuth secrets + Gmail Pub/Sub verification token
 - canonical OAuth secret names: `/friday/agent/google-client-id`, `/friday/agent/google-client-secret`, `/friday/agent/google-refresh-token`
-- compatibility aliases may still exist in local env or older SSM layouts, but the active mailbox runtime should mint short-lived Gmail access tokens from the Google OAuth refresh token
+- the local env and settings layer currently accept both `GOOGLE_*` and `GMAIL_*` OAuth key families for the same mailbox credentials; both are active in runtime resolution today
+- `GOOGLE_*` remains the preferred naming for new SSM/env wiring, but `GMAIL_*` compatibility keys are still live and should be kept in sync when both are present
+- the `.env -> SSM` sync path now preserves the first non-empty mapping for a target parameter, so canonical `GOOGLE_*` Gmail OAuth values are not overwritten later by legacy `GMAIL_*` aliases during the same sync run
 - Gmail App Password and IMAP/SMTP mailbox polling are no longer the intended active runtime path
 
 ## Current Hands Stack
@@ -178,9 +188,13 @@ Additional repo-wired MCP candidates now exist behind settings/secrets for evalu
 - Firecrawl MCP
 - cablate Google Maps MCP
 - Google Maps / Places / Routes via OpenAPI MCP
-- Resy MCP runtime hook
 - OpenTable MCP runtime hook
 - legacy Gmail MCP toggles retained only for compatibility; they are not the active mailbox design
+
+Canonical restaurant runtime:
+
+- `omarshahine/restaurant-cli` is the only supported Resy/OpenTable restaurant integration in this stack
+- the older Resy MCP runtime hook has been removed from settings, worker build, and browser-use registration to avoid ambiguous routing
 
 Current live proof on the dedicated worker:
 
@@ -214,7 +228,7 @@ Those profiles currently shape heavy-task routing guidance and heavy/light class
 
 The repo now includes a durable pause-for-input path that is intended to live on the Temporal workflow, not as a new replacement heavy job each time:
 - a heavy Siri or Telegram task can enter `paused_for_input`
-- a follow-up `answer: ...` signal can resume the same workflow
+- a natural follow-up reply or `answer: ...` signal can resume the same workflow
 - the dedicated worker can continue from the prior checkpoint/workspace path without handing orchestration back to the old claim loop
 
 The screenshot-suppression default is deployed live as part of the same rollout, but a clean end-to-end completed browser job proving the exact Telegram artifact/zip behavior is still pending.
@@ -235,6 +249,44 @@ Pull the current AWS SSM secrets into the local `.env`:
 ```bash
 bash ./scripts/sync-env-from-ssm.sh
 ```
+
+## Dedicated Worker Disk Cleanup
+
+If the dedicated worker image rebuild fails with `no space left on device`, use this safe cleanup order on the dedicated worker host before retrying the build:
+
+1. Inspect disk usage:
+
+```bash
+df -h
+sudo docker system df
+```
+
+2. Prune unused Docker artifacts only:
+
+```bash
+sudo docker system prune -af
+```
+
+3. Re-check free space:
+
+```bash
+df -h
+sudo docker system df
+```
+
+4. Retry the worker image build and restart the service:
+
+```bash
+sudo docker build --no-cache --platform linux/amd64 -t friday-hands-worker:latest -f hands/worker/Dockerfile .
+sudo systemctl restart friday-temporal-activity-worker.service
+sudo systemctl status friday-temporal-activity-worker.service --no-pager
+```
+
+Notes:
+
+- This cleanup is safe for the Friday worker because the running service starts from the rebuilt local image and does not rely on old stopped containers.
+- Do not delete `/opt/friday` workspaces or `/etc/friday-hands.env` during cleanup.
+- Do not run broad filesystem cleanup on the shared Iris/VPN host unless the issue is proven to be outside Docker.
 
 Push the local `.env` values back into AWS SSM:
 

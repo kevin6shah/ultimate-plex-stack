@@ -6,7 +6,9 @@ from app.restaurant_cli import (
     build_opentable_booking_url,
     choose_best_restaurant_result,
     ensure_restaurant_cli_state,
+    extract_opentable_time_labels,
     normalize_restaurant_provider,
+    restaurant_provider_sequence,
 )
 from app.settings import Settings
 from app.workspace import Workspace
@@ -54,6 +56,18 @@ def test_normalize_restaurant_provider_defaults_to_resy() -> None:
     assert normalize_restaurant_provider("OpenTable") == "opentable"
 
 
+def test_restaurant_provider_sequence_defaults_to_resy_then_opentable() -> None:
+    assert restaurant_provider_sequence("") == ("resy", "opentable")
+    assert restaurant_provider_sequence("resy") == ("resy", "opentable")
+    assert restaurant_provider_sequence("opentable") == ("opentable", "resy")
+
+
+def test_restaurant_provider_sequence_respects_explicit_only_and_auto() -> None:
+    assert restaurant_provider_sequence("resy only") == ("resy",)
+    assert restaurant_provider_sequence("opentable only") == ("opentable",)
+    assert restaurant_provider_sequence("auto") == ("resy", "opentable")
+
+
 def test_choose_best_restaurant_result_prefers_exact_bungalow_over_bowery_variant() -> None:
     results = [
         {"name": "Bowery Bungalow NYC", "city": "New York"},
@@ -62,3 +76,17 @@ def test_choose_best_restaurant_result_prefers_exact_bungalow_over_bowery_varian
     best = choose_best_restaurant_result("bungalow the Indian restaurant", results)
     assert best is not None
     assert best["name"] == "Bungalow"
+
+
+def test_extract_opentable_time_labels_filters_and_deduplicates_visible_buttons() -> None:
+    labels = extract_opentable_time_labels(
+        [
+            "Find a table",
+            "7:00 PM",
+            "7:15 PM",
+            "7:00 pm",
+            "Standard",
+            "Notify me",
+        ]
+    )
+    assert labels == ["7:00 PM", "7:15 PM"]

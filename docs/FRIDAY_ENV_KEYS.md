@@ -66,8 +66,10 @@ Rules:
 
 Notes:
 
-- The checked-in local `.env` currently still uses `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, and `GMAIL_REFRESH_TOKEN` as the Gmail OAuth alias names.
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REFRESH_TOKEN` are the canonical active mailbox OAuth contract in the Phase 1 runtime and should be preferred in new env/SSM wiring.
+- The local `.env` may intentionally contain both `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` and `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN`.
+- Both OAuth key families are currently active in runtime resolution for mailbox auth. The settings layer accepts either naming scheme so existing local env files and older deploy paths continue to work.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REFRESH_TOKEN` remain the preferred canonical names for new env/SSM wiring and future normalization work.
+- `scripts/sync-ssm-from-env.sh` now prefers the first non-empty mapping for a target parameter, so the canonical `GOOGLE_*` Gmail OAuth keys win and legacy `GMAIL_*` aliases do not overwrite them later in the same sync run.
 - `GMAIL_ACCOUNT_PASSWORD` and `GMAIL_APP_PASSWORD` still appear in the local env inventory for compatibility and migration continuity only.
 - `GMAIL_APP_PASSWORD` is not part of the active mailbox event-driven pipeline and should not be used as the primary mailbox runtime credential path.
 - `GMAIL_ACCOUNT_PASSWORD` is not part of the active mailbox event-driven pipeline either; keep it documented only until the local env and secret map are fully normalized.

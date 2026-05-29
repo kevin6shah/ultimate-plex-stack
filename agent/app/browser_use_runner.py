@@ -190,18 +190,6 @@ def _maps_openapi_mcp_env(settings: Settings) -> dict[str, str]:
     return env
 
 
-def _resy_mcp_env(settings: Settings) -> dict[str, str]:
-    api_key = _optional_secret(settings, settings.resy_api_key_param, label="resy_api_key")
-    auth_token = _optional_secret(settings, settings.resy_auth_token_param, label="resy_auth_token")
-    if not (api_key and auth_token):
-        return {}
-    return {
-        "RESY_API_KEY": api_key,
-        "RESY_AUTH_TOKEN": auth_token,
-        "DOTENV_CONFIG_QUIET": "true",
-    }
-
-
 def _opentable_mcp_env(settings: Settings) -> dict[str, str]:
     email = _optional_secret(settings, settings.opentable_email_param, label="opentable_email")
     password = _optional_secret(settings, settings.opentable_password_param, label="opentable_password")
@@ -464,24 +452,6 @@ async def run_browser_use_task(
                 mcp_clients.append(maps_openapi_mcp)
         else:
             logger.warning("maps OpenAPI MCP enabled but spec URL or BASE_URL was unavailable")
-
-    if enable_optional_mcps and settings.resy_mcp_enabled:
-        resy_env = _resy_mcp_env(settings)
-        if resy_env:
-            resy_mcp = await _register_optional_mcp(
-                MCPClient=MCPClient,
-                tools=tools,
-                server_name="resy",
-                command=settings.resy_mcp_command,
-                args=_split_mcp_args(settings.resy_mcp_args),
-                env=resy_env,
-                prefix="resy_",
-                timeout_seconds=settings.mcp_registration_timeout_seconds,
-            )
-            if resy_mcp is not None:
-                mcp_clients.append(resy_mcp)
-        else:
-            logger.warning("resy MCP enabled but RESY_API_KEY or RESY_AUTH_TOKEN was unavailable")
 
     if enable_optional_mcps and settings.opentable_mcp_enabled:
         opentable_env = _opentable_mcp_env(settings)
