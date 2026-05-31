@@ -118,3 +118,56 @@ def test_durable_findings_text_ignores_cross_domain_findings_leak() -> None:
 
     assert "flight options" not in text
     assert "rate-limited" in text
+
+
+def test_durable_findings_text_infers_stalled_travel_summary_before_failure_snapshot() -> None:
+    job = AgentJob(
+        source=JobSource.SIRI,
+        query="Find me the cheapest flights from NYC to Delhi",
+        task_class=TaskClass.HEAVY,
+        current_step="running_agent",
+        heartbeat_repeat_count=3,
+        metadata={
+            "strategy_state": {
+                "current_strategy": "api_direct",
+            }
+        },
+    )
+
+    text = durable_findings_text(
+        job=job,
+        checkpoint=None,
+        strategy_name="api_direct",
+        error_message="",
+    )
+
+    assert "usable flight shortlist" in text
+    assert "still not returning stable results" in text
+
+
+def test_durable_findings_text_prefers_stalled_summary_over_iata_setup_artifact() -> None:
+    job = AgentJob(
+        source=JobSource.SIRI,
+        query="Find me the cheapest flights from New York City to Delhi",
+        task_class=TaskClass.HEAVY,
+        current_step="attachments_ready",
+        heartbeat_repeat_count=3,
+        metadata={
+            "execution_progress_matrix": {
+                "last_meaningful_artifact": "# IATA resolution\n\n- Original input: New York City\n- Resolved airport code: `NYC`",
+            },
+            "job_context": {
+                "latest_findings_summary": "# IATA resolution\n\n- Original input: New York City\n- Resolved airport code: `NYC`",
+            },
+        },
+    )
+
+    text = durable_findings_text(
+        job=job,
+        checkpoint=None,
+        strategy_name="api_direct",
+        error_message="",
+    )
+
+    assert "usable flight shortlist" in text
+    assert "Resolved airport code" not in text

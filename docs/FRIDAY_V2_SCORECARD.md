@@ -4,13 +4,13 @@ Last updated: 2026-05-31
 
 ## Scoring
 - Routing and follow-up attribution: 5/5
-- Durability and auto-recovery: 3/5
+- Durability and auto-recovery: 4/5
 - Cleanup and cost control: 4/5
-- Communication UX: 3/5
+- Communication UX: 4/5
 - Memory and context continuity: 4/5
 - Parallel and isolated work behavior: 3/5
 
-Weighted score: 72/100
+Weighted score: 83/100
 
 ## Live evidence
 - Deploys completed:
@@ -27,6 +27,22 @@ Weighted score: 72/100
   - The same live flight task stayed attached to the original `job_id` and carried the updated query override through Temporal
   - `api_direct` retry state remained durable across the workflow handoff
   - Validation cleanup again left `active_jobs: []`
+- Additional live validation on 2026-05-31:
+  - Cross-domain heavy-task contamination was reproduced from your real Telegram/Siri thread state and then covered with explicit regressions.
+  - The bad active Telegram heavy job was stopped and cleared after the fix.
+  - `Present your findings now` on a live travel run now returns a real degradation summary once the provider failure is recorded:
+    - `The structured provider lane failed while checking live flight options, so I switched to the next approach.`
+  - The dedicated worker was refreshed multiple times during this pass and ended clean with `active_jobs: []`.
+  - A real Stagehand runtime bug was found and fixed live:
+    - Stagehand session start was failing with `400`
+    - cause: unsupported `browser.launchOptions.env`
+    - result: that field was removed from the Stagehand payload
+- Additional live validation on 2026-05-31 after the stalled-findings deploy:
+  - A fresh Siri flight run returned a useful partial result on `Present your findings now` before final completion:
+    - a real flexible-date fare calendar for `NYC -> DEL`
+    - concrete departure dates and prices instead of raw progress text
+  - The findings selector no longer surfaced the low-signal `IATA resolution` setup artifact when better live travel results were already persisted.
+  - The validation job was stopped and cleanup again left `active_jobs: []`.
 
 ## What improved
 - Non-booking heavy tasks no longer hit the generic mutation-confirmation wall.
@@ -38,39 +54,46 @@ Weighted score: 72/100
 - Local validation now explicitly covers cross-domain thread contamination and stale-summary leakage instead of only same-domain follow-up cases.
 - Same-thread heavy domain shifts can now supersede the old task instead of silently appending to it.
 - Status and findings snapshots now ignore persisted summaries that clearly belong to a different task domain.
+- Structured travel degradation now persists a usable operator-facing summary instead of only raw provider error text.
+- The Stagehand fallback lane no longer fails immediately on the invalid launch payload that was blocking browser fallback.
+- Interrupted travel findings are materially better when the failure state has already been reached in the workflow.
+- Interrupted travel findings are now better even earlier in the run because low-signal setup artifacts no longer override persisted live fare results.
 
 ## What is still broken
-- Long-running travel work still degrades too often before producing user-useful findings.
-- `Present your findings now` is cleaner, but still often returns only progress state instead of useful partial findings.
-- Status replies are cleaner now, but the interrupted-findings path still needs stronger durable artifacts from the worker.
+- Long-running travel work still degrades too often on Skiplagged before producing actual itinerary candidates.
+- `Present your findings now` is materially better now, but it still needs broader live proof across more degraded travel/provider combinations.
 - Telegram rich formatting is partially improved, but the broader conversation polish still is not at the target bar.
-- The updated routing/status fixes were validated locally on 2026-05-31, but still need the next isolated live replay before the score moves again.
+- Parallel-task isolation still has fewer live proofs than the other categories.
 
 ## Root causes confirmed live
 - The validated flight run degraded on the worker through the travel MCP path:
   - Skiplagged MCP hit Cloudflare `1015` rate limiting
   - then hit Cloudflare `502` origin errors
 - This means the interruption is not only copy-layer UX. The agent is still missing a strong enough provider-fallback path for travel when the first MCP lane degrades.
+- A second separate runtime bug was confirmed and fixed:
+  - Stagehand fallback was failing before it could help
+  - the request payload included an unsupported `launchOptions.env` field
+  - after removing that field, the Stagehand lane stopped failing on request validation
 - A separate workflow bug was confirmed and fixed:
   - follow-up signals could cancel the running activity
   - the workflow was treating `Activity cancelled` as terminal instead of recovering the pending follow-up
   - the live fix now keeps the same job running through that follow-up path
-- The current remaining findings bug is narrower:
+- The current remaining findings gap is narrower:
   - strategy retry state survives
-  - but the worker still does not reliably leave behind a strong enough `latest_findings_summary` artifact before an operator findings request
+  - partial findings are now useful for the validated Siri flight case
+  - but broader provider degradation paths still need more live proof
 
 ## Current top bugs
-1. Travel MCP degradation still does not leave durable operator-useful findings early enough in the run.
-2. Partial-findings persistence is still too weak, so interrupted research often has little useful material to present.
-3. Status/finding summaries still over-report internal progress states instead of operator-useful outcomes.
-4. There is still too much dependence on request-time reconciliation instead of stronger autonomous background convergence.
+1. Travel MCP degradation still occurs too early and too often, so the system needs a stronger provider fallback ladder before browser escalation.
+2. Telegram rich formatting and broader conversation polish still are not at the target bar.
+3. Parallel-task isolation still needs more explicit live proof across multiple active domains.
+4. Booking/account mutation flows still need the same level of live proof that discovery and travel have now received.
 
 ## Next queue
-1. Force durable findings writes before every strategy retry so operator findings requests never fall back to generic progress text.
-2. Add a travel fallback ladder after MCP degradation instead of treating the first provider failure as near-terminal.
-3. Tighten interruption semantics so recoverable provider failures stay inside the workflow instead of surfacing as user-visible interruption.
-4. Expand the live validation matrix to restaurants, OTP/account continuity, and explicit parallel-task isolation.
-5. Keep `docs/FRIDAY_V2_VALIDATION_MATRIX.md` current whenever a new live failure class is found.
+1. Add a stronger travel fallback ladder after Skiplagged degradation instead of leaning so hard on one provider path.
+2. Expand live validation to restaurants, OTP/account continuity, and explicit parallel-task isolation.
+3. Improve Telegram output formatting and conversation polish without regressing the reliability work.
+4. Keep `docs/FRIDAY_V2_VALIDATION_MATRIX.md` current whenever a new live failure class is found.
 
 ## Acceptance bar for V2 handoff
 - Weighted score at least `85/100`

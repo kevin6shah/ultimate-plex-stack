@@ -50,6 +50,7 @@ def has_useful_partial_findings(text: str) -> bool:
         return False
     lowered = normalized.lower()
     generic_markers = (
+        "# iata resolution",
         "attachments downloaded",
         "working through website steps",
         "working through the task",
@@ -60,6 +61,8 @@ def has_useful_partial_findings(text: str) -> bool:
         "checking reservation sources and matching the correct venue",
         "checking live flight options and collecting candidate itineraries",
         "collecting hotel candidates with live pricing and location details",
+        "resolved airport code:",
+        "original input:",
     )
     return not any(marker in lowered for marker in generic_markers)
 
@@ -117,6 +120,41 @@ def summarize_recoverable_failure(query: str, error_message: str, strategy_name:
     return ""
 
 
+def infer_stalled_findings_text(job: AgentJob, *, strategy_name: str = "") -> str:
+    repeat_count = int(job.heartbeat_repeat_count or 0)
+    current_step = (job.current_step or "").strip().lower()
+    if repeat_count < 2 or current_step not in {"running_agent", "attachments_ready"}:
+        return ""
+    query_lowered = (job.query or "").lower()
+    strategy = str(strategy_name or "").strip().lower()
+    if any(token in query_lowered for token in ("flight", "flights", "airline", "airport", "travel")):
+        if "stagehand" in strategy:
+            return (
+                "I do not have a usable flight shortlist yet. "
+                "The direct flight sources already degraded, and I am checking the browser fallback now."
+            )
+        if "browser_use" in strategy:
+            return (
+                "I do not have a usable flight shortlist yet. "
+                "The direct and primary browser lanes already degraded, and I am checking the last fallback now."
+            )
+        return (
+            "I do not have a usable flight shortlist yet. "
+            "The live flight sources are still not returning stable results, so I am continuing to work the search."
+        )
+    if any(token in query_lowered for token in ("hotel", "hotels", "stay", "accommodation")):
+        return (
+            "I do not have a usable hotel shortlist yet. "
+            "The live hotel sources are still not returning stable results."
+        )
+    if any(token in query_lowered for token in ("rental car", "car rental", "rent a car")):
+        return (
+            "I do not have usable rental-car options yet. "
+            "The live rental sources are still not returning stable results."
+        )
+    return ""
+
+
 def durable_findings_text(
     *,
     job: AgentJob,
@@ -145,6 +183,9 @@ def durable_findings_text(
             continue
         if has_useful_partial_findings(cleaned):
             return cleaned[:1200]
+    stalled = infer_stalled_findings_text(job, strategy_name=strategy_name)
+    if stalled:
+        return stalled[:1200]
     return summarize_recoverable_failure(job.query, error_message or (job.error_message or ""), strategy_name)[:1200]
 
 
