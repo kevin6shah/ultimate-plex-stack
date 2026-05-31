@@ -28,6 +28,30 @@ class FridayHeavyJobWorkflow:
         self.resume_reply: str | None = None
         self.pending_followup: str | None = None
         self._running_activity: asyncio.Task | None = None
+        self._rehydration_attempts = 0
+
+    def _consume_pending_followup(self) -> str | None:
+        normalized = (self.pending_followup or "").strip()
+        self.pending_followup = None
+        return normalized or None
+
+    async def _await_pending_followup(self) -> str | None:
+        followup = self._consume_pending_followup()
+        if followup or self.stop_requested:
+            return followup
+        await workflow.sleep(timedelta(seconds=1))
+        return self._consume_pending_followup()
+
+    async def _prepare_followup_claim(self, job_id: str, followup: str | None, control_retry: RetryPolicy) -> dict | None:
+        try:
+            return await workflow.execute_activity(
+                prepare_heavy_job_followup_claim,
+                args=[job_id, str(followup or "")],
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=control_retry,
+            )
+        except ActivityError:
+            return None
 
     @workflow.signal
     def stop(self, note: str = "") -> None:
@@ -58,6 +82,32 @@ class FridayHeavyJobWorkflow:
         normalized = (code or "").strip()
         if normalized:
             self.resume_reply = f"verification code: {normalized}"
+
+    @staticmethod
+    def _is_rehydratable_activity_error(message: str) -> bool:
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+        markers = (
+            "worker exited without reporting a terminal state",
+            "worker stopped unexpectedly before the task finished",
+            "activity worker not running",
+            "activity task not found",
+            "connection reset",
+            "connection closed",
+            "connection aborted",
+            "unavailable",
+            "oom",
+            "exit 137",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _is_cancellation_activity_error(message: str) -> bool:
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+        return "activity cancelled" in normalized or "activity canceled" in normalized
 
     @workflow.run
     async def run(self, payload: dict) -> None:
@@ -101,15 +151,9 @@ class FridayHeavyJobWorkflow:
                         retry_policy=control_retry,
                     )
                     return
-                if self.pending_followup:
-                    followup = self.pending_followup
-                    self.pending_followup = None
-                    claim = await workflow.execute_activity(
-                        prepare_heavy_job_followup_claim,
-                        args=[job_id, followup],
-                        start_to_close_timeout=timedelta(minutes=2),
-                        retry_policy=control_retry,
-                    )
+                followup = await self._await_pending_followup()
+                claim = await self._prepare_followup_claim(job_id, followup, control_retry)
+                if claim is not None:
                     continue
                 await workflow.execute_activity(
                     finalize_heavy_job_stop,
@@ -127,11 +171,36 @@ class FridayHeavyJobWorkflow:
                         retry_policy=control_retry,
                     )
                     return
+                error_message = str(exc) or "The worker activity did not finish cleanly."
+                if self._is_cancellation_activity_error(error_message):
+                    followup = await self._await_pending_followup()
+                    claim = await self._prepare_followup_claim(job_id, followup, control_retry)
+                    if claim is not None:
+                        continue
+                    await workflow.execute_activity(
+                        finalize_heavy_job_stop,
+                        job_id,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=control_retry,
+                    )
+                    return
+                if (
+                    self._is_rehydratable_activity_error(error_message)
+                    and self._rehydration_attempts < max(0, heavy_activity_max_attempts - 1)
+                ):
+                    self._rehydration_attempts += 1
+                    claim = await workflow.execute_activity(
+                        prepare_heavy_job_claim,
+                        job_id,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=control_retry,
+                    )
+                    continue
                 await workflow.execute_activity(
                     finalize_heavy_job_failed,
                     args=[
                         job_id,
-                        str(exc) or "The worker activity did not finish cleanly.",
+                        error_message,
                         False,
                         False,
                     ],
@@ -198,6 +267,14 @@ class FridayHeavyJobWorkflow:
                     retry_policy=control_retry,
                 )
                 continue
+            if kind == "failed" and bool(result.get("interrupted")):
+                followup = await self._await_pending_followup()
+                if not self.stop_requested:
+                    claim = await self._prepare_followup_claim(job_id, followup, control_retry)
+                else:
+                    claim = None
+                if claim is not None:
+                    continue
             if kind == "failed" and (self.stop_requested or bool(result.get("interrupted"))):
                 await workflow.execute_activity(
                     finalize_heavy_job_stop,

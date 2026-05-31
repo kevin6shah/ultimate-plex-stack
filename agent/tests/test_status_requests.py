@@ -31,7 +31,9 @@ from app.main import (
     _looks_like_natural_input_reply,
     _natural_reply_can_resume,
     _partial_findings_text,
+    _query_changes_active_heavy_domain,
     _preferred_latest_status_job_for_thread_async,
+    _record_visible_assistant_turn,
     _refresh_superseded_paused_jobs,
     _resolve_contextual_heavy_followup,
     _resolve_stop_target,
@@ -39,6 +41,8 @@ from app.main import (
     _followup_matcher_decision,
     _stop_jobs,
     _strip_input_reply_prefix,
+    _should_supersede_for_new_heavy_task,
+    _sync_siri_heavy_job_to_telegram_thread,
     _sync_thread_active_heavy_job,
     _telegram_owner_source_pairs,
     _wants_findings_after_stop,
@@ -108,9 +112,23 @@ def test_format_status_message_for_running_job() -> None:
     )
     state = SimpleNamespace(get_latest_checkpoint=lambda _job_id: None)
     text = _format_status_message(state, job)
-    assert "Still working on it." in text
-    assert "Step: comparing sources" in text
-    assert "Update: reviewing travel and vlogging options" in text
+    assert text == "reviewing travel and vlogging options"
+
+
+def test_format_status_message_ignores_stale_cross_domain_progress() -> None:
+    job = AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Create an account with a free trial for Willow TV",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.RUNNING,
+        current_step="running_agent",
+        latest_checkpoint_summary="checking live flight options and collecting candidate itineraries",
+        last_status_sent_text="checking live flight options and collecting candidate itineraries.",
+    )
+    state = SimpleNamespace(get_latest_checkpoint=lambda _job_id: None)
+    text = _format_status_message(state, job)
+    assert "flight options" not in text
+    assert text == "running agent"
 
 
 def test_format_status_message_for_running_job_with_interrupted_checkpoint() -> None:
@@ -221,9 +239,107 @@ def test_format_status_message_for_paused_input_job() -> None:
     assert "How many people should I book for?" in text
     assert "Reply normally with the missing detail." in text
     assert "If you want something else instead, just ask." in text
-    assert "Step: waiting for your reply" in text
+    assert "blocked on party size" in text
     assert "**" not in text
     assert "\n\nHow many people should I book for?\n" in text
+
+
+def test_sync_siri_heavy_job_to_telegram_thread_sets_and_clears(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.main.settings",
+        SimpleNamespace(
+            telegram_allowed_chat_id_param="telegram_allowed_chat_id_param",
+            secret=lambda _param: "1106318894",
+        ),
+    )
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeStore:
+        def set_active_heavy_job(self, **kwargs):
+            calls.append(("set", kwargs))
+
+        def clear_active_heavy_job(self, **kwargs):
+            calls.append(("clear", kwargs))
+
+    job = AgentJob(
+        job_id="job-123",
+        source=JobSource.SIRI,
+        query="find dinner",
+        task_class=TaskClass.HEAVY,
+        user_id="siri",
+        conversation_id="siri",
+    )
+
+    _sync_siri_heavy_job_to_telegram_thread(FakeStore(), job_id="job-123", job=job)
+    _sync_siri_heavy_job_to_telegram_thread(FakeStore(), job_id=None, job=job)
+
+    assert calls == [
+        (
+            "set",
+            {
+                "channel": "telegram",
+                "user_id": "1106318894",
+                "conversation_id": "1106318894",
+                "job_id": "job-123",
+            },
+        ),
+        (
+            "clear",
+            {
+                "channel": "telegram",
+                "user_id": "1106318894",
+                "conversation_id": "1106318894",
+                "only_if_job_id": "job-123",
+            },
+        ),
+    ]
+
+
+def test_record_visible_assistant_turn_mirrors_siri_reply_to_telegram(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.main.settings",
+        SimpleNamespace(
+            telegram_allowed_chat_id_param="telegram_allowed_chat_id_param",
+            secret=lambda _param: "1106318894",
+        ),
+    )
+
+    recorded: list[dict[str, object]] = []
+
+    class FakeStore:
+        def record_turn(self, **kwargs):
+            recorded.append(kwargs)
+
+    job = AgentJob(
+        job_id="job-123",
+        source=JobSource.SIRI,
+        query="find dinner",
+        task_class=TaskClass.HEAVY,
+        user_id="siri",
+        conversation_id="siri",
+    )
+
+    _record_visible_assistant_turn(FakeStore(), job, "Found two options.", task_class=TaskClass.HEAVY)
+
+    assert recorded == [
+        {
+            "channel": "siri",
+            "user_id": "siri",
+            "conversation_id": "siri",
+            "role": ThreadTurnRole.ASSISTANT,
+            "text": "Found two options.",
+            "task_class": TaskClass.HEAVY,
+        },
+        {
+            "channel": "telegram",
+            "user_id": "1106318894",
+            "conversation_id": "1106318894",
+            "role": ThreadTurnRole.ASSISTANT,
+            "text": "Found two options.",
+            "task_class": TaskClass.HEAVY,
+        },
+    ]
 
 
 def test_completed_booking_clarification_is_treated_like_waiting_for_input() -> None:
@@ -296,6 +412,28 @@ def test_contextual_heavy_followup_continues_booking_thread() -> None:
     assert not _should_continue_contextual_heavy_followup(
         "Find me Italian restaurants in Soho tomorrow at 8",
         latest_job=latest_job,
+    )
+
+
+def test_followup_matcher_rejects_new_domain_shift() -> None:
+    latest_job = AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Not flights I'm thinking activities in NYC",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.RUNNING,
+    )
+    assert _query_changes_active_heavy_domain(
+        "Create an account with a free trial for Willow TV",
+        latest_job=latest_job,
+    )
+    assert _followup_matcher_decision(
+        "Create an account with a free trial for Willow TV",
+        latest_job=latest_job,
+    ) is False
+    assert _should_supersede_for_new_heavy_task(
+        "Create an account with a free trial for Willow TV",
+        latest_job=latest_job,
+        task_class=TaskClass.HEAVY,
     )
 
 
@@ -550,7 +688,7 @@ def test_format_tasks_list_humanizes_status_and_step() -> None:
     ]
     text = _format_tasks_list(SimpleNamespace(), jobs)
     assert "paused for your input" in text
-    assert "waiting for your reply" in text
+    assert "blocked on party size" in text
 
 
 def test_resolve_stop_target_prefers_running_task_over_paused_threads() -> None:
@@ -692,6 +830,54 @@ def test_partial_findings_text_prefers_useful_summary() -> None:
             return None
 
     assert "Vik hotels under $300" in _partial_findings_text(FakeState(), job)
+
+
+def test_partial_findings_text_uses_persisted_browser_partial_findings() -> None:
+    job = AgentJob(
+        job_id="99999999-9999-9999-9999-999999999999",
+        source=JobSource.TELEGRAM,
+        query="find me good flights to delhi",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.INTERRUPTED,
+        metadata={
+            "job_context": {
+                "latest_findings_summary": (
+                    "PARTIAL_STAGEHAND_FINDINGS: the browser session gathered these findings before it stopped:\n"
+                    "- Found a nonstop JFK to DEL option on Air India.\n"
+                    "- Lowest fare seen was about $780.\n"
+                    "Stagehand issue: selector timeout"
+                )
+            }
+        },
+    )
+
+    class FakeState:
+        def get_latest_checkpoint(self, _job_id: str):
+            return None
+
+    findings = _partial_findings_text(FakeState(), job)
+    assert "Air India" in findings
+    assert "selector timeout" not in findings
+
+
+def test_partial_findings_text_falls_back_to_recoverable_failure_summary() -> None:
+    job = AgentJob(
+        job_id="12121212-1212-1212-1212-121212121212",
+        source=JobSource.TELEGRAM,
+        query="find me cheap flights to delhi",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.INTERRUPTED,
+        error_message="Cloudflare 1015 rate limit while checking live fares",
+        metadata={"strategy_state": {"current_strategy": "api_direct"}},
+    )
+
+    class FakeState:
+        def get_latest_checkpoint(self, _job_id: str):
+            return None
+
+    findings = _partial_findings_text(FakeState(), job)
+    assert "rate-limited" in findings
+    assert "switched to the next approach" in findings
 
 
 def test_build_paused_input_resume_query_includes_new_input() -> None:
@@ -837,6 +1023,44 @@ def test_sync_thread_active_heavy_job_returns_running_job() -> None:
     assert resolved is job
 
 
+def test_sync_thread_active_heavy_job_accepts_siri_job_for_telegram_owner_thread(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.main.settings",
+        SimpleNamespace(
+            telegram_allowed_chat_id_param="telegram_allowed_chat_id_param",
+            secret=lambda _param: "1106318894",
+        ),
+    )
+    job = AgentJob(
+        source=JobSource.SIRI,
+        query="Find Indian restaurants",
+        task_class=TaskClass.HEAVY,
+        status=JobStatus.RUNNING,
+        user_id="siri",
+        conversation_id="siri",
+    )
+
+    class FakeStore:
+        def get_active_heavy_job_id(self, *, channel: str, user_id: str, conversation_id: str):
+            assert (channel, user_id, conversation_id) == ("telegram", "1106318894", "1106318894")
+            return job.job_id
+
+        def get_job(self, job_id: str):
+            assert job_id == job.job_id
+            return job
+
+        def clear_active_heavy_job(self, **_kwargs):
+            raise AssertionError("should not clear siri-owned active job for telegram owner thread")
+
+    resolved = _sync_thread_active_heavy_job(
+        FakeStore(),
+        channel="telegram",
+        user_id="1106318894",
+        conversation_id="1106318894",
+    )
+    assert resolved is job
+
+
 def test_sync_thread_active_heavy_job_clears_terminal_job() -> None:
     job = AgentJob(
         source=JobSource.TELEGRAM,
@@ -911,9 +1135,7 @@ def test_progress_notification_text_is_descriptive() -> None:
         task_class=TaskClass.HEAVY,
     )
     message = progress_notification_text(job, current_step="running_agent", summary="checking live flight options and comparing fares")
-    assert "Still working on it." in message
-    assert "Step: running agent" in message
-    assert "Update: checking live flight options and collecting candidate itineraries" in message
+    assert message == "checking live flight options and collecting candidate itineraries."
 
 
 def test_progress_summary_for_step_gets_more_specific_over_time() -> None:

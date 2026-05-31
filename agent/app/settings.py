@@ -160,7 +160,7 @@ class Settings:
     temporal_activity_schedule_to_close_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_SCHEDULE_TO_CLOSE_SECONDS", "5400"))
     temporal_activity_start_to_close_seconds: int = int(os.environ.get("TEMPORAL_ACTIVITY_START_TO_CLOSE_SECONDS", "5400"))
     temporal_activity_max_attempts: int = int(os.environ.get("TEMPORAL_ACTIVITY_MAX_ATTEMPTS", "3"))
-    strategy_consecutive_failure_threshold: int = int(os.environ.get("STRATEGY_CONSECUTIVE_FAILURE_THRESHOLD", "4"))
+    strategy_consecutive_failure_threshold: int = int(os.environ.get("STRATEGY_CONSECUTIVE_FAILURE_THRESHOLD", "3"))
     worker_stall_repeat_heartbeats: int = int(os.environ.get("WORKER_STALL_REPEAT_HEARTBEATS", "8"))
     worker_running_stall_seconds: int = int(os.environ.get("WORKER_RUNNING_STALL_SECONDS", "180"))
     worker_preflight_stall_seconds: int = int(os.environ.get("WORKER_PREFLIGHT_STALL_SECONDS", "90"))

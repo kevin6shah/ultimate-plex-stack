@@ -14,9 +14,11 @@ from .artifacts import (
     visible_output_files,
 )
 from .jobs import AgentJob, CheckpointPayload, JobStatus, TaskClass, ThreadTurnRole
+from .routing import query_domain_tags, query_domains_compatible
+from .schemas.execution_state import JobContext
 from .settings import Settings
 from .storage import StateStore
-from .strategy_runtime import default_strategy_state, normalize_strategy_state
+from .strategy_runtime import default_strategy_state, normalize_execution_progress_matrix, normalize_strategy_state
 from .telegram import TelegramClient
 
 
@@ -62,17 +64,122 @@ def has_useful_partial_findings(text: str) -> bool:
     return not any(marker in lowered for marker in generic_markers)
 
 
-def partial_findings_text(job: AgentJob, checkpoint: Optional[CheckpointPayload]) -> str:
+def extract_partial_findings_block(text: str) -> str:
+    normalized = plain_text_message(text or "")
+    if not normalized:
+        return ""
+    for marker in ("PARTIAL_STAGEHAND_FINDINGS:", "PARTIAL_BROWSER_FINDINGS:"):
+        if marker not in normalized:
+            continue
+        _, _, remainder = normalized.partition(marker)
+        lines: list[str] = []
+        for raw_line in remainder.splitlines():
+            line = plain_text_message(raw_line).strip()
+            if not line:
+                if lines:
+                    break
+                continue
+            lowered = line.lower()
+            if lowered.startswith("stagehand issue:") or lowered.startswith("primary browser issue:"):
+                break
+            if lowered.startswith("the lightweight browser fallback could not verify more details"):
+                break
+            lines.append(line[:300])
+        if lines:
+            return "\n".join(lines[:6])
+    return ""
+
+
+def summarize_recoverable_failure(query: str, error_message: str, strategy_name: str = "") -> str:
+    normalized = plain_text_message(error_message or "")
+    lowered = normalized.lower()
+    query_lowered = (query or "").lower()
+    strategy = str(strategy_name or "").strip().lower()
+    mode = "structured provider lane"
+    if "stagehand" in strategy:
+        mode = "browser interaction lane"
+    elif "browser_use" in strategy:
+        mode = "visual browser fallback lane"
+    if any(token in query_lowered for token in ("flight", "flights", "airline", "airport", "travel")):
+        if any(token in lowered for token in ("1015", "429", "cloudflare", "rate limit")):
+            return f"The {mode} was rate-limited while checking live flight options, so I switched to the next approach."
+        if any(token in lowered for token in ("502", "503", "504", "service unavailable", "gateway timeout", "internal server error")):
+            return f"The {mode} failed while checking live flight options, so I switched to the next approach."
+    if any(token in query_lowered for token in ("restaurant", "reservation", "resy", "opentable", "book me", "dinner")):
+        if any(token in lowered for token in ("500", "502", "503", "504", "service unavailable", "gateway timeout", "internal server error")):
+            return f"The {mode} failed while checking live reservation availability, so I switched to the next approach."
+        if any(token in lowered for token in ("429", "1015", "cloudflare", "rate limit")):
+            return f"The {mode} was rate-limited while checking live reservation availability, so I switched to the next approach."
+    if any(token in lowered for token in ("429", "1015", "cloudflare", "rate limit")):
+        return f"The {mode} was rate-limited, so I switched to the next approach."
+    if any(token in lowered for token in ("500", "502", "503", "504", "service unavailable", "gateway timeout", "internal server error")):
+        return f"The {mode} failed, so I switched to the next approach."
+    return ""
+
+
+def durable_findings_text(
+    *,
+    job: AgentJob,
+    checkpoint: Optional[CheckpointPayload],
+    strategy_name: str = "",
+    error_message: str = "",
+) -> str:
+    metadata = job.metadata or {}
+    matrix = metadata.get("execution_progress_matrix") if isinstance(metadata.get("execution_progress_matrix"), dict) else {}
+    job_context = metadata.get("job_context") if isinstance(metadata.get("job_context"), dict) else {}
+    persisted_findings = plain_text_message(str(job_context.get("latest_findings_summary") or ""))
+    artifact_findings = plain_text_message(str(matrix.get("last_meaningful_artifact") or ""))
     candidates = [
+        extract_partial_findings_block(error_message),
+        extract_partial_findings_block(persisted_findings),
+        extract_partial_findings_block(artifact_findings),
+        persisted_findings,
+        artifact_findings,
         job.result_preview or "",
         job.latest_checkpoint_summary or "",
         checkpoint.summary if checkpoint else "",
     ]
     for candidate in candidates:
         cleaned = clean_user_facing_result(candidate)
+        if cleaned and not _summary_matches_job_domain(job.query, cleaned):
+            continue
         if has_useful_partial_findings(cleaned):
             return cleaned[:1200]
-    return ""
+    return summarize_recoverable_failure(job.query, error_message or (job.error_message or ""), strategy_name)[:1200]
+
+
+def partial_findings_text(job: AgentJob, checkpoint: Optional[CheckpointPayload]) -> str:
+    strategy_name = ""
+    metadata = job.metadata or {}
+    if isinstance(metadata.get("strategy_state"), dict):
+        strategy_name = str(metadata["strategy_state"].get("current_strategy") or "")
+    return durable_findings_text(
+        job=job,
+        checkpoint=checkpoint,
+        strategy_name=strategy_name,
+        error_message=job.error_message or "",
+    )
+
+
+def progress_snapshot_text(job: AgentJob, checkpoint: Optional[CheckpointPayload]) -> str:
+    candidates = [
+        job.last_status_sent_text or "",
+        job.latest_checkpoint_summary or "",
+        checkpoint.summary if checkpoint else "",
+    ]
+    for candidate in candidates:
+        cleaned = clean_user_facing_result(candidate)
+        if not cleaned:
+            continue
+        if not _summary_matches_job_domain(job.query, cleaned):
+            continue
+        lowered = cleaned.lower()
+        if lowered.startswith("interrupted:"):
+            cleaned = cleaned.split(":", 1)[1].strip()
+        if cleaned:
+            return cleaned[:1200]
+    step = humanize_step(job.current_step or (checkpoint.current_step if checkpoint else "") or "")
+    return clean_user_facing_result(step)[:1200]
 
 
 def interrupted_reply_text(
@@ -86,6 +193,10 @@ def interrupted_reply_text(
     if findings:
         tail = "\n\nI kept the latest checkpoint." if include_checkpoint_note else ""
         return f"{lead}\n\nCurrent findings:\n{findings}{tail}".strip()
+    snapshot = progress_snapshot_text(job, checkpoint)
+    if snapshot:
+        tail = "\n\nI kept the latest checkpoint." if include_checkpoint_note else ""
+        return f"{lead}\n\nLatest progress:\n{snapshot}{tail}".strip()
     if include_checkpoint_note:
         return f"{lead} I kept the latest checkpoint.".strip()
     return lead.strip()
@@ -118,6 +229,13 @@ def humanize_worker_failure(query: str, error_message: str, status: JobStatus) -
     if normalized:
         return normalized
     return "I hit an internal error before the task finished."
+
+
+def _summary_matches_job_domain(query: str, summary: str) -> bool:
+    summary_tags = query_domain_tags(summary)
+    if not summary_tags:
+        return True
+    return query_domains_compatible(query, summary)
 
 
 def humanize_step(step: str) -> str:
@@ -252,21 +370,19 @@ def progress_summary_for_step(
 
 
 def progress_notification_text(job: AgentJob, *, current_step: str, summary: str) -> str:
-    cleaned_step = humanize_step(current_step)
     cleaned_summary = progress_summary_for_step(
         job.query,
         current_step=current_step,
         attachments=bool(job.attachments),
         summary=summary,
     )
-    lines = ["Still working on it."]
-    if cleaned_step:
-        lines.append(f"Step: {cleaned_step}")
-    if cleaned_summary:
-        lines.append(f"Update: {cleaned_summary[:1000]}")
-    else:
-        lines.append(f"Update: {status_summary_for_query(job.query, attachments=bool(job.attachments))}")
-    return "\n".join(lines)
+    message = cleaned_summary or status_summary_for_query(job.query, attachments=bool(job.attachments))
+    message = " ".join(message.split()).strip()
+    if not message:
+        return "Continuing the task."
+    if message[-1] not in ".!?":
+        message += "."
+    return message[:1000]
 
 
 def checkpoint_input_prompt(checkpoint: Optional[CheckpointPayload]) -> tuple[str, str]:
@@ -282,7 +398,6 @@ def paused_input_reply_text(state: StateStore, job: AgentJob) -> str:
     checkpoint = state.get_latest_checkpoint(job.job_id)
     question, details = checkpoint_input_prompt(checkpoint)
     summary = plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
-    step = humanize_step(job.current_step or (checkpoint.current_step if checkpoint else "") or "")
     question = plain_text_message(question)
     details = plain_text_message(details)
 
@@ -291,10 +406,8 @@ def paused_input_reply_text(state: StateStore, job: AgentJob) -> str:
         lines.append(question)
     if details:
         lines.extend(["", details])
-    if step:
-        lines.extend(["", f"Step: {step}"])
-    if summary:
-        lines.append(f"Update: {summary}")
+    elif summary:
+        lines.extend(["", summary])
     lines.extend(["", "Reply normally with the missing detail.", "If you want something else instead, just ask."])
     return "\n".join(lines)
 
@@ -350,12 +463,37 @@ def build_heavy_claim(state: StateStore, settings: Settings, job: AgentJob, *, q
     )
     memories = state.list_memories(owner=job.user_id or "siri")
     resume_checkpoint = state.get_latest_checkpoint(job.resume_from_job_id) if job.resume_from_job_id else None
-    strategy_state = normalize_strategy_state((job.metadata or {}).get("strategy_state") or default_strategy_state())
+    execution_progress_matrix = normalize_execution_progress_matrix(
+        (job.metadata or {}).get("execution_progress_matrix")
+        or (job.metadata or {}).get("strategy_state")
+        or default_strategy_state()
+    )
+    strategy_state = normalize_strategy_state(execution_progress_matrix.model_dump(mode="json"))
+    persisted_job_context = JobContext.model_validate((job.metadata or {}).get("job_context") or {})
     metadata_query_override = str((job.metadata or {}).get("query_override") or "").strip()
+    effective_query = query_override or metadata_query_override or job.query
+    job_context = JobContext(
+        original_query=job.query,
+        current_query=effective_query,
+        conversation_id=job.conversation_id or "default",
+        source=job.source.value,
+        resume_from_job_id=job.resume_from_job_id,
+        latest_findings_summary=persisted_job_context.latest_findings_summary or job.result_preview or "",
+        latest_checkpoint_summary=(
+            persisted_job_context.latest_checkpoint_summary
+            or (resume_checkpoint.summary if resume_checkpoint else "")
+            or (job.latest_checkpoint_summary or "")
+        ),
+        active_topic_key=str((job.metadata or {}).get("active_topic_key") or persisted_job_context.active_topic_key or ""),
+        thread_context_excerpt=context_summary[:3000],
+        operator_constraints=str((job.metadata or {}).get("operator_constraints") or persisted_job_context.operator_constraints or ""),
+        created_at=job.created_at or persisted_job_context.created_at,
+        updated_at=job.last_heartbeat_at or job.created_at,
+    )
     claim = {
         "job": {
             **job.model_dump(),
-            "query": query_override or metadata_query_override or job.query,
+            "query": effective_query,
         },
         "attachments": [attachment.model_dump() for attachment in job.attachments],
         "context_summary": context_summary,
@@ -364,6 +502,8 @@ def build_heavy_claim(state: StateStore, settings: Settings, job: AgentJob, *, q
         "resume_checkpoint": resume_checkpoint.model_dump() if resume_checkpoint else None,
         "config": config.model_dump(),
         "strategy_state": strategy_state,
+        "execution_progress_matrix": execution_progress_matrix.model_dump(mode="json"),
+        "job_context": job_context.model_dump(mode="json"),
         "artifacts_bucket": settings.artifacts_bucket,
         "artifacts_prefix": f"jobs/{job.job_id}",
     }

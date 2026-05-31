@@ -103,6 +103,31 @@ LOGIN_ACCOUNT_PROFILE = TaskRoutingProfile(
     ),
 )
 
+DOMAIN_TAG_PATTERNS: dict[str, tuple[str, ...]] = {
+    "travel": (
+        r"\b(flight|flights|airfare|airport|airline|delta|united|american airlines|skiplagged|google flights)\b",
+        r"\b(hotel|hotels|airbnb|accommodation|rental car|rental cars|car rental|car rentals)\b",
+    ),
+    "restaurant": (
+        r"\b(restaurant|restaurants|reservation|reservations|table|resy|opentable|dinner|lunch|brunch|breakfast|cuisine|cuisines)\b",
+    ),
+    "account": (
+        r"\b(account|login|log in|sign in|sign up|signup|register|password|verification code|otp|2fa|captcha)\b",
+    ),
+    "streaming": (
+        r"\b(willow|fubo|fubo tv|espn\+|youtube tv|streaming|subscription|trial|sports package|ipl)\b",
+    ),
+    "fitness": (
+        r"\b(calorie|calories|protein|macros|macro|nutrition|myfitnesspal|weight loss|diet)\b",
+    ),
+    "nightlife": (
+        r"\b(party|parties|bar|bars|club|clubs|dj|nightlife|speakeasy|password)\b",
+    ),
+    "activities": (
+        r"\b(things to do|activities|activity|options|rainy day|windy day|museum|park|indoor|outdoor)\b",
+    ),
+}
+
 
 def _matches_any(normalized: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, normalized) for pattern in patterns)
@@ -119,6 +144,40 @@ def task_routing_profile(query: str) -> TaskRoutingProfile:
     if _matches_any(normalized, BOOKING_COMMERCE_PATTERNS):
         return BOOKING_COMMERCE_PROFILE
     return GENERAL_PROFILE
+
+
+def query_domain_tags(query: str) -> set[str]:
+    normalized = query.strip().lower()
+    if not normalized:
+        return set()
+    tags: set[str] = set()
+    profile = task_routing_profile(normalized).name
+    if profile != "general":
+        tags.add(profile)
+    for tag, patterns in DOMAIN_TAG_PATTERNS.items():
+        if _matches_any(normalized, patterns):
+            tags.add(tag)
+    return tags
+
+
+def query_domains_compatible(prior_query: str, new_query: str) -> bool:
+    normalized_prior = prior_query.strip().lower()
+    normalized_new = new_query.strip().lower()
+    if not normalized_prior or not normalized_new:
+        return True
+
+    prior_profile = task_routing_profile(normalized_prior).name
+    new_profile = task_routing_profile(normalized_new).name
+    if new_profile != "general" and prior_profile == "general":
+        return False
+    if prior_profile != "general" and new_profile != "general" and prior_profile != new_profile:
+        return False
+
+    prior_tags = query_domain_tags(normalized_prior)
+    new_tags = query_domain_tags(normalized_new)
+    if prior_tags and new_tags and prior_tags.isdisjoint(new_tags):
+        return False
+    return True
 
 
 def is_long_task(query: str) -> bool:
@@ -181,3 +240,10 @@ def needs_confirmation(text: str) -> bool:
         r"\b(reply|respond)\b.{0,20}\b(to)\b",
     )
     return any(re.search(pattern, normalized) for pattern in outbound_patterns)
+
+
+def needs_explicit_operator_confirmation(text: str, *, routing_profile_name: str) -> bool:
+    normalized_profile = (routing_profile_name or "").strip().lower()
+    if normalized_profile not in {"booking_commerce", "login_account"}:
+        return False
+    return needs_confirmation(text)

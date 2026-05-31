@@ -54,10 +54,14 @@ def test_stagehand_browser_payload_includes_launch_options(tmp_path) -> None:
     assert "--no-sandbox" in launch_options["args"]
     assert "--disable-dev-shm-usage" in launch_options["args"]
     assert "--disable-blink-features=AutomationControlled" in launch_options["args"]
+    assert any(arg.startswith("--user-agent=") for arg in launch_options["args"])
+    assert any(arg.startswith("--window-size=") for arg in launch_options["args"])
     assert launch_options["chromiumSandbox"] is False
     assert launch_options["headless"] is False
     assert launch_options["executablePath"] == "/custom/chrome"
     assert launch_options["preserveUserDataDir"] is True
+    assert launch_options["acceptDownloads"] is True
+    assert launch_options["ignoreHTTPSErrors"] is True
     assert launch_options["locale"] == "en-US"
     assert launch_options["viewport"]["width"] > 0
     assert launch_options["viewport"]["height"] > 0
@@ -99,6 +103,7 @@ def test_stagehand_task_needs_interaction_for_booking_flow() -> None:
 
 def test_stagehand_interaction_instruction_is_non_destructive() -> None:
     instruction = _stagehand_interaction_instruction("Find dinner slots")
+    assert "dismiss non-essential cookie banners" in instruction
     assert "Set or confirm the requested date, party size, and reservation controls" in instruction
     assert "Do not submit or finalize any booking." in instruction
 
@@ -107,9 +112,10 @@ def test_stagehand_interaction_steps_prioritize_date_then_party_size() -> None:
     steps = _stagehand_interaction_steps(
         "Open the booking flow for 2026-05-28 for 3 people and reveal visible reservation times."
     )
-    assert steps[0].startswith("Open the date selector and set the reservation date to 2026-05-28")
-    assert steps[1].startswith("Set the party size selector to 3 guests")
-    assert steps[2].startswith("Open the reservation time selector or reservation results area")
+    assert "dismiss non-essential cookie banners" in steps[0]
+    assert steps[1].startswith("Open the date selector and set the reservation date to 2026-05-28")
+    assert steps[2].startswith("Set the party size selector to 3 guests")
+    assert steps[3].startswith("Open the reservation time selector or reservation results area")
 
 
 def test_stagehand_verification_instruction_understands_relative_date_labels() -> None:
@@ -138,10 +144,12 @@ def test_format_stagehand_summary_renders_sources_and_findings() -> None:
     rendered = _format_stagehand_summary(
         summary="Hotel A is the closest option with decent reviews.",
         findings=["About 10 minutes from the venue", "Roughly $240/night on the checked dates"],
+        validation_evidence=["Confirmation number: ABC123"],
         current_url="https://example.com/hotel-a",
         search_results=[{"title": "Hotel A", "url": "https://example.com/hotel-a", "snippet": "Closest option"}],
         blocker="",
     )
     assert "Hotel A is the closest option" in rendered
+    assert "Validation evidence:" in rendered
     assert "Candidate sources:" in rendered
     assert "Current page: https://example.com/hotel-a" in rendered

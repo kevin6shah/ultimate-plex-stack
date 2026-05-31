@@ -68,7 +68,7 @@ from .gmail_oauth import (
     mint_gmail_access_token,
     renew_gmail_watch,
 )
-from .routing import classify_task, is_long_task, task_routing_profile
+from .routing import classify_task, is_long_task, query_domains_compatible, task_routing_profile
 from .settings import settings
 from .storage import StateStore
 from .temporal_runtime import temporal_backend_enabled
@@ -79,6 +79,7 @@ from .heavy_job_runtime import (
     has_useful_partial_findings as _shared_has_useful_partial_findings,
     interrupted_reply_text as _shared_interrupted_reply_text,
     partial_findings_text as _shared_partial_findings_text,
+    progress_snapshot_text as _shared_progress_snapshot_text,
     progress_notification_text,
 )
 
@@ -194,6 +195,7 @@ async def _start_heavy_job(state: StateStore, job: AgentJob) -> None:
             conversation_id=job.conversation_id,
             job_id=job.job_id,
         )
+        _sync_siri_heavy_job_to_telegram_thread(state, job_id=job.job_id, job=job)
     if temporal_backend_enabled(settings):
         from .temporal_client import start_heavy_job_workflow
 
@@ -780,6 +782,32 @@ def _natural_reply_can_resume(
     return _looks_like_natural_input_reply(query)
 
 
+def _query_changes_active_heavy_domain(
+    query: str,
+    *,
+    latest_job: Optional[AgentJob],
+) -> bool:
+    if latest_job is None or latest_job.task_class != TaskClass.HEAVY:
+        return False
+    normalized = query.strip()
+    if not normalized:
+        return False
+    return not query_domains_compatible(latest_job.query, normalized)
+
+
+def _should_supersede_for_new_heavy_task(
+    query: str,
+    *,
+    latest_job: Optional[AgentJob],
+    task_class: TaskClass,
+) -> bool:
+    if task_class != TaskClass.HEAVY:
+        return False
+    if not _job_can_be_superseded_by_followup(latest_job):
+        return False
+    return _query_changes_active_heavy_domain(query, latest_job=latest_job)
+
+
 def _followup_matcher_decision(
     query: str,
     *,
@@ -798,6 +826,8 @@ def _followup_matcher_decision(
         or _is_resume_request(normalized)
         or _is_input_reply(normalized)
     ):
+        return False
+    if _query_changes_active_heavy_domain(normalized, latest_job=latest_job):
         return False
     if len(normalized) > 220:
         return False
@@ -1006,9 +1036,25 @@ async def _signal_running_heavy_followup(job: Optional[AgentJob], query: str) ->
     uses_temporal = str((job.metadata or {}).get("execution_backend", "")).strip().lower() == "temporal"
     if not uses_temporal:
         return False
+    state = store()
+    normalized = (query or "").strip()
+    if not normalized:
+        return False
+    existing_followup = str((job.metadata or {}).get("pending_followup_text") or "").strip()
+    combined_followup = f"{existing_followup}\n{normalized}".strip() if existing_followup else normalized
+    state.merge_job_metadata(
+        job.job_id,
+        {
+            "pending_followup_text": combined_followup,
+        },
+    )
     from .temporal_client import signal_update_heavy_job
 
-    return await signal_update_heavy_job(settings, job.job_id, query)
+    signaled = await signal_update_heavy_job(settings, job.job_id, normalized)
+    if signaled:
+        return True
+    state.merge_job_metadata(job.job_id, {"pending_followup_text": None})
+    return False
 
 
 def _job_result_looks_like_booking_clarification(job: AgentJob) -> bool:
@@ -1164,6 +1210,12 @@ def _partial_findings_text(state: StateStore, job: AgentJob) -> str:
     return _shared_partial_findings_text(job, checkpoint)
 
 
+def _progress_snapshot_text(state: StateStore, job: AgentJob) -> str:
+    get_checkpoint = getattr(state, "get_latest_checkpoint", None)
+    checkpoint = get_checkpoint(job.job_id) if callable(get_checkpoint) else None
+    return _plain_text_message(_shared_progress_snapshot_text(job, checkpoint))
+
+
 def _resume_query_text(query: str, resumable: Optional[AgentJob]) -> str:
     if resumable is None:
         return query
@@ -1199,6 +1251,13 @@ def _job_indicates_user_stop(job: AgentJob, latest_summary: str) -> bool:
 
 
 def _job_thread_matches(job: AgentJob, *, channel: str, user_id: str, conversation_id: str) -> bool:
+    if (
+        channel == "telegram"
+        and job.source == JobSource.SIRI
+        and settings.secret(settings.telegram_allowed_chat_id_param) == user_id
+        and conversation_id == user_id
+    ):
+        return True
     return (
         job.source.value == channel
         and (job.user_id or "unknown") == user_id
@@ -1215,6 +1274,57 @@ def _clear_thread_active_heavy_job_if_matches(state: StateStore, job: Optional[A
         conversation_id=job.conversation_id,
         only_if_job_id=job.job_id,
     )
+    _sync_siri_heavy_job_to_telegram_thread(state, job_id=None, job=job)
+
+
+def _sync_siri_heavy_job_to_telegram_thread(
+    state: StateStore,
+    *,
+    job_id: Optional[str],
+    job: Optional[AgentJob],
+) -> None:
+    if job is None or job.source != JobSource.SIRI:
+        return
+    chat_id = settings.secret(settings.telegram_allowed_chat_id_param)
+    if not chat_id:
+        return
+    if job_id:
+        state.set_active_heavy_job(
+            channel="telegram",
+            user_id=chat_id,
+            conversation_id=chat_id,
+            job_id=job_id,
+        )
+        return
+    state.clear_active_heavy_job(
+        channel="telegram",
+        user_id=chat_id,
+        conversation_id=chat_id,
+        only_if_job_id=job.job_id,
+    )
+
+
+def _record_visible_assistant_turn(state: StateStore, job: AgentJob, text: str, *, task_class: TaskClass) -> None:
+    cleaned_text = _clean_user_facing_result(text)
+    state.record_turn(
+        channel=job.source.value,
+        user_id=job.user_id or "unknown",
+        conversation_id=job.conversation_id or "default",
+        role=ThreadTurnRole.ASSISTANT,
+        text=cleaned_text,
+        task_class=task_class,
+    )
+    if job.source == JobSource.SIRI:
+        chat_id = settings.secret(settings.telegram_allowed_chat_id_param)
+        if chat_id:
+            state.record_turn(
+                channel="telegram",
+                user_id=chat_id,
+                conversation_id=chat_id,
+                role=ThreadTurnRole.ASSISTANT,
+                text=cleaned_text,
+                task_class=task_class,
+            )
 
 
 def _sync_thread_active_heavy_job(
@@ -1636,8 +1746,8 @@ def _checkpoint_input_prompt(checkpoint: Optional[CheckpointPayload]) -> tuple[s
 def _paused_input_reply_text(state: StateStore, job: AgentJob) -> str:
     checkpoint = state.get_latest_checkpoint(job.job_id)
     question, details = _checkpoint_input_prompt(checkpoint)
-    summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
-    step = _humanize_step(job.current_step or (checkpoint.current_step if checkpoint else "") or "")
+    progress = _progress_snapshot_text(state, job)
+    raw_summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
     question = _plain_text_message(question)
     details = _plain_text_message(details)
 
@@ -1646,14 +1756,10 @@ def _paused_input_reply_text(state: StateStore, job: AgentJob) -> str:
         lines.extend(["", question])
     if details:
         lines.extend(["", details])
-    status_lines: list[str] = []
-    if step:
-        status_lines.append(f"Step: {step}")
-    if summary:
-        status_lines.append(f"Update: {summary}")
-    if status_lines:
-        lines.extend([""])
-        lines.extend(status_lines)
+    if raw_summary and raw_summary not in {question, details, progress}:
+        lines.extend(["", raw_summary])
+    if progress:
+        lines.extend(["", progress])
     lines.extend(
         [
             "",
@@ -1688,8 +1794,9 @@ def _format_tasks_list(state: StateStore, jobs: list[AgentJob]) -> str:
         return "I do not see any active long-running tasks right now."
     lines = ["Active tasks:"]
     for index, job in enumerate(jobs, start=1):
-        summary = _plain_text_message(job.latest_checkpoint_summary or "")
-        step = _humanize_step(job.current_step or "")
+        progress = _progress_snapshot_text(state, job)
+        checkpoint = state.get_latest_checkpoint(job.job_id) if hasattr(state, "get_latest_checkpoint") else None
+        raw_summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
         source = job.source.value
         query_preview = _plain_text_message(job.query or "")
         query_preview = re.sub(r"\s+", " ", query_preview).strip()
@@ -1698,12 +1805,10 @@ def _format_tasks_list(state: StateStore, jobs: list[AgentJob]) -> str:
         line = f"{index}. {_humanize_status(job.status)}: {query_preview or job.job_id[:8]}"
         if query_preview:
             line += f" ({source})"
-        if step:
-            line += f"\n   Step: {step}"
-        elif summary:
-            line += f"\n   Update: {summary[:120]}"
-        if query_preview:
-            line += f"\n   Query: {query_preview}"
+        if raw_summary and raw_summary != progress:
+            line += f"\n   {raw_summary[:160]}"
+        if progress:
+            line += f"\n   {progress[:160]}"
         line += f"\n   ID: {job.job_id[:8]}"
         lines.append(line)
     lines.append("Say 'stop 1' or 'stop <job id>' to stop one.")
@@ -1852,32 +1957,38 @@ def _format_status_message(state: StateStore, job: Optional[AgentJob]) -> str:
     if job is None:
         return "I do not see a recent long-running task to report on."
     checkpoint = state.get_latest_checkpoint(job.job_id)
-    summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
-    step = _humanize_step(job.current_step or (checkpoint.current_step if checkpoint else "") or "")
-    step_line = f"\nStep: {step}" if step else ""
-    summary_line = f"\nUpdate: {summary}" if summary else ""
+    raw_summary = _plain_text_message(job.latest_checkpoint_summary or (checkpoint.summary if checkpoint else "") or "")
+    progress = _progress_snapshot_text(state, job)
     if job.status in {JobStatus.QUEUED, JobStatus.WAITING_WORKER}:
-        return f"I queued that task.{step_line}{summary_line}".strip()
+        if progress:
+            return f"I queued that task. {progress}".strip()
+        return "I queued that task."
     if job.status == JobStatus.RUNNING:
-        if _checkpoint_indicates_interruption(summary):
+        if _checkpoint_indicates_interruption(raw_summary):
             return _shared_interrupted_reply_text(
                 job,
                 checkpoint,
-                lead=f"I hit an interruption while finishing that task.{step_line}{summary_line}".strip(),
+                lead="I hit an interruption while finishing that task.",
             )
-        return f"Still working on it.{step_line}{summary_line}".strip()
+        if progress:
+            return progress
+        return "I’m still working on that."
     if job.status == JobStatus.WAITING_APPROVAL:
-        return f"I’m waiting for approval on that task.{step_line}{summary_line}".strip()
+        if progress:
+            return f"I’m waiting for approval on that task. {progress}".strip()
+        return "I’m waiting for approval on that task."
     if job.status == JobStatus.PAUSED_FOR_INPUT:
         return _paused_input_reply_text(state, job)
     if job.status in {JobStatus.CHECKPOINTED, JobStatus.INTERRUPTED, JobStatus.TIMED_OUT}:
         return _shared_interrupted_reply_text(
             job,
             checkpoint,
-            lead=f"That task is {_humanize_status(job.status)}.{step_line}{summary_line}".strip(),
+            lead=f"That task is {_humanize_status(job.status)}.",
         )
     if job.status == JobStatus.PAUSED_BUDGET:
-        return f"That task is paused because of budget limits.{step_line}{summary_line}".strip()
+        if progress:
+            return f"That task is paused because of budget limits. {progress}".strip()
+        return "That task is paused because of budget limits."
     if job.status == JobStatus.COMPLETED:
         if _job_result_looks_like_booking_clarification(job):
             prompt = (job.result_preview or "").strip()
@@ -3030,7 +3141,11 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
         if findings:
             reply = f"Here’s what I have so far:\n{findings}"
         else:
-            reply = "I do not have useful findings to share from that run yet."
+            progress = _progress_snapshot_text(state, latest_status_job)
+            if progress:
+                reply = f"I do not have concrete results yet.\n\nLatest progress:\n{progress}"
+            else:
+                reply = "I do not have concrete results to share from that run yet."
         state.record_turn(
             channel="telegram",
             user_id=user_id,
@@ -3146,6 +3261,15 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
                         text=query,
                         task_class=task_class,
                     )
+                if query and _should_supersede_for_new_heavy_task(query, latest_job=resume_job, task_class=task_class):
+                    await _supersede_running_heavy_job(state, resume_job)
+                    superseded_running_job = True
+                    _log_followup_resolution(
+                        channel="telegram",
+                        query=query,
+                        latest_job=resume_job,
+                        action="replace_paused_task_for_new_domain",
+                    )
                 resume_from_job_id = None
                 effective_query = query
     else:
@@ -3199,6 +3323,15 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Op
                 query or "",
             )
         else:
+            if query and _should_supersede_for_new_heavy_task(query, latest_job=latest_status_job, task_class=task_class):
+                await _supersede_running_heavy_job(state, latest_status_job)
+                superseded_running_job = True
+                _log_followup_resolution(
+                    channel="telegram",
+                    query=query,
+                    latest_job=latest_status_job,
+                    action="replace_running_task_for_new_domain",
+                )
             resume_from_job_id = None
             effective_query = query
         if query:
@@ -3415,7 +3548,11 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
         if findings:
             reply = f"Here’s what I have so far:\n{findings}"
         else:
-            reply = "I do not have useful findings to share from that run yet."
+            progress = _progress_snapshot_text(state, latest_status_job)
+            if progress:
+                reply = f"I do not have concrete results yet.\n\nLatest progress:\n{progress}"
+            else:
+                reply = "I do not have concrete results to share from that run yet."
         state.record_turn(
             channel="siri",
             user_id="siri",
@@ -3490,6 +3627,15 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
                 )
             else:
                 task_class = classify_task(query)
+                if _should_supersede_for_new_heavy_task(query, latest_job=resume_job, task_class=task_class):
+                    await _supersede_running_heavy_job(state, resume_job)
+                    superseded_running_job = True
+                    _log_followup_resolution(
+                        channel="siri",
+                        query=query,
+                        latest_job=resume_job,
+                        action="replace_paused_task_for_new_domain",
+                    )
                 resume_from_job_id = None
                 effective_query = query
     else:
@@ -3544,6 +3690,15 @@ async def siri(request: SiriRequest, x_friday_siri_key: Optional[str] = Header(d
                 query,
             )
         else:
+            if _should_supersede_for_new_heavy_task(query, latest_job=latest_status_job, task_class=task_class):
+                await _supersede_running_heavy_job(state, latest_status_job)
+                superseded_running_job = True
+                _log_followup_resolution(
+                    channel="siri",
+                    query=query,
+                    latest_job=latest_status_job,
+                    action="replace_running_task_for_new_domain",
+                )
             resume_from_job_id = None
             effective_query = query
         if _is_resume_request(query):
@@ -3782,14 +3937,17 @@ async def worker_heartbeat(body: WorkerHeartbeat, x_friday_worker_key: Optional[
         )
         state.mark_loop_stop_requested(body.job_id)
         if updated_job.chat_id:
+            message = _stall_stop_user_message()
+            _record_visible_assistant_turn(state, updated_job, message, task_class=TaskClass.HEAVY)
             await TelegramClient(settings).send_message(
                 updated_job.chat_id,
-                _stall_stop_user_message(),
+                message,
             )
         return {"status": "stall_stop_requested"}
     if body.notify and job.chat_id:
         message = progress_notification_text(updated_job, current_step=body.current_step, summary=body.summary)
         if state.should_send_status_update(body.job_id, interval_seconds=config.status_update_interval_seconds, text=message):
+            _record_visible_assistant_turn(state, updated_job, message, task_class=TaskClass.HEAVY)
             await TelegramClient(settings).send_message(job.chat_id, message)
             state.mark_status_update_sent(body.job_id, text=message)
     return {"status": "ok"}
@@ -3853,14 +4011,7 @@ async def worker_pause(body: WorkerPauseRequest, x_friday_worker_key: Optional[s
             job_id=job.job_id,
         )
     message = _paused_input_reply_text(state, state.get_job(body.job_id) or job)
-    state.record_turn(
-        channel=job.source.value,
-        user_id=job.user_id or "unknown",
-        conversation_id=job.conversation_id or "default",
-        role=ThreadTurnRole.ASSISTANT,
-        text=message,
-        task_class=TaskClass.HEAVY,
-    )
+    _record_visible_assistant_turn(state, job, message, task_class=TaskClass.HEAVY)
     if job.chat_id:
         await TelegramClient(settings).send_message(job.chat_id, message)
     _maybe_stop_dedicated_worker_if_idle(state)
@@ -3920,14 +4071,7 @@ async def worker_complete(body: WorkerCompleteRequest, x_friday_worker_key: Opti
         )
         paused_job = state.get_job(body.job_id)
         user_message = _paused_input_reply_text(state, paused_job) if paused_job is not None else cleaned_result
-        state.record_turn(
-            channel=job.source.value,
-            user_id=job.user_id or "unknown",
-            conversation_id=job.conversation_id or "default",
-            role=ThreadTurnRole.ASSISTANT,
-            text=user_message,
-            task_class=TaskClass.HEAVY,
-        )
+        _record_visible_assistant_turn(state, job, user_message, task_class=TaskClass.HEAVY)
         if job.chat_id:
             await TelegramClient(settings).send_message(job.chat_id, user_message)
         return {"status": "paused_for_input"}
@@ -3940,14 +4084,7 @@ async def worker_complete(body: WorkerCompleteRequest, x_friday_worker_key: Opti
         artifact_keys=body.artifact_keys,
     )
     _clear_thread_active_heavy_job_if_matches(state, job)
-    state.record_turn(
-        channel=job.source.value,
-        user_id=job.user_id or "unknown",
-        conversation_id=job.conversation_id or "default",
-        role=ThreadTurnRole.ASSISTANT,
-        text=cleaned_result,
-        task_class=TaskClass.HEAVY,
-    )
+    _record_visible_assistant_turn(state, job, cleaned_result, task_class=TaskClass.HEAVY)
     if job.chat_id:
         include_browser_step_screenshots = query_requests_browser_images(job.query)
         include_requested_output_files = query_requests_output_files(job.query)
@@ -4004,14 +4141,7 @@ async def worker_fail(body: WorkerFailureRequest, x_friday_worker_key: Optional[
     user_error = _humanize_worker_failure(job.query, body.error_message, status)
     state.update_job_status(body.job_id, status=status, current_step="failed", error_message=user_error)
     _clear_thread_active_heavy_job_if_matches(state, job)
-    state.record_turn(
-        channel=job.source.value,
-        user_id=job.user_id or "unknown",
-        conversation_id=job.conversation_id or "default",
-        role=ThreadTurnRole.ASSISTANT,
-        text=user_error,
-        task_class=TaskClass.HEAVY,
-    )
+    _record_visible_assistant_turn(state, job, user_error, task_class=TaskClass.HEAVY)
     if job.chat_id:
         await TelegramClient(settings).send_message(job.chat_id, user_error)
     _maybe_stop_dedicated_worker_if_idle(state)

@@ -3,6 +3,7 @@ import asyncio
 
 from app.browser_use_runner import (
     _browser_use_result_needs_retry,
+    _extract_browser_use_validation_evidence,
     _extract_browser_use_partial_findings,
     _filesystem_mcp_args,
     _firecrawl_mcp_env,
@@ -64,6 +65,14 @@ def test_extract_browser_use_partial_findings_prefers_memory_lines() -> None:
     assert "docs.openclaw.ai and a GitHub repo" in findings
     assert "self-hosted gateway for chat apps and coding agents" in findings
     assert findings.count("- ") >= 2
+
+
+def test_extract_browser_use_validation_evidence_finds_confirmation_markers() -> None:
+    evidence = _extract_browser_use_validation_evidence(
+        "Reservation confirmed\nConfirmation number: ABC123\nReceipt emailed."
+    )
+    assert "Reservation confirmed" in evidence
+    assert "Confirmation number: ABC123" in evidence
 
 
 def test_maps_openapi_mcp_env_uses_base_url_headers_and_token() -> None:

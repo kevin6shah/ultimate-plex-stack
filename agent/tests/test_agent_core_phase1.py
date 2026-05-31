@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
 import pytest
 
 import app.agent_core as agent_core
@@ -14,6 +18,7 @@ from app.agent_core import (
     _ensure_default_mailbox_identity,
     _enforce_automation_policy,
     _extract_party_size_value,
+    _extract_intermediate_findings_text,
     _extract_resy_venue_note,
     _extract_restaurant_booking_prefill,
     _extract_restaurant_discovery_prefill,
@@ -30,17 +35,26 @@ from app.agent_core import (
     _restaurant_provider_browser_fallback_message,
     _restaurant_booking_missing_details,
     _phase1_booking_runtime_guidance,
+    _persist_intermediate_findings,
+    _persist_recoverable_failure_summary,
     _opentable_requires_login_gate,
     _restaurant_search_with_city_fallback,
     _render_clock_label,
     _render_resy_slot_policy,
     _select_resy_time_option_labels,
+    _structured_travel_failure_message,
     _should_skip_booking_cancellation_precheck,
     _should_expose_browser_tools,
 )
-from app.jobs import AutomationPolicyRecord, BookingRecord, BrowserSessionRecord, CheckpointPayload, IdentityRecord
+from app.jobs import AutomationPolicyRecord, BookingRecord, BrowserSessionRecord, CheckpointPayload, IdentityRecord, JobSource, TaskClass
 from app.restaurant_cli import RestaurantSlotPolicy
 from app.settings import Settings
+
+
+def _local_date_iso(settings: Settings, days: int = 0) -> str:
+    timezone_name = settings.restaurant_cli_timezone or "America/New_York"
+    current = datetime.now(ZoneInfo(timezone_name)).date() + timedelta(days=days)
+    return current.isoformat()
 
 
 class _FakeStore:
@@ -248,6 +262,101 @@ def test_retryable_model_error_detects_deepseek_internal_error() -> None:
     assert _is_retryable_model_error(exc) is True
 
 
+def test_extract_intermediate_findings_text_prefers_partial_browser_block() -> None:
+    text = (
+        "PARTIAL_STAGEHAND_FINDINGS: the browser session gathered these findings before it stopped:\n"
+        "- Air India nonstop was listed at $812\n"
+        "- Etihad one-stop was listed at $734\n"
+        "STAGEHAND_BROWSER_TASK_FAILED: selector timeout"
+    )
+
+    findings = _extract_intermediate_findings_text(text)
+
+    assert "Air India nonstop" in findings
+    assert "selector timeout" not in findings
+
+
+def test_persist_intermediate_findings_updates_job_metadata() -> None:
+    job = agent_core.AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Find flights to Delhi",
+        task_class=TaskClass.HEAVY,
+        metadata={},
+    )
+    merged: list[tuple[str, dict[str, object]]] = []
+
+    class FakeStore:
+        def merge_job_metadata(self, job_id: str, updates: dict[str, object]) -> None:
+            merged.append((job_id, updates))
+
+    ctx = SimpleNamespace(deps=SimpleNamespace(current_job=job, store=FakeStore()))
+
+    rendered = _persist_intermediate_findings(
+        ctx,
+        "Air India nonstop is available for $812 and Etihad is available for $734.",
+    )
+
+    assert "Air India nonstop" in rendered
+    assert merged
+    _, updates = merged[-1]
+    assert updates["job_context"]["latest_findings_summary"].startswith("Air India nonstop")
+    assert updates["execution_progress_matrix"]["last_meaningful_artifact"].startswith("Air India nonstop")
+
+
+def test_persist_intermediate_findings_skips_generic_progress() -> None:
+    job = agent_core.AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Find flights to Delhi",
+        task_class=TaskClass.HEAVY,
+        metadata={},
+    )
+    merged: list[tuple[str, dict[str, object]]] = []
+
+    class FakeStore:
+        def merge_job_metadata(self, job_id: str, updates: dict[str, object]) -> None:
+            merged.append((job_id, updates))
+
+    ctx = SimpleNamespace(deps=SimpleNamespace(current_job=job, store=FakeStore()))
+
+    _persist_intermediate_findings(ctx, "checking live flight options and collecting candidate itineraries")
+
+    assert merged == []
+
+
+def test_persist_recoverable_failure_summary_updates_job_metadata() -> None:
+    job = agent_core.AgentJob(
+        source=JobSource.TELEGRAM,
+        query="Find flights to Delhi",
+        task_class=TaskClass.HEAVY,
+        metadata={},
+    )
+    merged: list[tuple[str, dict[str, object]]] = []
+
+    class FakeStore:
+        def merge_job_metadata(self, job_id: str, updates: dict[str, object]) -> None:
+            merged.append((job_id, updates))
+
+    ctx = SimpleNamespace(
+        deps=SimpleNamespace(
+            current_job=job,
+            store=FakeStore(),
+            strategy_mode="api_direct",
+        )
+    )
+
+    _persist_recoverable_failure_summary(
+        ctx,
+        error="Cloudflare 1015 retry_after=30",
+        query="Find flights from JFK to DEL next week",
+    )
+
+    assert merged
+    _, updates = merged[-1]
+    summary = updates["job_context"]["latest_findings_summary"]
+    assert "rate-limited" in summary.lower()
+    assert "flight" in summary.lower()
+
+
 def test_retryable_model_error_ignores_user_input_pause() -> None:
     exc = RuntimeError("I need party size before I can continue.")
     assert _is_retryable_model_error(exc) is False
@@ -259,6 +368,31 @@ def test_retryable_model_error_ignores_structured_restaurant_api_direct_failure(
         "provider=resy venue=Indian Table venue_id=88720 error=500 Internal Server Error"
     )
     assert _is_retryable_model_error(exc) is False
+
+
+def test_retryable_model_error_ignores_structured_travel_api_direct_failure() -> None:
+    exc = RuntimeError(
+        "service unavailable: structured travel flight search failed in api_direct mode. "
+        "error=Cloudflare 1015 retry_after=45"
+    )
+    assert _is_retryable_model_error(exc) is False
+
+
+def test_retryable_model_error_ignores_browser_fallback_failures() -> None:
+    exc = RuntimeError("BROWSER_TASK_UNAVAILABLE: browser escalation is disabled in API_DIRECT strategy mode.")
+    assert _is_retryable_model_error(exc) is False
+
+
+def test_structured_travel_failure_message_includes_operation_and_strategy() -> None:
+    text = _structured_travel_failure_message(
+        operation="flight search",
+        strategy_mode="stagehand_stealth_act",
+        error="Cloudflare 1015",
+    )
+
+    assert "structured travel flight search failed" in text
+    assert "stagehand_stealth_act" in text
+    assert "Cloudflare 1015" in text
 
 
 def test_booking_cancellation_followup_detection() -> None:
@@ -569,7 +703,7 @@ def test_extract_restaurant_booking_prefill_accepts_flexible_time_and_venue_afte
     assert prefill is not None
     assert prefill.venue_query == "Angel Indian Restaurant"
     assert prefill.provider == "resy"
-    assert prefill.date == "2026-05-29"
+    assert prefill.date == _local_date_iso(settings)
     assert prefill.time == "ANY AVAILABLE"
     assert prefill.party_size == 3
 
@@ -587,7 +721,7 @@ def test_extract_restaurant_booking_prefill_accepts_resumed_labeled_inputs() -> 
 
     assert prefill is not None
     assert prefill.venue_query == "Angel Indian Restaurant"
-    assert prefill.date == "2026-05-30"
+    assert prefill.date == _local_date_iso(settings, days=1)
     assert prefill.time == "2:30 AM"
     assert prefill.party_size == 3
 
@@ -955,5 +1089,12 @@ def test_basic_restaurant_lookup_query_keeps_browser_tools_off() -> None:
 def test_free_cancel_booking_language_is_not_treated_as_cancel_followup() -> None:
     assert not _is_booking_cancellation_followup(
         "Find Italian restaurants in NYC tomorrow at 9pm for 2 and get ready to book the best free-cancel option",
+        "booking_commerce",
+    )
+
+
+def test_free_to_cancel_language_is_not_treated_as_cancel_followup() -> None:
+    assert not _is_booking_cancellation_followup(
+        "Find available times tomorrow at Angel Indian Restaurant on Resy for 2 people. Only show slots that are free to cancel.",
         "booking_commerce",
     )

@@ -5,11 +5,19 @@ import json
 import logging
 import os
 import shlex
+import re
 from pathlib import Path
 from typing import Optional
 
 from .artifacts import query_requests_browser_images
 from .browser import _choose_user_agent, run_browser_task
+from .browser_validation import (
+    browser_modal_dismissal_instruction,
+    result_has_validation_evidence,
+    task_requires_confirmation_evidence,
+    validation_failure_text,
+    validation_instruction_for_task,
+)
 from .booking_guard import zero_dollar_booking_instruction
 from .browser_fingerprint import browser_fingerprint_seed, build_browser_fingerprint, browser_use_profile_kwargs
 from .research import sanitize_tool_output
@@ -113,6 +121,28 @@ def _extract_browser_use_partial_findings(messages: list[str]) -> str:
         return ""
     trimmed = findings[-4:]
     return "\n".join(f"- {item}" for item in trimmed)
+
+
+def _extract_browser_use_validation_evidence(result_text: str) -> list[str]:
+    evidence: list[str] = []
+    for line in re.split(r"[\r\n]+", result_text or ""):
+        cleaned = " ".join(line.split())
+        lowered = cleaned.lower()
+        if not cleaned:
+            continue
+        if any(
+            marker in lowered
+            for marker in (
+                "confirmation number",
+                "reservation confirmed",
+                "booking confirmed",
+                "order number",
+                "receipt",
+                "cancellation confirmed",
+            )
+        ):
+            evidence.append(cleaned[:300])
+    return evidence[:6]
 
 
 def _merge_browser_use_partial_findings(*, partial_findings: str, fallback_result: str, primary_error: str) -> str:
@@ -257,6 +287,14 @@ async def run_browser_use_task(
         .replace("skiplagged.com", "Skiplagged")
         .replace("SKIPLAGGED.COM", "Skiplagged")
     )
+    validation_instruction = validation_instruction_for_task(task)
+    task_prefix_parts = [
+        browser_modal_dismissal_instruction(),
+        "Use the browser only when deterministic search or fetch was insufficient.",
+    ]
+    if validation_instruction:
+        task_prefix_parts.append(validation_instruction)
+    normalized_task = " ".join(part for part in task_prefix_parts if part) + "\n\n" + normalized_task
 
     try:
         from browser_use import Agent, Browser, BrowserProfile, ChatBrowserUse
@@ -487,13 +525,15 @@ async def run_browser_use_task(
             "Use the browser only when deterministic search/fetch was insufficient. "
             "Prefer robust interaction over brittle repeated clicks. "
             "If one source blocks or fails, continue to other sources and finish with partial results when necessary."
-            " Use the official filesystem MCP tools for broad file and directory operations within the allowed workspace roots."
-            " Use the Friday workspace helper MCP tools for preview, markdown conversion, and PDF generation."
+            + " "
+            + browser_modal_dismissal_instruction()
+            + " Use the official filesystem MCP tools for broad file and directory operations within the allowed workspace roots."
+            + " Use the Friday workspace helper MCP tools for preview, markdown conversion, and PDF generation."
             + optional_mcp_guidance
             + " "
             + zero_dollar_booking_instruction()
-            +
-            " Do not rely on built-in browser-use file actions."
+            + (" " + validation_instruction if validation_instruction else "")
+            + " Do not rely on built-in browser-use file actions."
         ),
     )
 
@@ -545,6 +585,24 @@ async def run_browser_use_task(
         if not parts:
             parts.append("Browser-use completed without a final summary. Continue with the evidence already gathered.")
         result_text = sanitize_tool_output("\n\n".join(parts))
+        explicit_validation_evidence = _extract_browser_use_validation_evidence(result_text)
+        if task_requires_confirmation_evidence(task) and not result_has_validation_evidence(
+            task,
+            result_text,
+            explicit_evidence=explicit_validation_evidence,
+        ):
+            return sanitize_tool_output(
+                "\n\n".join(
+                    part
+                    for part in [
+                        validation_failure_text(task),
+                        "Validation evidence:\n" + "\n".join(f"- {item}" for item in explicit_validation_evidence)
+                        if explicit_validation_evidence
+                        else "",
+                    ]
+                    if part
+                )
+            )
         if _browser_use_result_needs_retry(result_text):
             logger.info("browser-use result looked too weak, retrying with legacy browser task")
             return await run_browser_task(task, max_pages=max_pages, max_steps=max_steps)

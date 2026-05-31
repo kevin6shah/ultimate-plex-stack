@@ -136,6 +136,15 @@ def test_worker_stall_defaults_are_tighter_than_old_status_timer(monkeypatch):
     assert settings.worker_preflight_stall_seconds == 90
 
 
+def test_strategy_consecutive_failure_threshold_defaults_to_three(monkeypatch):
+    monkeypatch.delenv("STRATEGY_CONSECUTIVE_FAILURE_THRESHOLD", raising=False)
+
+    reloaded = importlib.reload(settings_module)
+    settings = reloaded.Settings()
+
+    assert settings.strategy_consecutive_failure_threshold == 3
+
+
 def test_claim_telegram_update_is_idempotent(monkeypatch):
     class FakeTable:
         def __init__(self):

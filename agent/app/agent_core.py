@@ -33,6 +33,12 @@ from .jobs import (
     ThreadTurn,
     ThreadTurnRole,
 )
+from .heavy_job_runtime import (
+    clean_user_facing_result,
+    extract_partial_findings_block,
+    has_useful_partial_findings,
+    summarize_recoverable_failure,
+)
 from .prompts import STATIC_SYSTEM_PROMPT
 from .research import fetch_page_content, sanitize_tool_output, search_web
 from .restaurant_cli import (
@@ -46,7 +52,7 @@ from .restaurant_cli import (
     run_restaurant_cli,
     run_restaurant_cli_json,
 )
-from .routing import needs_confirmation, task_routing_profile
+from .routing import needs_explicit_operator_confirmation, task_routing_profile
 from .skiplagged import call_skiplagged_tool
 from .stagehand_runner import run_stagehand_task
 from .settings import Settings
@@ -82,11 +88,47 @@ class PauseForInputRequested(RuntimeError):
         self.resume_instructions = resume_instructions.strip()
 
 
+def _structured_travel_failure_message(*, operation: str, strategy_mode: str, error: Exception | str) -> str:
+    detail = str(error or "").strip()[:1200]
+    normalized_strategy = str(strategy_mode or STRATEGY_API_DIRECT).strip().lower() or STRATEGY_API_DIRECT
+    return (
+        f"service unavailable: structured travel {operation} failed in {normalized_strategy} mode. "
+        f"error={detail}"
+    )
+
+
+def _raise_structured_travel_failure(*, operation: str, strategy_mode: str, error: Exception | str) -> None:
+    raise RuntimeError(
+        _structured_travel_failure_message(
+            operation=operation,
+            strategy_mode=strategy_mode,
+            error=error,
+        )
+    )
+
+
 def _is_retryable_model_error(exc: Exception) -> bool:
     normalized = str(exc or "").strip().lower()
     if not normalized:
         return False
     if "structured restaurant availability failed in api_direct mode" in normalized:
+        return False
+    if "structured travel" in normalized:
+        return False
+    if any(
+        marker in normalized
+        for marker in (
+            "browser task unavailable",
+            "browser task failed",
+            "stagehand browser task failed",
+            "stagehand browser task unavailable",
+            "stagehand_browser_task_failed",
+            "stagehand_browser_task_unavailable",
+            "browser_validation_failed",
+            "missing explicit booking confirmation evidence",
+            "missing explicit cancellation confirmation evidence",
+        )
+    ):
         return False
     retry_markers = (
         "status_code: 500",
@@ -1342,10 +1384,13 @@ def _is_booking_cancellation_followup(query: str, routing_profile_name: str) -> 
     lowered = query.lower()
     if not re.search(r"\bcancel(?:led|ing|ation)?\b", lowered):
         return False
+    if re.search(r"\bfree\b.{0,30}\bcancel(?:led|ing|ation)?\b", lowered):
+        return False
     policy_contexts = (
         "free cancel",
         "free-cancel",
         "free cancellation",
+        "free to cancel",
         "cancellation policy",
         "cancel policy",
         "best free-cancel option",
@@ -2462,6 +2507,93 @@ def _text_only_agent_result(text: str) -> SimpleNamespace:
     return SimpleNamespace(text=sanitize_tool_output(text))
 
 
+def _summarize_structured_findings_payload(text: str) -> str:
+    normalized = str(text or "").strip()
+    if not normalized or normalized[:1] not in {"{", "["}:
+        return ""
+    try:
+        payload = json.loads(normalized)
+    except Exception:
+        return ""
+
+    if isinstance(payload, dict):
+        parts: list[str] = []
+        for key in ("message", "summary", "venue_name", "provider", "policy", "confirmation_reference"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                parts.append(value)
+        return " | ".join(parts)[:1200]
+
+    if isinstance(payload, list):
+        rendered: list[str] = []
+        for item in payload[:4]:
+            if not isinstance(item, dict):
+                continue
+            bits: list[str] = []
+            for key in ("name", "time", "price", "airline", "hotel", "type", "message"):
+                value = str(item.get(key) or "").strip()
+                if value:
+                    bits.append(value)
+            if bits:
+                rendered.append(" - ".join(bits))
+        return "\n".join(rendered)[:1200]
+    return ""
+
+
+def _extract_intermediate_findings_text(text: str) -> str:
+    candidate = extract_partial_findings_block(text)
+    if candidate:
+        candidate = re.sub(r"\b(?:STAGEHAND|PRIMARY_BROWSER|BROWSER_USE)[A-Z_]*FAILED:.*$", "", candidate, flags=re.IGNORECASE | re.DOTALL).strip()
+        return candidate[:1200]
+    structured = _summarize_structured_findings_payload(text)
+    if structured and has_useful_partial_findings(structured):
+        return structured[:1200]
+    cleaned = clean_user_facing_result(text)
+    if has_useful_partial_findings(cleaned):
+        return cleaned[:1200]
+    return ""
+
+
+def _persist_intermediate_findings(ctx: RunContext["AgentDependencies"], text: str) -> str:
+    rendered = sanitize_tool_output(text)
+    job = ctx.deps.current_job
+    if job is None:
+        return rendered
+    findings = _extract_intermediate_findings_text(rendered)
+    if not findings:
+        return rendered
+    metadata = dict(job.metadata or {})
+    matrix = dict(metadata.get("execution_progress_matrix") or {})
+    job_context = dict(metadata.get("job_context") or {})
+    matrix["last_meaningful_artifact"] = findings
+    job_context["latest_findings_summary"] = findings
+    metadata["execution_progress_matrix"] = matrix
+    metadata["job_context"] = job_context
+    ctx.deps.store.merge_job_metadata(job.job_id, metadata)
+    job.metadata = metadata
+    return rendered
+
+
+def _persist_recoverable_failure_summary(
+    ctx: RunContext["AgentDependencies"],
+    *,
+    error: Exception | str,
+    query: str = "",
+    strategy_name: str = "",
+) -> None:
+    job = ctx.deps.current_job
+    effective_query = query.strip() or (job.query if job is not None else "")
+    effective_strategy = strategy_name.strip() or ctx.deps.strategy_mode
+    summary = summarize_recoverable_failure(
+        effective_query,
+        str(error or ""),
+        effective_strategy,
+    )
+    if not summary:
+        return
+    _persist_intermediate_findings(ctx, summary)
+
+
 def _render_restaurant_discovery_direct_response(
     *,
     prefill: RestaurantDiscoveryPrefill,
@@ -2795,7 +2927,9 @@ async def run_agent(
         logger.warning("agent budget blocked request")
         return AgentResult(text="Daily Budget Reached", budget_blocked=True)
 
-    if needs_confirmation(query):
+    routing_profile = task_routing_profile(query)
+
+    if needs_explicit_operator_confirmation(query, routing_profile_name=routing_profile.name):
         logger.info("agent request requires confirmation")
         return AgentResult(text="This task may change data, send information, or spend money. Reply with explicit confirmation and the exact action you want me to take.")
 
@@ -2808,7 +2942,6 @@ async def run_agent(
     memories = durable_memories or []
     attachments = attachment_names or []
     effective_config = config or AgentConfig()
-    routing_profile = task_routing_profile(query)
     allow_browser_tools = _should_expose_browser_tools(query, routing_profile.name) and strategy_mode != STRATEGY_API_DIRECT
     allow_travel_browser_fallback = _should_expose_travel_browser_fallback(query, routing_profile.name) and strategy_mode != STRATEGY_API_DIRECT
     structured_restaurant_task = _is_structured_restaurant_task(query, routing_profile.name)
@@ -2991,7 +3124,7 @@ async def run_agent(
                         f"DETERMINISTIC_SEARCH_UNAVAILABLE: search failed for '{task}' due to {exc}. "
                         "Try another query or use the browser only if needed."
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def fetch_web_page(ctx: RunContext[AgentDependencies], url: str, max_chars: int = 6000) -> str:
@@ -3005,7 +3138,7 @@ async def run_agent(
                         "Skip this source, try another public source, or use browser tools only if interaction is truly needed.",
                         limit=max_chars,
                     )
-                return sanitize_tool_output(result, limit=max_chars)
+                return _persist_intermediate_findings(ctx, sanitize_tool_output(result, limit=max_chars))
 
         if settings.skiplagged_mcp_enabled:
 
@@ -3023,10 +3156,21 @@ async def run_agent(
                     )
                 except Exception as exc:
                     logger.warning("travel_resolve_iata degraded place=%s error=%s", place, exc)
+                    if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                        _persist_recoverable_failure_summary(
+                            ctx,
+                            error=exc,
+                            query=f"Resolve the IATA code for {place}",
+                        )
+                        _raise_structured_travel_failure(
+                            operation="iata resolution",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=exc,
+                        )
                     return sanitize_tool_output(
                         f"TRAVEL_TOOL_UNAVAILABLE: could not resolve '{place}' to an IATA code because {exc}."
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def travel_search_flights(
@@ -3061,6 +3205,20 @@ async def run_agent(
                     )
                 except Exception as exc:
                     logger.warning("travel_search_flights degraded origin=%s destination=%s error=%s", origin, destination, exc)
+                    if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                        _persist_recoverable_failure_summary(
+                            ctx,
+                            error=exc,
+                            query=(
+                                f"Find flights from {origin} to {destination} departing {departure_date} "
+                                + (f"and returning {return_date}" if return_date.strip() else "")
+                            ),
+                        )
+                        _raise_structured_travel_failure(
+                            operation="flight search",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=exc,
+                        )
                     try:
                         fallback = await _run_travel_browser_fallback(
                             settings=ctx.deps.settings,
@@ -3085,11 +3243,23 @@ async def run_agent(
                             "TRAVEL_TOOL_UNAVAILABLE: Skiplagged flight search failed due to "
                             f"{exc}. Browser fallback also failed due to {fallback_exc}."
                         )
+                    if _browser_fallback_failed(fallback):
+                        logger.warning(
+                            "travel_search_flights browser fallback returned failure origin=%s destination=%s result=%s",
+                            origin,
+                            destination,
+                            fallback,
+                        )
+                        _raise_structured_travel_failure(
+                            operation="flight browser fallback",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=fallback,
+                        )
                     return sanitize_tool_output(
                         "TRAVEL_TOOL_UNAVAILABLE: Skiplagged flight search was unavailable, so browser fallback was used.\n\n"
                         + fallback
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def travel_search_flexible_departures(
@@ -3118,10 +3288,24 @@ async def run_agent(
                     )
                 except Exception as exc:
                     logger.warning("travel_search_flexible_departures degraded origin=%s destination=%s error=%s", origin, destination, exc)
+                    if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                        _persist_recoverable_failure_summary(
+                            ctx,
+                            error=exc,
+                            query=(
+                                f"Check nearby departure dates for flights from {origin} to {destination} around {departure_date} "
+                                + (f"with return {return_date}" if return_date.strip() else "")
+                            ),
+                        )
+                        _raise_structured_travel_failure(
+                            operation="flexible departure search",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=exc,
+                        )
                     return sanitize_tool_output(
                         f"TRAVEL_TOOL_UNAVAILABLE: flexible departure search failed because {exc}."
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def travel_search_hotels(
@@ -3152,6 +3336,17 @@ async def run_agent(
                     )
                 except Exception as exc:
                     logger.warning("travel_search_hotels degraded city=%s error=%s", city, exc)
+                    if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                        _persist_recoverable_failure_summary(
+                            ctx,
+                            error=exc,
+                            query=f"Find hotels in {city} from {checkin} to {checkout}",
+                        )
+                        _raise_structured_travel_failure(
+                            operation="hotel search",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=exc,
+                        )
                     try:
                         fallback = await _run_travel_browser_fallback(
                             settings=ctx.deps.settings,
@@ -3168,11 +3363,22 @@ async def run_agent(
                         return sanitize_tool_output(
                             f"TRAVEL_TOOL_UNAVAILABLE: hotel search failed because {exc}. Browser fallback also failed because {fallback_exc}."
                         )
+                    if _browser_fallback_failed(fallback):
+                        logger.warning(
+                            "travel_search_hotels browser fallback returned failure city=%s result=%s",
+                            city,
+                            fallback,
+                        )
+                        _raise_structured_travel_failure(
+                            operation="hotel browser fallback",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=fallback,
+                        )
                     return sanitize_tool_output(
                         "TRAVEL_TOOL_UNAVAILABLE: direct hotel search was unavailable, so browser fallback was used.\n\n"
                         + fallback
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def travel_search_cars(
@@ -3205,6 +3411,20 @@ async def run_agent(
                     )
                 except Exception as exc:
                     logger.warning("travel_search_cars degraded pickup_location=%s error=%s", pickup_location, exc)
+                    if ctx.deps.strategy_mode == STRATEGY_API_DIRECT:
+                        _persist_recoverable_failure_summary(
+                            ctx,
+                            error=exc,
+                            query=(
+                                f"Find rental cars in {pickup_location} from {pickup_date} {pickup_time} "
+                                f"to {dropoff_date} {dropoff_time}"
+                            ),
+                        )
+                        _raise_structured_travel_failure(
+                            operation="car rental search",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=exc,
+                        )
                     try:
                         fallback = await _run_travel_browser_fallback(
                             settings=ctx.deps.settings,
@@ -3222,11 +3442,22 @@ async def run_agent(
                         return sanitize_tool_output(
                             f"TRAVEL_TOOL_UNAVAILABLE: car rental search failed because {exc}. Browser fallback also failed because {fallback_exc}."
                         )
+                    if _browser_fallback_failed(fallback):
+                        logger.warning(
+                            "travel_search_cars browser fallback returned failure pickup_location=%s result=%s",
+                            pickup_location,
+                            fallback,
+                        )
+                        _raise_structured_travel_failure(
+                            operation="car rental browser fallback",
+                            strategy_mode=ctx.deps.strategy_mode,
+                            error=fallback,
+                        )
                     return sanitize_tool_output(
                         "TRAVEL_TOOL_UNAVAILABLE: direct car-rental search was unavailable, so browser fallback was used.\n\n"
                         + fallback
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             if allow_travel_browser_fallback:
 
@@ -3281,12 +3512,12 @@ async def run_agent(
                     booking_preflight=ctx.deps.restaurant_booking_preflight,
                 )
                 if _is_restaurant_discovery_request(query, "booking_commerce"):
-                    return _render_restaurant_search_shortlist(
+                    return _persist_intermediate_findings(ctx, _render_restaurant_search_shortlist(
                         query=query,
                         attempts=attempts,
                         city=city,
                         limit=limit,
-                    )
+                    ))
                 browser_probe_candidate: Optional[tuple[str, str, str, str]] = None
                 failure_lines: list[str] = []
                 for attempt in attempts:
@@ -3322,7 +3553,7 @@ async def run_agent(
                                 f"{provider_label} matched {venue_name}, but there was no live booking page URL to inspect in {ctx.deps.strategy_mode} mode."
                             )
                             continue
-                        return await _restaurant_browser_availability_summary(
+                        return _persist_intermediate_findings(ctx, await _restaurant_browser_availability_summary(
                             settings=ctx.deps.settings,
                             workspace=ctx.deps.workspace,
                             venue_id=venue_id,
@@ -3334,7 +3565,7 @@ async def run_agent(
                             party_size=max(1, party_size),
                             requested_time="",
                             strategy_mode=ctx.deps.strategy_mode,
-                        )
+                        ))
                     availability_args = [
                         "availability",
                         "--venue",
@@ -3383,7 +3614,7 @@ async def run_agent(
                                     policy_exc,
                                 )
                             else:
-                                return sanitize_tool_output(
+                                return _persist_intermediate_findings(ctx, sanitize_tool_output(
                                     _render_resy_policy_slot_lines(
                                         resy_policy_by_token,
                                         date=date,
@@ -3392,7 +3623,7 @@ async def run_agent(
                                         venue_city=venue_city,
                                         venue_url=venue_url,
                                     )
-                                )
+                                ))
                         failure_lines.append(
                             f"{provider_label} live availability failed for {venue_name}"
                             + (f" ({venue_city})" if venue_city else "")
@@ -3458,7 +3689,7 @@ async def run_agent(
                     if failures:
                         provider_labels = ", ".join(str(item.get("provider") or "provider") for item in failures[:3])
                         lines.append(f"Other provider lookups also had issues: {provider_labels}.")
-                    return sanitize_tool_output("\n".join(lines))
+                    return _persist_intermediate_findings(ctx, "\n".join(lines))
                 if browser_probe_candidate is not None and ctx.deps.strategy_mode != STRATEGY_API_DIRECT:
                     venue_id, venue_name, venue_city, venue_url = browser_probe_candidate
                     probe = await _run_resy_browser_probe(
@@ -3472,7 +3703,7 @@ async def run_agent(
                         party_size=party_size,
                     )
                     if probe is not None:
-                        return _render_resy_browser_probe_summary(
+                        return _persist_intermediate_findings(ctx, _render_resy_browser_probe_summary(
                             probe,
                             venue_id=venue_id,
                             venue_name=venue_name,
@@ -3480,8 +3711,8 @@ async def run_agent(
                             date=date,
                             time="(not specified)",
                             party_size=party_size,
-                        )
-                return sanitize_tool_output(
+                        ))
+                return _persist_intermediate_findings(ctx, sanitize_tool_output(
                     _restaurant_provider_browser_fallback_message(
                         provider=restaurant_provider_sequence(provider)[0],
                         venue_name=query,
@@ -3489,7 +3720,7 @@ async def run_agent(
                         party_size=party_size,
                         details="\n".join(failure_lines[:6]) if failure_lines else "The provider sequence exhausted without a usable live availability result.",
                     )
-                )
+                ))
 
             @agent.tool
             async def restaurant_search(
@@ -3510,12 +3741,12 @@ async def run_agent(
                     limit=limit,
                     timeout_seconds=25,
                 )
-                return _render_restaurant_search_shortlist(
+                return _persist_intermediate_findings(ctx, _render_restaurant_search_shortlist(
                     query=query,
                     attempts=attempts,
                     city=city,
                     limit=limit,
-                )
+                ))
 
             @agent.tool
             async def restaurant_availability(
@@ -3580,7 +3811,7 @@ async def run_agent(
                             party_size=party_size,
                         )
                         if browser_summary is not None:
-                            return browser_summary
+                            return _persist_intermediate_findings(ctx, browser_summary)
                     if normalized_provider == "resy":
                         try:
                             policy_map = await fetch_resy_slot_policies(
@@ -3598,7 +3829,7 @@ async def run_agent(
                                 policy_exc,
                             )
                         else:
-                            return sanitize_tool_output(
+                            return _persist_intermediate_findings(ctx, sanitize_tool_output(
                                 _render_resy_policy_slot_lines(
                                     policy_map,
                                     date=date,
@@ -3607,8 +3838,8 @@ async def run_agent(
                                     venue_city=resolved_venue_city,
                                     venue_url=resolved_venue_url,
                                 )
-                            )
-                    return sanitize_tool_output(
+                            ))
+                    return _persist_intermediate_findings(ctx, sanitize_tool_output(
                         _restaurant_provider_browser_fallback_message(
                             provider=normalized_provider,
                             venue_name=venue_label,
@@ -3616,7 +3847,7 @@ async def run_agent(
                             party_size=party_size,
                             details=f"Availability lookup failed because {exc}.",
                         )
-                    )
+                    ))
                 if normalized_provider == "opentable":
                     try:
                         browser_slots = await fetch_opentable_slots_via_browser(
@@ -3635,8 +3866,8 @@ async def run_agent(
                         )
                     else:
                         if browser_slots:
-                            return sanitize_tool_output(json.dumps(browser_slots))
-                return sanitize_tool_output(result)
+                            return _persist_intermediate_findings(ctx, sanitize_tool_output(json.dumps(browser_slots)))
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def restaurant_book_or_handoff(
@@ -3668,7 +3899,7 @@ async def run_agent(
                         party_size=max(1, party_size),
                     )
                     try:
-                        return await _run_opentable_booking_browser_flow(
+                        return _persist_intermediate_findings(ctx, await _run_opentable_booking_browser_flow(
                             settings=ctx.deps.settings,
                             workspace=ctx.deps.workspace,
                             booking_url=booking_url,
@@ -3678,7 +3909,7 @@ async def run_agent(
                             date=date,
                             time=time,
                             party_size=max(1, party_size),
-                        )
+                        ))
                     except PauseForInputRequested:
                         raise
                     except Exception as exc:
@@ -3748,7 +3979,7 @@ async def run_agent(
                 rendered = result.strip()
                 if normalized_provider == "resy":
                     rendered = (rendered + "\n" + _render_resy_slot_policy(policy)).strip()
-                return sanitize_tool_output(rendered)
+                return _persist_intermediate_findings(ctx, rendered)
 
             @agent.tool
             async def restaurant_list_reservations(
@@ -3773,7 +4004,7 @@ async def run_agent(
                     return sanitize_tool_output(
                         f"RESTAURANT_TOOL_UNAVAILABLE: reservation list failed because {exc}."
                     )
-                return sanitize_tool_output(result)
+                return _persist_intermediate_findings(ctx, result)
 
             @agent.tool
             async def restaurant_cancel_reservation(
@@ -3848,7 +4079,7 @@ async def run_agent(
                         ctx.deps.store.put_booking_record(
                             target_record.model_copy(update={"status": "cancelled"})
                         )
-                return sanitize_tool_output(json.dumps(result))
+                return _persist_intermediate_findings(ctx, json.dumps(result))
 
         if allow_browser_tools and not structured_restaurant_task:
 
@@ -3858,7 +4089,7 @@ async def run_agent(
                 bounded_pages = min(max(max_pages, 1), ctx.deps.settings.max_browser_pages)
                 bounded_steps = min(max(max_steps, 1), ctx.deps.settings.max_browser_steps)
                 try:
-                    return await _run_general_browser_task(
+                    result = await _run_general_browser_task(
                         settings=ctx.deps.settings,
                         workspace=ctx.deps.workspace,
                         task=task,
@@ -3872,6 +4103,7 @@ async def run_agent(
                         "BROWSER_TASK_UNAVAILABLE: live browser reading failed for this step due to "
                         f"{exc}. Try another source or finish with the information already gathered."
                     )
+                return _persist_intermediate_findings(ctx, result)
 
         @agent.tool
         async def pause_for_input(

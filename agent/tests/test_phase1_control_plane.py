@@ -247,7 +247,10 @@ def test_recent_context_clears_stale_active_heavy_job_id(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["contexts"][0]["active_heavy_job_id"] == ""
-    assert cleared == ["siri:siri:siri:job-123"]
+    assert cleared == [
+        "siri:siri:siri:job-123",
+        "telegram:test-key:test-key:job-123",
+    ]
 
 
 def test_delete_thread_normalizes_telegram_owner_alias(monkeypatch) -> None:

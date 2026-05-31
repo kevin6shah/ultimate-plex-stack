@@ -1,4 +1,4 @@
-from app.telegram import parse_telegram_update
+from app.telegram import _telegram_html, parse_telegram_update
 
 
 def test_parse_telegram_from_field() -> None:
@@ -45,3 +45,11 @@ def test_parse_telegram_document_and_caption() -> None:
     assert update.message.document is not None
     assert update.message.effective_text == "process this"
     assert update.message.document.file_name == "report.csv"
+
+
+def test_telegram_html_renders_basic_markdown_and_links() -> None:
+    rendered = _telegram_html("**Bold** and *italic* plus [link](https://example.com)")
+
+    assert "<b>Bold</b>" in rendered
+    assert "<i>italic</i>" in rendered
+    assert '<a href="https://example.com">link</a>' in rendered

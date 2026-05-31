@@ -103,14 +103,42 @@ def common_chromium_args() -> list[str]:
     ]
 
 
-def stagehand_launch_options(*, fingerprint: BrowserFingerprint, executable_path: str = "", user_data_dir: str = "", downloads_path: str = "") -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "headless": True,
-        "args": common_chromium_args(),
-        "chromiumSandbox": False,
+def shared_browser_launch_args(fingerprint: BrowserFingerprint) -> list[str]:
+    return [
+        *common_chromium_args(),
+        f"--user-agent={fingerprint.user_agent}",
+        f"--lang={fingerprint.locale}",
+        f"--window-size={fingerprint.viewport_width},{fingerprint.viewport_height}",
+    ]
+
+
+def shared_browser_stealth_context(fingerprint: BrowserFingerprint) -> dict[str, Any]:
+    return {
+        "args": shared_browser_launch_args(fingerprint),
         "locale": fingerprint.locale,
         "viewport": fingerprint.viewport(),
+        "init_scripts": [
+            f"window.__fridayFingerprintSeed = {fingerprint.seed!r};",
+            STEALTH_INIT_SCRIPT,
+        ],
+        "launch_env": {
+            "FRIDAY_FINGERPRINT_SEED": fingerprint.seed,
+            "FRIDAY_BROWSER_LOCALE": fingerprint.locale,
+        },
+    }
+
+
+def stagehand_launch_options(*, fingerprint: BrowserFingerprint, executable_path: str = "", user_data_dir: str = "", downloads_path: str = "") -> dict[str, Any]:
+    stealth = shared_browser_stealth_context(fingerprint)
+    payload: dict[str, Any] = {
+        "headless": True,
+        "args": stealth["args"],
+        "chromiumSandbox": False,
+        "locale": stealth["locale"],
+        "viewport": stealth["viewport"],
         "preserveUserDataDir": True,
+        "acceptDownloads": True,
+        "ignoreHTTPSErrors": True,
     }
     if executable_path:
         payload["executablePath"] = executable_path
@@ -122,6 +150,7 @@ def stagehand_launch_options(*, fingerprint: BrowserFingerprint, executable_path
 
 
 def browser_use_profile_kwargs(*, fingerprint: BrowserFingerprint, user_data_dir: str, downloads_path: str) -> dict[str, Any]:
+    stealth = shared_browser_stealth_context(fingerprint)
     return {
         "headless": True,
         "user_agent": fingerprint.user_agent,
@@ -129,9 +158,9 @@ def browser_use_profile_kwargs(*, fingerprint: BrowserFingerprint, user_data_dir
         "downloads_path": downloads_path,
         "disable_security": False,
         "deterministic_rendering": False,
-        "locale": fingerprint.locale,
-        "viewport": fingerprint.viewport(),
-        "args": common_chromium_args(),
+        "locale": stealth["locale"],
+        "viewport": stealth["viewport"],
+        "args": stealth["args"],
     }
 
 

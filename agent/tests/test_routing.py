@@ -1,6 +1,15 @@
 from app.jobs import TaskClass
 from app.agent_core import _current_local_datetime_text, _direct_tool_mode_summary, _should_expose_browser_tools, _should_expose_travel_browser_fallback
-from app.routing import classify_task, is_long_task, needs_confirmation, should_offer_browser_tool, task_routing_profile
+from app.routing import (
+    classify_task,
+    is_long_task,
+    needs_confirmation,
+    needs_explicit_operator_confirmation,
+    query_domain_tags,
+    query_domains_compatible,
+    should_offer_browser_tool,
+    task_routing_profile,
+)
 from app.settings import Settings
 
 
@@ -41,6 +50,22 @@ def test_task_routing_profile_detection() -> None:
     assert task_routing_profile("find rental cars in Chicago for next weekend").name == "itinerary_maps"
     assert task_routing_profile("sign up for the site with a new account").name == "login_account"
     assert task_routing_profile("summarize this article for me").name == "general"
+
+
+def test_query_domains_compatible_rejects_cross_domain_shift() -> None:
+    assert not query_domains_compatible(
+        "Not flights I'm thinking activities in NYC",
+        "Create an account with a free trial for Willow TV",
+    )
+    assert not query_domains_compatible(
+        "Find me the cheapest flights to Delhi",
+        "How many calories are in chicken tikka masala?",
+    )
+    assert query_domains_compatible(
+        "Find me Indian restaurants tonight",
+        "Preferably ones with free cancellation",
+    )
+    assert "streaming" in query_domain_tags("Use a Willow TV free trial for the IPL match")
 
 
 def test_plural_restaurants_request_is_heavy() -> None:
@@ -127,6 +152,25 @@ def test_informational_questions_about_costs_and_architecture_do_not_require_con
     assert not needs_confirmation("Is Temporal free to use?")
     assert not needs_confirmation("For AWS infra where I have an on demand ec2 instance with docker a better system for temporal or lang graph?")
     assert not needs_confirmation("For most of these things is it better to just pay the cost for certain tools?")
+
+
+def test_only_booking_and_login_profiles_use_generic_confirmation_gate() -> None:
+    assert not needs_explicit_operator_confirmation(
+        "Do you actually like look up these calories I'm not just asking you to figure this out by lol",
+        routing_profile_name="general",
+    )
+    assert not needs_explicit_operator_confirmation(
+        "Find me the cheapest flights to India from June 22 to July 12-15 any of those dates works\n\nContinue the same task using the user's new follow-up.\n\nNew user direction:\nNew York City area to Delhi preferably with free cancellation and lowest flight duration (decent times)",
+        routing_profile_name="itinerary_maps",
+    )
+    assert needs_explicit_operator_confirmation(
+        "submit this application for me",
+        routing_profile_name="login_account",
+    )
+    assert needs_explicit_operator_confirmation(
+        "buy this for me",
+        routing_profile_name="booking_commerce",
+    )
 
 
 def test_current_local_datetime_text_includes_relative_date_guidance() -> None:

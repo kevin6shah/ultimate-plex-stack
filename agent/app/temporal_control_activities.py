@@ -20,7 +20,7 @@ from .gmail_oauth import renew_gmail_watch
 from .jobs import CheckpointPayload, JobStatus, MailboxWatchState, utc_now_iso
 from .settings import Settings, settings
 from .storage import StateStore
-from .strategy_runtime import default_strategy_state, normalize_strategy_state
+from .strategy_runtime import default_strategy_state, normalize_execution_progress_matrix, normalize_strategy_state
 from .worker_lifecycle import ensure_dedicated_worker_running, maybe_stop_dedicated_worker_if_idle
 
 
@@ -123,7 +123,17 @@ async def prepare_heavy_job_claim(job_id: str) -> dict:
         raise _missing_job(job_id)
     ensure_dedicated_worker_running(settings)
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="starting worker")
-    return build_heavy_claim(state, settings, job)
+    claim = build_heavy_claim(state, settings, job)
+    state.merge_job_metadata(
+        job_id,
+        {
+            "pending_followup_text": None,
+            "strategy_state": claim["strategy_state"],
+            "execution_progress_matrix": claim["execution_progress_matrix"],
+            "job_context": claim["job_context"],
+        },
+    )
+    return claim
 
 
 @activity.defn
@@ -137,14 +147,25 @@ async def prepare_heavy_job_resume_claim(job_id: str, reply_text: str) -> dict:
     state.merge_job_metadata(
         job_id,
         {
+            "pending_followup_text": None,
             "strategy_state": default_strategy_state(),
+            "execution_progress_matrix": normalize_execution_progress_matrix(default_strategy_state()).model_dump(mode="json"),
             "last_strategy_error": None,
             "query_override": resumed_query,
         },
     )
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="resuming task")
     refreshed_job = state.get_job(job_id) or job
-    return build_heavy_claim(state, settings, refreshed_job, query_override=resumed_query)
+    claim = build_heavy_claim(state, settings, refreshed_job, query_override=resumed_query)
+    state.merge_job_metadata(
+        job_id,
+        {
+            "strategy_state": claim["strategy_state"],
+            "execution_progress_matrix": claim["execution_progress_matrix"],
+            "job_context": claim["job_context"],
+        },
+    )
+    return claim
 
 
 @activity.defn
@@ -154,18 +175,33 @@ async def prepare_heavy_job_followup_claim(job_id: str, followup_text: str) -> d
     if job is None:
         raise _missing_job(job_id)
     checkpoint = state.get_latest_checkpoint(job_id)
-    followup_query = build_contextual_heavy_followup_query(job, checkpoint, followup_text)
+    resolved_followup = str(followup_text or "").strip() or str((job.metadata or {}).get("pending_followup_text") or "").strip()
+    if not resolved_followup:
+        raise ApplicationError("pending follow-up not found", non_retryable=True)
+    followup_query = build_contextual_heavy_followup_query(job, checkpoint, resolved_followup)
     state.merge_job_metadata(
         job_id,
         {
+            "pending_followup_text": None,
             "strategy_state": default_strategy_state(),
+            "execution_progress_matrix": normalize_execution_progress_matrix(default_strategy_state()).model_dump(mode="json"),
             "last_strategy_error": None,
             "query_override": followup_query,
         },
     )
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="updating task")
     refreshed_job = state.get_job(job_id) or job
-    return build_heavy_claim(state, settings, refreshed_job, query_override=followup_query)
+    claim = build_heavy_claim(state, settings, refreshed_job, query_override=followup_query)
+    state.merge_job_metadata(
+        job_id,
+        {
+            "pending_followup_text": None,
+            "strategy_state": claim["strategy_state"],
+            "execution_progress_matrix": claim["execution_progress_matrix"],
+            "job_context": claim["job_context"],
+        },
+    )
+    return claim
 
 
 @activity.defn
@@ -174,18 +210,32 @@ async def prepare_heavy_job_strategy_retry_claim(job_id: str, strategy_state: di
     job = state.get_job(job_id)
     if job is None:
         raise _missing_job(job_id)
+    normalized_matrix = normalize_execution_progress_matrix(
+        strategy_state.get("execution_progress_matrix") if isinstance(strategy_state, dict) and strategy_state.get("execution_progress_matrix") else strategy_state
+    )
     normalized_strategy_state = normalize_strategy_state(strategy_state)
     state.merge_job_metadata(
         job_id,
         {
+            "pending_followup_text": None,
             "strategy_state": normalized_strategy_state,
+            "execution_progress_matrix": normalized_matrix.model_dump(mode="json"),
             "last_strategy_error": str(error_message or "")[:1000],
             "query_override": str((job.metadata or {}).get("query_override") or "").strip() or None,
         },
     )
     state.update_job_status(job_id, status=JobStatus.RUNNING, current_step="switching strategy")
     refreshed_job = state.get_job(job_id) or job
-    return build_heavy_claim(state, settings, refreshed_job)
+    claim = build_heavy_claim(state, settings, refreshed_job)
+    state.merge_job_metadata(
+        job_id,
+        {
+            "strategy_state": claim["strategy_state"],
+            "execution_progress_matrix": claim["execution_progress_matrix"],
+            "job_context": claim["job_context"],
+        },
+    )
+    return claim
 
 
 @activity.defn

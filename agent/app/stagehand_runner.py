@@ -12,6 +12,13 @@ from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 from .browser import _choose_user_agent
+from .browser_validation import (
+    browser_modal_dismissal_instruction,
+    result_has_validation_evidence,
+    task_requires_confirmation_evidence,
+    validation_failure_text,
+    validation_instruction_for_task,
+)
 from .booking_guard import zero_dollar_booking_instruction
 from .browser_fingerprint import browser_fingerprint_seed, build_browser_fingerprint, stagehand_launch_options
 from .research import sanitize_tool_output
@@ -140,7 +147,9 @@ def _stagehand_task_needs_interaction(task: str) -> bool:
 
 def _stagehand_interaction_instruction(task: str) -> str:
     return (
-        "Interact with the current page before summarizing. "
+        browser_modal_dismissal_instruction()
+        + " "
+        + "Interact with the current page before summarizing. "
         "Set or confirm the requested date, party size, and reservation controls from the task. "
         "Open the time selector or reservation area if needed so visible bookable times are shown. "
         "Do not submit or finalize any booking."
@@ -148,7 +157,7 @@ def _stagehand_interaction_instruction(task: str) -> str:
 
 
 def _stagehand_interaction_steps(task: str) -> list[str]:
-    steps: list[str] = []
+    steps: list[str] = [browser_modal_dismissal_instruction()]
     date_match = DATE_PATTERN.search(task or "")
     if date_match:
         requested_date = date_match.group(1)
@@ -175,6 +184,9 @@ def _stagehand_verification_instruction(task: str) -> str:
         "Summarize the current page for the user's task.",
         "Return concrete findings and note any blocker briefly.",
     ]
+    validation_instruction = validation_instruction_for_task(task)
+    if validation_instruction:
+        guidance.append(validation_instruction)
     date_match = DATE_PATTERN.search(task or "")
     if date_match:
         requested_date = date_match.group(1)
@@ -266,6 +278,7 @@ def _format_stagehand_summary(
     *,
     summary: str,
     findings: list[str],
+    validation_evidence: list[str],
     current_url: str,
     search_results: list[dict[str, str]],
     blocker: str,
@@ -276,6 +289,8 @@ def _format_stagehand_summary(
         parts.append(normalized_summary[:2500])
     if findings:
         parts.append("\n".join(f"- {item}" for item in findings[:5]))
+    if validation_evidence:
+        parts.append("Validation evidence:\n" + "\n".join(f"- {item}" for item in validation_evidence[:5]))
     if search_results:
         rendered = []
         for item in search_results[:3]:
@@ -391,7 +406,10 @@ async def run_stagehand_task(
     )
     normalized_task = (
         "Interactive browser fallback mode. Deterministic MCP/API/public-web paths were insufficient for this task. "
-        "Stay bounded, prefer factual extraction over exploration, and finish with a concise summary.\n\n"
+        "Stay bounded, prefer factual extraction over exploration, and finish with a concise summary. "
+        + browser_modal_dismissal_instruction()
+        + (" " + validation_instruction_for_task(task) if validation_instruction_for_task(task) else "")
+        + "\n\n"
         + task
     )
 
@@ -529,6 +547,11 @@ async def run_stagehand_task(
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
+                            "validated_success": {"type": "boolean"},
+                            "validation_evidence": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
                             "current_url": {"type": "string"},
                             "blocker": {"type": ["string", "null"]},
                         },
@@ -547,14 +570,27 @@ async def run_stagehand_task(
         message = sanitize_tool_output(str(extract_payload.get("summary", "") or ""))
         current_url = str(extract_payload.get("current_url", "") or target_url)
         findings = _coerce_stagehand_findings(extract_payload.get("findings"))
+        validation_evidence = _coerce_stagehand_findings(extract_payload.get("validation_evidence"))
+        validated_success = bool(extract_payload.get("validated_success"))
         blocker = " ".join(str(extract_payload.get("blocker", blocker) or "").split())
         rendered = _format_stagehand_summary(
             summary=message,
             findings=findings,
+            validation_evidence=validation_evidence,
             current_url=current_url,
             search_results=search_results,
             blocker=blocker,
         )
+        if task_requires_confirmation_evidence(task) and not result_has_validation_evidence(
+            task,
+            rendered,
+            explicit_evidence=validation_evidence if validated_success else [],
+        ):
+            return _merge_stagehand_partial_findings(
+                message=validation_failure_text(task),
+                partial_findings="\n".join(f"- {item}" for item in findings[:4]) if findings else "",
+                primary_error=blocker or "missing explicit success evidence",
+            )
         if rendered and not _stagehand_result_needs_fallback(rendered):
             return rendered
         return _merge_stagehand_partial_findings(

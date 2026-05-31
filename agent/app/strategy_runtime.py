@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from .schemas.execution_state import ExecutionProgressMatrix, ExecutionTier, PauseReason, ProgressOutcome, StrategyFailureSignature
 
-STRATEGY_API_DIRECT = "api_direct"
-STRATEGY_STAGEHAND_STEALTH_ACT = "stagehand_stealth_act"
-STRATEGY_BROWSER_USE_VISUAL_PIVOT = "browser_use_visual_pivot"
+STRATEGY_API_DIRECT = ExecutionTier.API_MCP.value
+STRATEGY_STAGEHAND_STEALTH_ACT = ExecutionTier.STAGEHAND.value
+STRATEGY_BROWSER_USE_VISUAL_PIVOT = ExecutionTier.BROWSER_USE.value
 STRATEGY_SEQUENCE = (
     STRATEGY_API_DIRECT,
     STRATEGY_STAGEHAND_STEALTH_ACT,
@@ -13,42 +14,41 @@ STRATEGY_SEQUENCE = (
 )
 
 
+def default_execution_progress_matrix() -> ExecutionProgressMatrix:
+    return ExecutionProgressMatrix.default()
+
+
+def normalize_execution_progress_matrix(value: Any) -> ExecutionProgressMatrix:
+    return ExecutionProgressMatrix.from_legacy(value)
+
+
 def default_strategy_state() -> dict[str, Any]:
-    return {
-        "current_strategy": STRATEGY_API_DIRECT,
-        "failure_counts": {name: 0 for name in STRATEGY_SEQUENCE},
-        "history": [],
-        "last_error": "",
-    }
+    return default_execution_progress_matrix().to_legacy_strategy_state(
+        retry_requested=True,
+        switched_strategy=False,
+        exhausted=False,
+        failed_strategy=STRATEGY_API_DIRECT,
+    )
 
 
 def normalize_strategy_state(value: Any) -> dict[str, Any]:
-    state = default_strategy_state()
-    if not isinstance(value, dict):
-        return state
-    current_strategy = str(value.get("current_strategy") or STRATEGY_API_DIRECT).strip().lower()
-    if current_strategy not in STRATEGY_SEQUENCE:
-        current_strategy = STRATEGY_API_DIRECT
-    failure_counts: dict[str, int] = {}
-    raw_counts = value.get("failure_counts")
-    if isinstance(raw_counts, dict):
-        for name in STRATEGY_SEQUENCE:
-            try:
-                failure_counts[name] = max(0, int(raw_counts.get(name) or 0))
-            except Exception:
-                failure_counts[name] = 0
+    matrix = normalize_execution_progress_matrix(value)
+    if isinstance(value, dict):
+        retry_requested = bool(value.get("retry_requested")) if "retry_requested" in value else not matrix.hard_blocked
+        switched_strategy = bool(value.get("switched_strategy"))
+        exhausted = bool(value.get("exhausted")) if "exhausted" in value else matrix.hard_blocked
+        failed_strategy = str(value.get("failed_strategy") or matrix.current_tier.value).strip().lower()
     else:
-        failure_counts = {name: 0 for name in STRATEGY_SEQUENCE}
-    history = [str(item).strip().lower() for item in list(value.get("history") or []) if str(item).strip()]
-    state.update(
-        {
-            "current_strategy": current_strategy,
-            "failure_counts": failure_counts,
-            "history": [item for item in history if item in STRATEGY_SEQUENCE],
-            "last_error": str(value.get("last_error") or "")[:1000],
-        }
+        retry_requested = not matrix.hard_blocked
+        switched_strategy = False
+        exhausted = matrix.hard_blocked
+        failed_strategy = matrix.current_tier.value
+    return matrix.to_legacy_strategy_state(
+        retry_requested=retry_requested,
+        switched_strategy=switched_strategy,
+        exhausted=exhausted,
+        failed_strategy=failed_strategy,
     )
-    return state
 
 
 def strategy_guidance(strategy_name: str) -> str:
@@ -100,6 +100,11 @@ def is_retryable_interaction_failure(message: str) -> bool:
         "429",
         "cloudflare",
         "rate limit",
+        "browser_validation_failed",
+        "validation failed",
+        "missing explicit success evidence",
+        "missing explicit booking confirmation evidence",
+        "missing explicit cancellation confirmation evidence",
     )
     return any(marker in normalized for marker in markers)
 
@@ -122,38 +127,56 @@ def is_unskippable_pause_blocker(message: str) -> bool:
 
 
 def advance_strategy_state(state_value: Any, error_message: str, *, threshold: int) -> dict[str, Any]:
-    state = normalize_strategy_state(state_value)
-    strategy = state["current_strategy"]
-    failure_counts = dict(state.get("failure_counts") or {})
-    failure_counts[strategy] = int(failure_counts.get(strategy) or 0) + 1
-    history = list(state.get("history") or [])
-    if not history or history[-1] != strategy:
-        history.append(strategy)
-    last_error = str(error_message or "")[:1000]
-    should_retry_same = failure_counts[strategy] < max(1, int(threshold))
-    next_strategy = strategy
-    exhausted = False
+    matrix = normalize_execution_progress_matrix(state_value)
+    current_tier = matrix.current_tier
+    tier_state = matrix.current_tier_state()
+    tier_state.attempt_count += 1
+    tier_state.consecutive_no_progress += 1
+    tier_state.last_outcome = ProgressOutcome.BLOCKED_RETRYABLE
+    tier_state.last_error_message = str(error_message or "")[:1000]
+    matrix.active_failure_signature = StrategyFailureSignature(
+        raw_message=str(error_message or "")[:1000],
+        source_tier=current_tier,
+        retryable=True,
+    )
+    matrix.legacy_last_error = tier_state.last_error_message
+    if not matrix.history or matrix.history[-1] != current_tier.value:
+        matrix.history.append(current_tier.value)
+
+    should_retry_same = tier_state.consecutive_no_progress < max(1, int(threshold))
     switched = False
-    if not should_retry_same:
-        try:
-            current_index = STRATEGY_SEQUENCE.index(strategy)
-        except ValueError:
-            current_index = 0
-        if current_index + 1 < len(STRATEGY_SEQUENCE):
-            next_strategy = STRATEGY_SEQUENCE[current_index + 1]
-            switched = next_strategy != strategy
-        else:
-            exhausted = True
-    return {
-        "current_strategy": next_strategy,
-        "failure_counts": failure_counts,
-        "history": history,
-        "last_error": last_error,
-        "retry_requested": not exhausted,
-        "switched_strategy": switched,
-        "exhausted": exhausted,
-        "failed_strategy": strategy,
-    }
+    exhausted = False
+    if should_retry_same:
+        matrix.requires_operator_pause = False
+        matrix.hard_blocked = False
+        matrix.pause_reason = None
+        return matrix.to_legacy_strategy_state(
+            retry_requested=True,
+            switched_strategy=False,
+            exhausted=False,
+            failed_strategy=current_tier.value,
+        )
+
+    tier_state.exhausted = True
+    next_tier = matrix.next_tier()
+    if next_tier is None:
+        exhausted = True
+        matrix.requires_operator_pause = True
+        matrix.hard_blocked = True
+        matrix.pause_reason = PauseReason.STRATEGY_EXHAUSTED
+    else:
+        matrix.current_tier = next_tier
+        matrix.requires_operator_pause = False
+        matrix.hard_blocked = False
+        matrix.pause_reason = None
+        switched = True
+
+    return matrix.to_legacy_strategy_state(
+        retry_requested=not exhausted,
+        switched_strategy=switched,
+        exhausted=exhausted,
+        failed_strategy=current_tier.value,
+    )
 
 
 def strategy_threshold_for_error(
@@ -163,16 +186,9 @@ def strategy_threshold_for_error(
     default_threshold: int,
 ) -> int:
     strategy = str(strategy_name or STRATEGY_API_DIRECT).strip().lower()
-    normalized = str(error_message or "").strip().lower()
     threshold = max(1, int(default_threshold))
-    if strategy != STRATEGY_API_DIRECT:
+    if strategy not in STRATEGY_SEQUENCE:
         return threshold
-    if (
-        "structured restaurant availability failed in api_direct mode" in normalized
-        and "provider=resy" in normalized
-        and "500" in normalized
-    ):
-        return 1
     return threshold
 
 

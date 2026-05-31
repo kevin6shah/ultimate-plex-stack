@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from html import escape
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -59,6 +61,23 @@ def parse_telegram_update(payload: dict[str, Any]) -> TelegramUpdate:
     return TelegramUpdate.model_validate(payload)
 
 
+def _telegram_html(text: str) -> str:
+    escaped = escape((text or "").strip(), quote=False)
+    if not escaped:
+        return ""
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        lambda match: f'<a href="{escape(match.group(2), quote=True)}">{match.group(1)}</a>',
+        escaped,
+    )
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"__([^_]+)__", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+    escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<i>\1</i>", escaped)
+    return escaped
+
+
 class TelegramClient:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -80,7 +99,8 @@ class TelegramClient:
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 data={
                     "chat_id": chat_id,
-                    "text": text[:4000],
+                    "text": _telegram_html(text)[:4000],
+                    "parse_mode": "HTML",
                     "disable_web_page_preview": "true",
                 },
             )
@@ -94,7 +114,8 @@ class TelegramClient:
         files = {"document": (file_name, content, "application/octet-stream")}
         data = {"chat_id": chat_id}
         if caption:
-            data["caption"] = caption[:1024]
+            data["caption"] = _telegram_html(caption)[:1024]
+            data["parse_mode"] = "HTML"
         async with httpx.AsyncClient(timeout=max(self.settings.telegram_timeout_seconds, 60)) as client:
             response = await client.post(
                 f"https://api.telegram.org/bot{self.token}/sendDocument",

@@ -21,14 +21,23 @@ if str(AGENT_ROOT) not in sys.path:
 
 from app.agent_core import PauseForInputRequested, run_agent
 from app.artifacts import is_browser_step_screenshot, query_requests_browser_images
-from app.heavy_job_runtime import artifact_key, progress_notification_text, progress_summary_for_step, status_summary_for_query
+from app.heavy_job_runtime import (
+    artifact_key,
+    extract_partial_findings_block,
+    progress_notification_text,
+    progress_summary_for_step,
+    status_summary_for_query,
+    summarize_recoverable_failure,
+)
 from app.jobs import AgentConfig, AgentJob, CheckpointPayload, ThreadTurn
+from app.schemas.execution_state import ExecutionProgressMatrix, JobContext
 from app.settings import Settings
 from app.storage import StateStore
 from app.strategy_runtime import (
     advance_strategy_state,
     default_strategy_state,
     is_retryable_interaction_failure,
+    normalize_execution_progress_matrix,
     normalize_strategy_state,
     strategy_threshold_for_error,
 )
@@ -102,10 +111,25 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
     previous_checkpoint = state.get_latest_checkpoint(job.job_id)
     recent_turns = [ThreadTurn.model_validate(turn) for turn in claim.get("recent_turns") or []]
     config = AgentConfig.model_validate(claim.get("config") or {})
+    job_context = JobContext.model_validate(claim.get("job_context") or (job.metadata or {}).get("job_context") or {})
     workspace = _prepare_workspace(job.job_id, resume_checkpoint=claim.get("resume_checkpoint"))
     attachment_names = [attachment["file_name"] for attachment in claim.get("attachments", [])]
-    strategy_state = normalize_strategy_state(claim.get("strategy_state") or (job.metadata or {}).get("strategy_state") or default_strategy_state())
-    state.merge_job_metadata(job.job_id, {"strategy_state": strategy_state})
+    execution_progress_matrix = normalize_execution_progress_matrix(
+        claim.get("execution_progress_matrix")
+        or (job.metadata or {}).get("execution_progress_matrix")
+        or claim.get("strategy_state")
+        or (job.metadata or {}).get("strategy_state")
+        or default_strategy_state()
+    )
+    strategy_state = normalize_strategy_state(execution_progress_matrix.model_dump(mode="json"))
+    state.merge_job_metadata(
+        job.job_id,
+        {
+            "strategy_state": strategy_state,
+            "execution_progress_matrix": execution_progress_matrix.model_dump(mode="json"),
+            "job_context": job_context.model_dump(mode="json"),
+        },
+    )
     status_interval = max(10, settings.temporal_activity_heartbeat_seconds)
     current_step = "starting worker"
     current_step_started_at = time.monotonic()
@@ -115,6 +139,23 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
     main_task = asyncio.current_task()
     strategy_retry_result: dict[str, Any] | None = None
     strategy_exhausted_pause: dict[str, Any] | None = None
+
+    def _persist_runtime_state(*, heartbeat_summary: str = "", findings_summary: str = "") -> None:
+        nonlocal execution_progress_matrix, job_context
+        if heartbeat_summary:
+            execution_progress_matrix.last_operator_visible_summary = heartbeat_summary[:1200]
+            job_context.latest_checkpoint_summary = heartbeat_summary[:1200]
+        if findings_summary:
+            execution_progress_matrix.last_meaningful_artifact = findings_summary[:1200]
+            job_context.latest_findings_summary = findings_summary[:1200]
+        state.merge_job_metadata(
+            job.job_id,
+            {
+                "strategy_state": strategy_state,
+                "execution_progress_matrix": execution_progress_matrix.model_dump(mode="json"),
+                "job_context": job_context.model_dump(mode="json"),
+            },
+        )
 
     def _signal_handler(*_args) -> None:
         interrupted.set()
@@ -143,14 +184,21 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
             if main_task is not None:
                 main_task.cancel()
             return
+        _persist_runtime_state(heartbeat_summary=heartbeat_summary)
         config = state.get_config()
         if state.should_stop_for_stall(job.job_id, interval_seconds=config.status_update_interval_seconds):
             strategy_state = advance_strategy_state(
                 strategy_state,
                 "stalled without meaningful progress",
-                threshold=1,
+                threshold=max(1, int(settings.strategy_consecutive_failure_threshold)),
             )
-            state.merge_job_metadata(job.job_id, {"strategy_state": strategy_state})
+            execution_progress_matrix = ExecutionProgressMatrix.from_legacy(strategy_state)
+            findings_summary = summarize_recoverable_failure(
+                job.query,
+                "stalled without meaningful progress",
+                str(strategy_state.get("failed_strategy") or strategy_state.get("current_strategy") or ""),
+            )
+            _persist_runtime_state(heartbeat_summary=heartbeat_summary, findings_summary=findings_summary)
             state.save_checkpoint(
                 job.job_id,
                 CheckpointPayload(
@@ -322,6 +370,15 @@ async def execute_heavy_job_activity(claim: dict[str, Any]) -> dict[str, Any]:
                 error_message,
                 threshold=retry_threshold,
             )
+            updated_execution_progress_matrix = ExecutionProgressMatrix.from_legacy(updated_strategy_state)
+            strategy_state = updated_strategy_state
+            execution_progress_matrix = updated_execution_progress_matrix
+            findings_summary = extract_partial_findings_block(error_message) or summarize_recoverable_failure(
+                job.query,
+                error_message,
+                str(updated_strategy_state.get("failed_strategy") or updated_strategy_state.get("current_strategy") or ""),
+            )
+            _persist_runtime_state(heartbeat_summary=current_summary, findings_summary=findings_summary)
             state.save_checkpoint(
                 job.job_id,
                 CheckpointPayload(
