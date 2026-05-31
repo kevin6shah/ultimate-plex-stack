@@ -8,9 +8,9 @@ Last updated: 2026-05-31
 - Cleanup and cost control: 4/5
 - Communication UX: 4/5
 - Memory and context continuity: 4/5
-- Parallel and isolated work behavior: 3/5
+- Parallel and isolated work behavior: 4/5
 
-Weighted score: 83/100
+Weighted score: 85/100
 
 ## Live evidence
 - Deploys completed:
@@ -43,6 +43,13 @@ Weighted score: 83/100
     - concrete departure dates and prices instead of raw progress text
   - The findings selector no longer surfaced the low-signal `IATA resolution` setup artifact when better live travel results were already persisted.
   - The validation job was stopped and cleanup again left `active_jobs: []`.
+- Additional live validation on 2026-05-31 for task isolation:
+  - A running Siri heavy flight task stayed active while an orthogonal light Siri question (`What time is it in Tokyo?`) returned an immediate direct answer.
+  - A same-thread cross-domain heavy request (`Create an account with a free trial for Willow TV.`) superseded the flight task cleanly:
+    - the old flight `job_id` was replaced
+    - the new active job query was the Willow TV task only
+    - no flight status/findings leaked into the new task
+  - Validation cleanup again left `active_jobs: []`.
 
 ## What improved
 - Non-booking heavy tasks no longer hit the generic mutation-confirmation wall.
@@ -58,12 +65,15 @@ Weighted score: 83/100
 - The Stagehand fallback lane no longer fails immediately on the invalid launch payload that was blocking browser fallback.
 - Interrupted travel findings are materially better when the failure state has already been reached in the workflow.
 - Interrupted travel findings are now better even earlier in the run because low-signal setup artifacts no longer override persisted live fare results.
+- Same-thread isolated work behavior now has live proof for both:
+  - orthogonal light work during a running heavy task
+  - cross-domain heavy-task supersession without contamination
 
 ## What is still broken
 - Long-running travel work still degrades too often on Skiplagged before producing actual itinerary candidates.
 - `Present your findings now` is materially better now, but it still needs broader live proof across more degraded travel/provider combinations.
 - Telegram rich formatting is partially improved, but the broader conversation polish still is not at the target bar.
-- Parallel-task isolation still has fewer live proofs than the other categories.
+- Parallel-task isolation now has the core live proof it was missing, but broader multi-domain breadth is still lighter than routing/durability coverage.
 
 ## Root causes confirmed live
 - The validated flight run degraded on the worker through the travel MCP path:
@@ -86,12 +96,12 @@ Weighted score: 83/100
 ## Current top bugs
 1. Travel MCP degradation still occurs too early and too often, so the system needs a stronger provider fallback ladder before browser escalation.
 2. Telegram rich formatting and broader conversation polish still are not at the target bar.
-3. Parallel-task isolation still needs more explicit live proof across multiple active domains.
-4. Booking/account mutation flows still need the same level of live proof that discovery and travel have now received.
+3. Booking/account mutation flows still need the same level of live proof that discovery and travel have now received.
+4. Travel provider breadth still needs more fallback diversity beyond Skiplagged degradation.
 
 ## Next queue
 1. Add a stronger travel fallback ladder after Skiplagged degradation instead of leaning so hard on one provider path.
-2. Expand live validation to restaurants, OTP/account continuity, and explicit parallel-task isolation.
+2. Expand live validation to restaurants and OTP/account continuity.
 3. Improve Telegram output formatting and conversation polish without regressing the reliability work.
 4. Keep `docs/FRIDAY_V2_VALIDATION_MATRIX.md` current whenever a new live failure class is found.
 

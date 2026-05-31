@@ -48,6 +48,13 @@ Run only after the local matrix passes.
    - no stale active thread job
    - original Siri/Telegram thread state restored
 
+## Latest live proofs
+- 2026-05-31:
+  - orthogonal light query during a running Siri heavy flight task returned a direct time answer without hijacking the active `job_id`
+  - same-thread cross-domain heavy request (`Willow TV`) superseded the flight task cleanly and became the only active heavy job
+  - `present your findings now` on the travel run returned a real flex-fare calendar instead of generic progress or a low-signal setup artifact
+  - cleanup verification ended with `active_jobs: []`
+
 ## Real regressions now covered
 - `Not flights I’m thinking activities in NYC` must not absorb `Create an account with a free trial for Willow TV`
 - a Willow/Fubo/login task must not surface `checking live flight options and collecting candidate itineraries`
