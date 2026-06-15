@@ -441,7 +441,7 @@ Resources:
     Condition: CreateRuntimeWithImage
     Properties:
       LogGroupName: !Sub '/aws/lambda/${AgentName}'
-      RetentionInDays: 1
+      RetentionInDays: 30
 
   AgentFunction:
     Type: AWS::Lambda::Function
@@ -614,7 +614,7 @@ Resources:
     Condition: CreateRuntimeWithImage
     Properties:
       LogGroupName: !Sub '/aws/lambda/${AgentName}-cost-notifier'
-      RetentionInDays: 1
+      RetentionInDays: 30
 
   CostNotifierFunction:
     Type: AWS::Lambda::Function
