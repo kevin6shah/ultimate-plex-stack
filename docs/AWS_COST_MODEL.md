@@ -1,10 +1,19 @@
 # AWS Cost Model
 
-Last updated: `2026-05-20`
+Last updated: `2026-06-15`
 
 ## Purpose
 
 This is the deterministic AWS cost model for the Friday shared host, Iris backend, WireGuard VPN, and Friday personal agent.
+
+Important current note:
+
+- the older `~$12.566/month` baseline lower in this file is no longer the live June 2026 footprint
+- the live account drifted away from that smaller shape
+- on `2026-06-15`, AWS Budgets reported:
+  - actual month-to-date spend: `$17.956`
+  - forecasted month-end spend: `$39.065`
+- see the June 2026 reality-check section below
 
 Rules:
 
@@ -17,21 +26,23 @@ Rules:
 
 ## Current Live Inventory
 
-Verified from the repo and the live AWS account on `2026-05-17`:
+Verified from the repo and the live AWS account on `2026-06-15`:
 
 - Shared host stack: `friday-shared-host`
 - Agent stack: `friday-agent`
 - Dedicated hands worker stack: `friday-hands-worker`
 - Region: `us-east-1`
 - AWS account: `301142908919`
-- Shared host instance type: `t3.micro`
+- Shared host instance type: `t3a.small`
 - Shared host root disk: `8 GiB gp3`
 - Shared host public IPv4: `1`
 - Dedicated hands worker instance type: `t3a.small`
-- Dedicated hands worker root disk: `40 GiB gp3`
-- Dedicated hands worker public IPv4: ephemeral, attached only while running
+- Dedicated hands worker root disk: `20 GiB gp3`
+- Dedicated hands worker public IPv4: currently attached while running
 - Dedicated hands worker current state: `running`
-- Dedicated hands worker instance ID: `i-0cb9e56a9479b1e6c`
+- Dedicated hands worker instance ID: `i-04cf5a5edd3b4aa35`
+- Extra stopped worker stack still retaining EBS: `friday-hands-worker-paid`
+- Extra stopped worker root disk still allocated: `20 GiB gp3`
 - Agent Lambda: `1`
 - Agent Lambda memory: `2048 MB`
 - Agent ECR repository: `friday-agent`
@@ -42,7 +53,7 @@ Verified from the repo and the live AWS account on `2026-05-17`:
 - Agent CloudWatch dashboard: `1`
 - Agent CloudWatch billing alarms: `4`
 - Current artifacts bucket contents: empty
-- Current ECR image storage: `8.379806 GiB`
+- Current ECR image storage proxy from live images: `4.9004 GiB`
 - Migration anchor date for the current AWS account: `2026-05-10`
 - Current 6-month account-expiry target: `2026-11-10`
 - Current migration reminder date: `2026-10-26`
@@ -70,7 +81,41 @@ Interpretation:
 - yes, these credits should apply automatically to eligible AWS charges
 - no, the `Credits` page does not necessarily show in-month consumption immediately
 - AWS documents that the `Credits` page balance is updated at the end of the billing cycle, while the `Bills` page `Savings` tab shows an estimated current-month credit balance updated every 24 hours
-- User-reported current-month AWS usage so far: `$1.39`
+- User-reported current-month AWS usage so far on `2026-05-15`: `$1.39`
+
+## June 2026 Reality Check
+
+Live AWS Budget values on `2026-06-15`:
+
+- actual month-to-date spend: `$17.956`
+- forecasted month-end spend: `$39.065`
+
+Using the same price inputs already documented in this file, the current live infrastructure shape reconciles to about:
+
+```text
+$38.602/month
+```
+
+That reconciliation is:
+
+```text
+shared host compute (t3a.small)     = 720 * 0.0188 = 13.536
+hands worker compute (t3a.small)    = 720 * 0.0188 = 13.536
+two public IPv4s                    = 2 * 720 * 0.005 = 7.200
+EBS (8 + 20 + 20 GiB)               = 48 * 0.08 = 3.840
+ECR (~4.9004 GiB proxy)             = 4.9004 * 0.10 = 0.490
+
+reconciled raw monthly              = 38.602
+```
+
+Interpretation:
+
+- the `$38` to `$39` email forecast is directionally correct
+- the old lower baseline is not the current live architecture
+- the main drift sources are:
+  - shared host is now `t3a.small`, not `t3.micro`
+  - the hands worker has effectively been running as an always-on cost line this month
+  - an extra stopped worker stack is still retaining `20 GiB` of EBS
 
 ## Official Price Inputs
 
