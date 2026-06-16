@@ -117,6 +117,60 @@ Interpretation:
   - the hands worker has effectively been running as an always-on cost line this month
   - an extra stopped worker stack is still retaining `20 GiB` of EBS
 
+### Cost Explorer breakdown on `2026-06-15`
+
+After enabling Cost Explorer visibility and excluding `Credit` and `Refund` record types, the June month-to-date gross spend from `2026-06-01` through `2026-06-15` is about:
+
+```text
+$18.77
+```
+
+Service breakdown:
+
+| Service | June 1-15 gross cost |
+|---|---:|
+| `Amazon Elastic Compute Cloud - Compute` | `$13.0898` |
+| `Amazon Virtual Private Cloud` | `$3.5000` |
+| `EC2 - Other` | `$1.8400` |
+| `Amazon EC2 Container Registry (ECR)` | `$0.0476` |
+| `Amazon DynamoDB` | `$0.0148` |
+| `Amazon Simple Storage Service` | `$0.0002` |
+
+Usage-type breakdown for the main cost centers:
+
+| Usage type | June 1-15 gross cost |
+|---|---:|
+| `BoxUsage:t3a.small` | `$13.0898` |
+| `USE1-PublicIPv4:InUseAddress` | `$3.5000` |
+| `EBS:VolumeUsage.gp3` | `$1.8400` |
+| `TimedStorage-ByteHrs` | `$0.0476` |
+
+Daily gross burn has been very stable at roughly:
+
+```text
+$1.27/day
+```
+
+That daily burn projects naturally to the observed monthly budget forecast near:
+
+```text
+$39/month
+```
+
+### Net-vs-gross note
+
+The default Cost Explorer daily total can look near zero because credits are offsetting the raw charges. For operational modeling, the correct view is:
+
+- gross AWS usage:
+  - exclude `Credit` and `Refund`
+- net out-of-pocket:
+  - include credits if you want the post-credit billing view
+
+For June 2026 right now:
+
+- gross infrastructure burn is real and near `$39/month`
+- net out-of-pocket is still largely cushioned by credits
+
 ## Official Price Inputs
 
 These are the live price inputs used in the formulas below.

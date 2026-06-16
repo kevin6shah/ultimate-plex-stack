@@ -154,7 +154,7 @@ Interpretation:
 Current live retention realities:
 
 - thread memory: about `48 hours`
-- Lambda log retention: `1 day`
+- Lambda log retention was `1 day` at the start of this audit and is now `30 days`
 
 Interpretation:
 
@@ -172,6 +172,36 @@ From AWS Budgets on `2026-06-15`:
 - Forecasted month-end spend: `$39.065`
 
 So the email you saw around `$38` to `$39` is directionally correct.
+
+### Cost Explorer confirmation
+
+After Cost Explorer access was restored and `Credit` / `Refund` record types were excluded, the June `2026-06-01` through `2026-06-15` gross spend broke down to:
+
+- `Amazon Elastic Compute Cloud - Compute`: `$13.0898`
+- `Amazon Virtual Private Cloud`: `$3.5000`
+- `EC2 - Other`: `$1.8400`
+- `Amazon EC2 Container Registry (ECR)`: `$0.0476`
+- `Amazon DynamoDB`: `$0.0148`
+- `Amazon Simple Storage Service`: `$0.0002`
+
+The main usage types were:
+
+- `BoxUsage:t3a.small`: `$13.0898`
+- `USE1-PublicIPv4:InUseAddress`: `$3.5000`
+- `EBS:VolumeUsage.gp3`: `$1.8400`
+- `TimedStorage-ByteHrs`: `$0.0476`
+
+This is a very stable daily gross burn of about:
+
+```text
+$1.27/day
+```
+
+That daily burn naturally explains the budget forecast near:
+
+```text
+$39/month
+```
 
 ### Why the repo cost model drifted
 
@@ -224,15 +254,16 @@ Conclusion:
 
 ## IAM Visibility Gap
 
-Current reality:
+Current reality before the policy fix:
 
-- `budgets:ViewBudget` is live and working
-- `ce:GetCostAndUsage` is still denied for the `codex-migration` user
+- `budgets:ViewBudget` was live and working
+- `ce:GetCostAndUsage` was denied for the `codex-migration` user
 
-That means:
+Current reality after the policy fix:
 
-- we can see the monthly budget forecast and actuals
-- we cannot yet break spend down properly by service, day, or usage dimension using Cost Explorer
+- Cost Explorer access is now working
+- service-by-service and daily gross cost attribution is now available
+- CloudFormation-driven log-group retention changes also required CloudWatch Logs tag permissions
 
 The repo IAM policy has been updated in:
 
@@ -258,6 +289,24 @@ Also added IAM read actions needed to verify what policy is actually attached:
 - `iam:ListAttachedUserPolicies`
 - `iam:ListPolicies`
 
+Also added missing CloudWatch Logs permissions needed for CloudFormation-managed log-group updates:
+
+- `logs:ListTagsForResource`
+- `logs:TagResource`
+- `logs:UntagResource`
+
+## Retention Fix
+
+The Lambda log-retention gap has now been fixed live:
+
+- `/aws/lambda/friday-agent`: `30 days`
+- `/aws/lambda/friday-agent-cost-notifier`: `30 days`
+
+Why `30` instead of `21`:
+
+- CloudWatch Logs does not support a `21-day` retention value
+- `30 days` is the nearest valid retention that covers the requested `3 week` debugging window
+
 ## What Needs To Be Fixed Next
 
 ### Highest priority behavior fixes
@@ -275,9 +324,9 @@ Also added IAM read actions needed to verify what policy is actually attached:
 
 ### Infrastructure fixes
 
-8. Increase transcript/log retention enough to support real retro audits.
-9. Update `docs/AWS_COST_MODEL.md` to the live infrastructure shape.
-10. Reattach the updated IAM policy so Cost Explorer data becomes available for real cost attribution.
+8. Increase transcript retention, not just Lambda log retention, so full Siri/Telegram raw history can be audited for multiple weeks.
+9. Update `docs/AWS_COST_MODEL.md` continuously from Cost Explorer actuals, not only architecture assumptions.
+10. Add a repeatable cost-center reporting script so monthly drift is caught automatically.
 
 ## Recommendation
 
@@ -287,5 +336,5 @@ The more honest current state is:
 
 - the May substrate work improved the system materially
 - but the live June UX still has meaningful task-boundary, rendering, and operator-control failures
-- cost visibility is incomplete until Cost Explorer access is fixed
-- the repo cost model should now be treated as stale until it is refreshed to the live topology
+- cost visibility is materially better now that Cost Explorer access works
+- but transcript retention is still too short for a perfect multi-week raw-message audit
